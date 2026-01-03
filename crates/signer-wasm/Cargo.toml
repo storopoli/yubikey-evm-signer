@@ -1,0 +1,18 @@
+[package]
+name = "yubikey-evm-signer-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "YubiKey EVM Signer WASM Cryptography Library"
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
