@@ -28,8 +28,12 @@
 
 use std::cmp::Ordering;
 
-use p256::FieldBytes;
+use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+#[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
+use p256::elliptic_curve::generic_array::GenericArray;
+use p256::elliptic_curve::sec1::FromEncodedPoint;
+use p256::{AffinePoint, EncodedPoint, FieldBytes};
 
 use crate::error::{Error, Result};
 use crate::signature::Signature;
@@ -358,6 +362,84 @@ pub fn verify_signature(hash: &[u8; 32], signature: &Signature, public_key: &Ver
     } else {
         false
     }
+}
+
+/// Verifies a P-256 ECDSA signature per EIP-7951 precompile specification.
+///
+/// This function implements the `P256VERIFY` precompile as specified in [EIP-7951],
+/// which enables native secp256r1 (P-256) signature verification on Ethereum.
+///
+/// # Arguments
+///
+/// * `input` - A 160-byte input containing:
+///
+///   - `hash` (32 bytes): The message hash
+///   - `r` (32 bytes): Signature component R
+///   - `s` (32 bytes): Signature component S
+///   - `x` (32 bytes): Public key X-coordinate
+///   - `y` (32 bytes): Public key Y-coordinate
+///
+/// # Returns
+///
+/// [`true`](bool) if the signature is valid, [`false`](bool) otherwise.
+///
+/// # Example
+///
+/// ```
+/// use yubikey_evm_signer_core::crypto::p256_verify;
+///
+/// // Invalid input (wrong length)
+/// assert!(!p256_verify(&[0u8; 100]));
+///
+/// // Invalid input (all zeros - invalid public key)
+/// assert!(!p256_verify(&[0u8; 160]));
+/// ```
+#[must_use]
+pub fn p256_verify(input: &[u8]) -> bool {
+    // 1. Check input length is exactly 160 bytes
+    if input.len() != 160 {
+        return false;
+    }
+
+    // 2. Parse components
+    let hash = &input[0..32];
+    let r = &input[32..64];
+    let s = &input[64..96];
+    let x = &input[96..128];
+    let y = &input[128..160];
+
+    // 3. Construct public key from (x, y) coordinates
+    #[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
+    // generic_array 0.x API used by p256 crate
+    let encoded_point = EncodedPoint::from_affine_coordinates(
+        GenericArray::from_slice(x),
+        GenericArray::from_slice(y),
+        false, // not compressed
+    );
+
+    let affine_point = match AffinePoint::from_encoded_point(&encoded_point).into() {
+        Some(point) => point,
+        None => return false, // Invalid point (not on curve or at infinity)
+    };
+
+    let verifying_key = match VerifyingKey::from_affine(affine_point) {
+        Ok(vk) => vk,
+        Err(_) => return false,
+    };
+
+    // 4. Construct signature from r and s
+    #[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
+    // generic_array 0.x API used by p256 crate
+    let signature = match P256Signature::from_scalars(
+        FieldBytes::clone_from_slice(r),
+        FieldBytes::clone_from_slice(s),
+    ) {
+        Ok(sig) => sig,
+        Err(_) => return false, // Invalid r or s (not in range)
+    };
+
+    // 5. Verify signature using prehash (hash already provided)
+    verifying_key.verify_prehash(hash, &signature).is_ok()
 }
 
 #[cfg(test)]
