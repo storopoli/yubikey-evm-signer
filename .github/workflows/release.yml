@@ -47,3 +47,41 @@ jobs:
         run: cargo publish -p ${{ matrix.package }} # zizmor: ignore[use-trusted-publishing]
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    name: Publish Release to NPM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Setup Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v6.1.0 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build WASM package
+        run: wasm-pack build crates/signer-wasm --target web --release --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+
+      - name: Install dependencies
+        working-directory: packages/npm
+        run: npm ci
+
+      - name: Publish to NPM
+        working-directory: packages/npm
+        run: npm publish --provenance --access public # zizmor: ignore[use-trusted-publishing]
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
