@@ -23,7 +23,7 @@ updates:
       prefix: "chore(deps)"
       include: "scope"
 
-  # Rust/Cargo dependencies
+  # Rust/Cargo dependencies (workspace root)
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -42,6 +42,48 @@ updates:
           - "minor"
           - "patch"
     # Security updates remain ungrouped for urgent handling
+    open-pull-requests-limit: 20
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Rust/Cargo dependencies (signer-core)
+  - package-ecosystem: "cargo"
+    directory: "/crates/signer-core"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "00:00"
+    cooldown:
+      default-days: 14
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 20
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Rust/Cargo dependencies (signer-wasm)
+  - package-ecosystem: "cargo"
+    directory: "/crates/signer-wasm"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "00:00"
+    cooldown:
+      default-days: 14
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     open-pull-requests-limit: 20
     commit-message:
       prefix: "chore(deps)"
