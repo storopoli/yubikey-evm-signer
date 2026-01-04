@@ -20,6 +20,19 @@
             <p>Please switch to a supported browser to use this demo.</p>
         </section>
 
+        <!-- Platform Compatibility Info -->
+        <section id="platform-info-section" class="card info">
+            <h2>Platform Compatibility</h2>
+            <p>WebUSB requires the browser to claim the YubiKey's CCID interface. This may conflict with system drivers:</p>
+            <ul class="platform-list">
+                <li><strong>macOS:</strong> <span class="status-badge not-supported">Not Supported</span> — The system's smart card driver claims the CCID interface, blocking WebUSB access. There is no practical workaround.</li>
+                <li><strong>Linux:</strong> <span class="status-badge supported">Supported</span> — Works well. May require <a href="https://developers.yubico.com/yubikey-manager/Device_Permissions.html" target="_blank">udev rules</a> for non-root access.</li>
+                <li><strong>Windows:</strong> <span class="status-badge supported">Supported</span> — Generally works. Some configurations with smart card drivers may have issues.</li>
+                <li><strong>Android:</strong> <span class="status-badge supported">Supported</span> — Works with USB OTG adapter in Chrome.</li>
+            </ul>
+            <p class="hint">For macOS, use the native Rust library with PCSC transport instead of this WebUSB demo.</p>
+        </section>
+
         <!-- Connection Section -->
         <section id="connection-section" class="card">
             <h2>1. Device Connection</h2>

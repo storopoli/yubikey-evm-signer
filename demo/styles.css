@@ -114,6 +114,48 @@ footer a:hover {
     color: var(--color-warning);
 }
 
+.card.info {
+    border-color: var(--color-primary);
+    background: #eff6ff;
+}
+
+.card.info h2 {
+    color: var(--color-primary);
+}
+
+.card.info a {
+    color: var(--color-primary);
+}
+
+.platform-list {
+    margin: 0.75rem 0;
+    padding-left: 1.25rem;
+}
+
+.platform-list li {
+    margin-bottom: 0.5rem;
+    line-height: 1.5;
+}
+
+.status-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.125rem 0.375rem;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.025em;
+}
+
+.status-badge.supported {
+    color: #166534;
+    background: #dcfce7;
+}
+
+.status-badge.not-supported {
+    color: #991b1b;
+    background: #fee2e2;
+}
+
 /* ============================================
    Form Elements
    ============================================ */
