@@ -51,6 +51,8 @@ let hash = tx.signing_hash();
 
 ### JavaScript/TypeScript (Browser)
 
+**Live Demo**: [storopoli.github.io/yubikey-evm-signer](https://storopoli.github.io/yubikey-evm-signer/)
+
 ```javascript
 import init, { YubiKeyDevice } from 'yubikey-evm-signer';
 
