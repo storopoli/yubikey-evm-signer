@@ -14,5 +14,17 @@ keywords.workspace = true
 workspace = true
 
 [dependencies]
+# Crypto
+p256 = { workspace = true, features = ["ecdsa"] }
+
+# Ethereum
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+
+# Utils
+thiserror.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]

@@ -25,10 +25,29 @@ rust.unexpected_cfgs = { level = "warn", check-cfg = [
 rust.missing_docs = "warn"
 rustdoc.all = "warn"
 clippy.too_long_first_doc_paragraph = "warn"
-clippy.absolute_paths = "warn"
 clippy.missing_const_for_fn = "warn"
 
 [workspace.dependencies]
+# Crypto (RustCrypto)
+p256 = "0.13.2"
+sha3 = "0.10.8"
+ecdsa = "0.16.9"
+
+# Ethereum (Alloy)
+alloy-primitives = { version = "1.5.2", features = ["serde", "rlp"] }
+alloy-rlp = { version = "0.3.12", features = ["derive"] }
+
+# WASM
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4.56"
+js-sys = "0.3.83"
+web-sys = "0.3.83"
+
+# Utils
+thiserror = "2.0.17"
+hex = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 
 [profile.release]
 opt-level = "z"   # Optimized for size, use 3 for speed
