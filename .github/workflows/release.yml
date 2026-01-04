@@ -68,7 +68,7 @@ jobs:
         run: cargo install wasm-pack
 
       - name: Setup Node.js
-        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v6.1.0 # zizmor: ignore[cache-poisoning]
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0 # zizmor: ignore[cache-poisoning]
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
