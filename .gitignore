@@ -91,3 +91,6 @@ coverage.xml
 
 # backup files
 *.bak
+
+# NPM package build output
+packages/npm/dist/

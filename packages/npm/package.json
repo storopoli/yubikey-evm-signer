@@ -1,0 +1,43 @@
+{
+  "name": "yubikey-evm-signer",
+  "version": "0.0.1",
+  "description": "Sign Ethereum transactions using YubiKey's secp256r1 (P-256) keys via WebUSB and EIP-7951",
+  "type": "module",
+  "main": "./dist/yubikey_evm_signer_wasm.js",
+  "module": "./dist/yubikey_evm_signer_wasm.js",
+  "types": "./dist/yubikey_evm_signer_wasm.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/yubikey_evm_signer_wasm.js",
+      "types": "./dist/yubikey_evm_signer_wasm.d.ts"
+    },
+    "./yubikey_evm_signer_wasm_bg.wasm": "./dist/yubikey_evm_signer_wasm_bg.wasm"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "keywords": [
+    "yubikey",
+    "ethereum",
+    "evm",
+    "secp256r1",
+    "p256",
+    "webusb",
+    "wasm",
+    "eip-7951",
+    "hardware-wallet",
+    "signing"
+  ],
+  "author": "Jose Storopoli <jose@storopoli.com>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/storopoli/yubikey-evm-signer"
+  },
+  "homepage": "https://github.com/storopoli/yubikey-evm-signer#readme",
+  "bugs": {
+    "url": "https://github.com/storopoli/yubikey-evm-signer/issues"
+  },
+  "sideEffects": false
+}

@@ -51,3 +51,22 @@ audit:
 # Check GitHub Actions security analysis with `zizmor`
 check-github-actions-security:
   zizmor .
+
+# Build WASM package
+wasm-build:
+  wasm-pack build crates/signer-wasm --target web --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+
+# Build WASM package in release mode
+wasm-build-release:
+  wasm-pack build crates/signer-wasm --target web --release --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+
+# Clean WASM build artifacts
+wasm-clean:
+  rm -rf packages/npm/dist
+
+# Rebuild WASM package from scratch
+wasm-rebuild: wasm-clean wasm-build
+
+# Publish NPM package (requires npm login)
+npm-publish: wasm-build-release
+  cd packages/npm && npm publish --access public
