@@ -83,6 +83,9 @@ pub use device::YubiKeyDevice;
 pub use error::{WasmError, WasmResult};
 pub use transport::WebUsbTransport;
 
+// Required for getrandom's js feature to work on wasm targets
+#[cfg(target_arch = "wasm32")]
+use getrandom as _;
 use wasm_bindgen::prelude::*;
 
 /// Initializes the WASM module.
@@ -90,7 +93,7 @@ use wasm_bindgen::prelude::*;
 /// This function is automatically called when the module is loaded,
 /// but can be called explicitly if needed.
 #[wasm_bindgen(start)]
-#[expect(clippy::missing_const_for_fn, reason = "not a stable API function")]
+#[allow(clippy::missing_const_for_fn)]
 pub fn init() {
     // Nothing to initialize for now
 }

@@ -33,9 +33,36 @@ jobs:
           cache-on-failure: true
 
       - name: Run clippy
-        run: cargo clippy --workspace --examples --tests --benches --all-features --all-targets --locked
+        run: cargo clippy --workspace --exclude yubikey-evm-signer-wasm --examples --tests --benches --all-features --all-targets --locked
         env:
           RUSTFLAGS: -D warnings
+
+  clippy-wasm:
+    name: Run clippy on WASM crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@22a6a5b0f9f487c5f5587025ae9d4a1caf2a8a78 # clippy
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-on-failure: true
+
+      - name: Run clippy on WASM crate
+        run: cargo clippy -p yubikey-evm-signer-wasm --target wasm32-unknown-unknown --all-features --locked
+        env:
+          RUSTFLAGS: -D warnings --cfg=web_sys_unstable_apis
 
   fmt:
     name: Check code formatting
@@ -108,7 +135,8 @@ jobs:
         run: cargo install wasm-pack
 
       - name: Build WASM package
-        run: wasm-pack build crates/signer-wasm --target web --release --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+        # --no-opt skips wasm-opt which doesn't support bulk-memory ops from Rust 2024 edition
+        run: wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
 
       - name: Verify package files exist
         run: |
@@ -122,6 +150,7 @@ jobs:
     if: always()
     needs:
       - clippy
+      - clippy-wasm
       - fmt
       - taplo
       - wasm-build

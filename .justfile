@@ -14,9 +14,13 @@ toml-fmt:
 check-fmt:
   cargo fmt --all --check
 
-# Rust `clippy` lints
+# Rust `clippy` lints (excludes WASM crate which needs wasm32 target)
 clippy:
-  cargo clippy --workspace --examples --tests --benches --all-features --all-targets --locked
+  RUSTFLAGS="-D warnings" cargo clippy --workspace --exclude yubikey-evm-signer-wasm --examples --tests --benches --all-features --all-targets --locked
+
+# Rust `clippy` lints for WASM crate (requires wasm32 target)
+clippy-wasm:
+  RUSTFLAGS="-D warnings --cfg=web_sys_unstable_apis" cargo clippy -p yubikey-evm-signer-wasm --target wasm32-unknown-unknown --all-features --locked
 
 # TOML lint with `taplo`
 toml-lint:
@@ -35,7 +39,7 @@ doctest:
   cargo test --doc --all-features --workspace
 
 # Run all lints and formatting checks
-lints: toml-check-fmt toml-lint check-fmt clippy
+lints: toml-check-fmt toml-lint check-fmt clippy clippy-wasm
 
 # Rust all tests
 test: unit-test doctest
@@ -54,11 +58,11 @@ check-github-actions-security:
 
 # Build WASM package
 wasm-build:
-  wasm-pack build crates/signer-wasm --target web --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+  wasm-pack build crates/signer-wasm --target web --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
 
 # Build WASM package in release mode
 wasm-build-release:
-  wasm-pack build crates/signer-wasm --target web --release --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+  wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
 
 # Clean WASM build artifacts
 wasm-clean:

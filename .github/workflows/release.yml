@@ -74,7 +74,8 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Build WASM package
-        run: wasm-pack build crates/signer-wasm --target web --release --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+        # --no-opt skips wasm-opt which doesn't support bulk-memory ops from Rust 2024 edition
+        run: wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
 
       - name: Install dependencies
         working-directory: packages/npm

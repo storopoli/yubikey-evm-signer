@@ -137,7 +137,7 @@ impl From<WasmError> for JsValue {
 
 impl From<CoreError> for WasmError {
     fn from(error: CoreError) -> Self {
-        error.into()
+        Self::CoreError(error.to_string())
     }
 }
 
