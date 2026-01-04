@@ -23,10 +23,17 @@ jobs:
         uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1
 
   cratesio:
-    name: Publish Release to Crates.io
+    name: Publish ${{ matrix.package }} to Crates.io
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        package:
+          - yubikey-evm-signer-core
+          - yubikey-evm-signer-wasm
     steps:
       - name: Checkout repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -37,6 +44,6 @@ jobs:
         uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
 
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish -p ${{ matrix.package }} # zizmor: ignore[use-trusted-publishing]
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
