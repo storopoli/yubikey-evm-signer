@@ -1,0 +1,7 @@
+# Enable unstable web-sys APIs (WebUSB)
+[build]
+rustflags = ["--cfg=web_sys_unstable_apis"]
+
+# WASM target configuration
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]
