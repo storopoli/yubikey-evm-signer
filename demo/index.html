@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YubiKey EVM Signer Demo</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>YubiKey EVM Signer Demo</h1>
+        <p class="subtitle">Sign Ethereum transactions with YubiKey via WebUSB (EIP-7951)</p>
+    </header>
+
+    <main>
+        <!-- Browser Compatibility Warning -->
+        <section id="compatibility-section" class="card warning hidden">
+            <h2>Browser Not Supported</h2>
+            <p>WebUSB is only available in Chromium-based browsers (Chrome, Edge, Brave, Opera).</p>
+            <p>Please switch to a supported browser to use this demo.</p>
+        </section>
+
+        <!-- Connection Section -->
+        <section id="connection-section" class="card">
+            <h2>1. Device Connection</h2>
+            <div class="status-row">
+                <span class="label">Status:</span>
+                <span id="connection-status" class="status disconnected">Disconnected</span>
+            </div>
+            <div class="button-row">
+                <button id="connect-btn" class="primary">Connect YubiKey</button>
+                <button id="disconnect-btn" class="secondary" disabled>Disconnect</button>
+            </div>
+            <p class="hint">Requires HTTPS and user gesture. A device picker dialog will appear.</p>
+        </section>
+
+        <!-- PIN Verification Section -->
+        <section id="pin-section" class="card disabled-section">
+            <h2>2. PIN Verification</h2>
+            <div class="form-group">
+                <label for="pin-input">PIN (6-8 digits):</label>
+                <input type="password" id="pin-input" maxlength="8" placeholder="Enter PIN" disabled>
+            </div>
+            <div class="button-row">
+                <button id="verify-pin-btn" class="primary" disabled>Verify PIN</button>
+            </div>
+            <div class="status-row">
+                <span class="label">PIN Status:</span>
+                <span id="pin-status" class="status">Not verified</span>
+            </div>
+        </section>
+
+        <!-- Key Management Section -->
+        <section id="key-section" class="card disabled-section">
+            <h2>3. Key Management</h2>
+            <div class="button-row">
+                <button id="generate-key-btn" class="primary" disabled>Generate New Key</button>
+                <button id="get-address-btn" class="secondary" disabled>Get Address</button>
+            </div>
+            <div class="result-group">
+                <label>Ethereum Address:</label>
+                <div id="address-display" class="address-display">-</div>
+            </div>
+            <p class="hint">Warning: Generate New Key will overwrite any existing key in the slot.</p>
+        </section>
+
+        <!-- Sign Transaction Section (EIP-1559) -->
+        <section id="tx-section" class="card disabled-section">
+            <h2>4. Sign Transaction (EIP-1559)</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="tx-chain-id">Chain ID:</label>
+                    <input type="number" id="tx-chain-id" value="1" min="1" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-nonce">Nonce:</label>
+                    <input type="number" id="tx-nonce" value="0" min="0" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-to">To Address:</label>
+                    <input type="text" id="tx-to" placeholder="0x..." disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-value">Value (wei):</label>
+                    <input type="text" id="tx-value" value="0" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-gas-limit">Gas Limit:</label>
+                    <input type="number" id="tx-gas-limit" value="21000" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-max-priority-fee">Max Priority Fee (wei):</label>
+                    <input type="text" id="tx-max-priority-fee" value="1000000000" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="tx-max-fee">Max Fee (wei):</label>
+                    <input type="text" id="tx-max-fee" value="20000000000" disabled>
+                </div>
+                <div class="form-group full-width">
+                    <label for="tx-input">Input Data (hex, optional):</label>
+                    <input type="text" id="tx-input" placeholder="0x" disabled>
+                </div>
+            </div>
+            <div class="button-row">
+                <button id="sign-tx-btn" class="primary" disabled>Sign Transaction</button>
+            </div>
+            <div class="result-group">
+                <label>Signed Transaction (RLP):</label>
+                <textarea id="tx-signature" class="signature-output" readonly placeholder="Signed transaction will appear here..."></textarea>
+            </div>
+        </section>
+
+        <!-- Sign Typed Data Section (EIP-712) -->
+        <section id="typed-data-section" class="card disabled-section">
+            <h2>5. Sign Typed Data (EIP-712)</h2>
+            <div class="form-group">
+                <label for="typed-data-input">Typed Data JSON:</label>
+                <textarea id="typed-data-input" class="json-input" placeholder='{"domain": {...}, "types": {...}, "primaryType": "...", "message": {...}}' disabled></textarea>
+            </div>
+            <div class="button-row">
+                <button id="load-example-712-btn" class="secondary">Load Example</button>
+                <button id="sign-typed-data-btn" class="primary" disabled>Sign Typed Data</button>
+            </div>
+            <div class="result-group">
+                <label>Signature:</label>
+                <textarea id="typed-data-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
+            </div>
+        </section>
+
+        <!-- Sign Message Section (EIP-191) -->
+        <section id="message-section" class="card disabled-section">
+            <h2>6. Sign Message (EIP-191)</h2>
+            <div class="form-group">
+                <label for="message-input">Message:</label>
+                <textarea id="message-input" class="message-input" placeholder="Enter your message to sign..." disabled></textarea>
+            </div>
+            <div class="button-row">
+                <button id="sign-message-btn" class="primary" disabled>Sign Message</button>
+            </div>
+            <div class="result-group">
+                <label>Signature:</label>
+                <textarea id="message-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
+            </div>
+        </section>
+
+        <!-- Sign Hash Section -->
+        <section id="hash-section" class="card disabled-section">
+            <h2>7. Sign Raw Hash</h2>
+            <div class="form-group">
+                <label for="hash-input">Hash (32 bytes, hex):</label>
+                <input type="text" id="hash-input" placeholder="0x..." disabled>
+            </div>
+            <div class="button-row">
+                <button id="sign-hash-btn" class="primary" disabled>Sign Hash</button>
+            </div>
+            <div class="result-group">
+                <label>Signature:</label>
+                <textarea id="hash-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
+            </div>
+        </section>
+
+        <!-- Log Section -->
+        <section id="log-section" class="card">
+            <h2>Activity Log</h2>
+            <div id="log-output" class="log-output"></div>
+            <button id="clear-log-btn" class="secondary">Clear Log</button>
+        </section>
+    </main>
+
+    <footer>
+        <p>
+            <span id="version">Version: -</span> |
+            <a href="https://github.com/storopoli/yubikey-evm-signer" target="_blank">GitHub</a> |
+            <a href="https://eips.ethereum.org/EIPS/eip-7951" target="_blank">EIP-7951</a>
+        </p>
+        <p class="warning-text">This is a demo. Use at your own risk. Never use production keys in testing.</p>
+    </footer>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

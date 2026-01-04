@@ -94,3 +94,6 @@ coverage.xml
 
 # NPM package build output
 packages/npm/dist/
+
+# Demo WASM build output
+demo/wasm/

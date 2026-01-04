@@ -74,3 +74,20 @@ wasm-rebuild: wasm-clean wasm-build
 # Publish NPM package (requires npm login)
 npm-publish: wasm-build-release
   cd packages/npm && npm publish --access public
+
+# Build WASM for demo site
+demo-build:
+  wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../demo/wasm --out-name yubikey_evm_signer_wasm
+
+# Clean demo WASM artifacts
+demo-clean:
+  rm -rf demo/wasm
+
+# Serve demo site locally (requires Python 3)
+demo-serve:
+  @echo "Starting local server at http://localhost:8000"
+  @echo "Note: WebUSB requires HTTPS in production, but localhost is exempt"
+  python3 -m http.server 8000 --directory demo
+
+# Build and serve demo site locally
+demo: demo-build demo-serve

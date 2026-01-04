@@ -1,0 +1,365 @@
+/* ============================================
+   CSS Variables & Reset
+   ============================================ */
+:root {
+    --color-primary: #2563eb;
+    --color-primary-hover: #1d4ed8;
+    --color-secondary: #6b7280;
+    --color-secondary-hover: #4b5563;
+    --color-success: #10b981;
+    --color-warning: #f59e0b;
+    --color-error: #ef4444;
+    --color-bg: #f9fafb;
+    --color-card: #ffffff;
+    --color-border: #e5e7eb;
+    --color-text: #1f2937;
+    --color-text-muted: #6b7280;
+    --font-mono: 'SF Mono', 'Monaco', 'Consolas', monospace;
+    --radius: 8px;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--color-bg);
+    color: var(--color-text);
+    line-height: 1.6;
+    min-height: 100vh;
+}
+
+/* ============================================
+   Layout
+   ============================================ */
+header {
+    background: var(--color-card);
+    border-bottom: 1px solid var(--color-border);
+    padding: 1.5rem 2rem;
+    text-align: center;
+}
+
+header h1 {
+    font-size: 1.75rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+header .subtitle {
+    color: var(--color-text-muted);
+    font-size: 0.95rem;
+}
+
+main {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+
+footer {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: var(--color-text-muted);
+    font-size: 0.875rem;
+}
+
+footer a {
+    color: var(--color-primary);
+    text-decoration: none;
+}
+
+footer a:hover {
+    text-decoration: underline;
+}
+
+.warning-text {
+    color: var(--color-warning);
+    margin-top: 0.5rem;
+}
+
+/* ============================================
+   Card Component
+   ============================================ */
+.card {
+    background: var(--color-card);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+    box-shadow: var(--shadow);
+}
+
+.card.disabled-section {
+    opacity: 0.6;
+}
+
+.card h2 {
+    font-size: 1.125rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.card.warning {
+    border-color: var(--color-warning);
+    background: #fffbeb;
+}
+
+.card.warning h2 {
+    color: var(--color-warning);
+}
+
+/* ============================================
+   Form Elements
+   ============================================ */
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.875rem;
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+    color: var(--color-text);
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1rem;
+}
+
+.form-grid .full-width {
+    grid-column: 1 / -1;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+textarea {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-family: inherit;
+    transition: border-color 0.15s;
+}
+
+input:focus,
+textarea:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+input:disabled,
+textarea:disabled {
+    background: var(--color-bg);
+    cursor: not-allowed;
+}
+
+textarea {
+    min-height: 80px;
+    resize: vertical;
+}
+
+.json-input {
+    min-height: 120px;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+}
+
+.message-input {
+    min-height: 80px;
+}
+
+.signature-output {
+    min-height: 60px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    background: var(--color-bg);
+    word-break: break-all;
+}
+
+/* ============================================
+   Buttons
+   ============================================ */
+.button-row {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0;
+}
+
+button {
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.15s;
+}
+
+button.primary {
+    background: var(--color-primary);
+    color: white;
+}
+
+button.primary:hover:not(:disabled) {
+    background: var(--color-primary-hover);
+}
+
+button.secondary {
+    background: var(--color-secondary);
+    color: white;
+}
+
+button.secondary:hover:not(:disabled) {
+    background: var(--color-secondary-hover);
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ============================================
+   Status & Results
+   ============================================ */
+.status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0;
+}
+
+.status-row .label {
+    font-size: 0.875rem;
+    color: var(--color-text-muted);
+}
+
+.status {
+    font-size: 0.875rem;
+    font-weight: 500;
+    padding: 0.125rem 0.5rem;
+    border-radius: 4px;
+}
+
+.status.disconnected {
+    color: var(--color-error);
+    background: #fef2f2;
+}
+
+.status.connected {
+    color: var(--color-success);
+    background: #ecfdf5;
+}
+
+.status.verified {
+    color: var(--color-success);
+    background: #ecfdf5;
+}
+
+.result-group {
+    margin-top: 1rem;
+}
+
+.result-group label {
+    display: block;
+    font-size: 0.875rem;
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+}
+
+.address-display {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    word-break: break-all;
+}
+
+/* ============================================
+   Log Output
+   ============================================ */
+.log-output {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    background: #1f2937;
+    color: #e5e7eb;
+    padding: 1rem;
+    border-radius: var(--radius);
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 1rem;
+    min-height: 100px;
+}
+
+.log-output .log-entry {
+    margin-bottom: 0.25rem;
+    line-height: 1.4;
+}
+
+.log-output .log-entry.info {
+    color: #93c5fd;
+}
+
+.log-output .log-entry.success {
+    color: #86efac;
+}
+
+.log-output .log-entry.error {
+    color: #fca5a5;
+}
+
+.log-output .log-entry.warn {
+    color: #fcd34d;
+}
+
+.log-output .timestamp {
+    color: #9ca3af;
+    margin-right: 0.5rem;
+}
+
+/* ============================================
+   Utility Classes
+   ============================================ */
+.hidden {
+    display: none !important;
+}
+
+.hint {
+    font-size: 0.8rem;
+    color: var(--color-text-muted);
+    margin-top: 0.5rem;
+}
+
+/* ============================================
+   Responsive
+   ============================================ */
+@media (max-width: 600px) {
+    .form-grid {
+        grid-template-columns: 1fr;
+    }
+
+    header {
+        padding: 1rem;
+    }
+
+    header h1 {
+        font-size: 1.5rem;
+    }
+
+    .button-row {
+        flex-direction: column;
+    }
+}
