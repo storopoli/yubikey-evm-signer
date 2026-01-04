@@ -1,6 +1,6 @@
 //! Error types for the YubiKey EVM signer library.
 //!
-//! This module provides a comprehensive error type [`Error`] that covers all
+//! This module provides a comprehensive error type [`enum@Error`] that covers all
 //! possible failure modes when signing Ethereum transactions with a YubiKey.
 //!
 //! # Error Categories

@@ -1,7 +1,7 @@
 //! WebUSB transport implementation for YubiKey communication.
 //!
 //! This module provides a WebUSB-based transport layer that implements
-//! the [`Transport`] trait from the core library. It enables browser-based
+//! the [`Transport`](yubikey_evm_signer_core::yubikey::Transport) trait from the core library. It enables browser-based
 //! applications to communicate with YubiKey devices via the WebUSB API.
 //!
 //! # Browser Support
