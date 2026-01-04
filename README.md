@@ -2,107 +2,83 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache-blue.svg)](https://opensource.org/licenses/apache-2-0)
-[![ci](https://github.com/alpenlabs/rust-template/actions/workflows/lint.yml/badge.svg?event=push)](https://github.com/alpenlabs/rust-template/actions)
-[![docs](https://img.shields.io/badge/docs-docs.rs-orange)](https://docs.rs/rust-template)
+[![ci](https://github.com/storopoli/yubikey-evm-signer/actions/workflows/lint.yml/badge.svg?event=push)](https://github.com/storopoli/yubikey-evm-signer/actions)
 
-This repo is a workspace for the YubiKey EVM Signer project.
+| Crate | crates.io | docs.rs |
+|-------|-----------|---------|
+| yubikey-evm-signer-core | [![crates.io](https://img.shields.io/crates/v/yubikey-evm-signer-core.svg)](https://crates.io/crates/yubikey-evm-signer-core) | [![docs.rs](https://docs.rs/yubikey-evm-signer-core/badge.svg)](https://docs.rs/yubikey-evm-signer-core) |
+| yubikey-evm-signer-wasm | [![crates.io](https://img.shields.io/crates/v/yubikey-evm-signer-wasm.svg)](https://crates.io/crates/yubikey-evm-signer-wasm) | [![docs.rs](https://docs.rs/yubikey-evm-signer-wasm/badge.svg)](https://docs.rs/yubikey-evm-signer-wasm) |
 
-## Settings and Branch Protection Rules
+| Package | npm |
+|---------|-----|
+| yubikey-evm-signer | [![npm](https://img.shields.io/npm/v/yubikey-evm-signer.svg)](https://www.npmjs.com/package/yubikey-evm-signer) |
 
-Note that settings and branch protection rules are not ported over to new repositories
-created using templates.
-Hence, you'll need to change settings and add branch protection rules manually.
-Here's a suggestion for branch protection rules for the default branch,
-i.e. `main`:
+Sign Ethereum transactions using a YubiKey's PIV applet with secp256r1 (P-256) ECDSA. Leverages [EIP-7951](https://eips.ethereum.org/EIPS/eip-7951) for native secp256r1 signature verification on the EVM. Passes all 781 EIP-7951 test vectors.
 
-```json
-{
-  "id": 2405180,
-  "name": "Main Branch Protection",
-  "target": "branch",
-  "source_type": "Repository",
-  "source": "alpenlabs/NAME",
-  "enforcement": "active",
-  "conditions": {
-    "ref_name": {
-      "exclude": [],
-      "include": [
-        "~DEFAULT_BRANCH"
-      ]
-    }
-  },
-  "rules": [
-    {
-      "type": "deletion"
-    },
-    {
-      "type": "non_fast_forward"
-    },
-    {
-      "type": "pull_request",
-      "parameters": {
-        "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": false,
-        "require_last_push_approval": false,
-        "required_review_thread_resolution": false,
-        "automatic_copilot_code_review_enabled": false,
-        "allowed_merge_methods": [
-          "merge",
-          "squash",
-          "rebase"
-        ]
-      }
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "strict_required_status_checks_policy": false,
-        "do_not_enforce_on_create": false,
-        "required_status_checks": [
-          {
-            "context": "Check that lints passed",
-            "integration_id": 15368
-          },
-          {
-            "context": "Check that unit tests pass",
-            "integration_id": 15368
-          }
-        ]
-      }
-    },
-    {
-      "type": "merge_queue",
-      "parameters": {
-        "merge_method": "SQUASH",
-        "max_entries_to_build": 5,
-        "min_entries_to_merge": 1,
-        "max_entries_to_merge": 5,
-        "min_entries_to_merge_wait_minutes": 5,
-        "grouping_strategy": "ALLGREEN",
-        "check_response_timeout_minutes": 60
-      }
-    }
-  ],
-  "bypass_actors": [
-    {
-      "actor_id": 5,
-      "actor_type": "RepositoryRole",
-      "bypass_mode": "pull_request"
-    }
-  ]
-}
-```
 ## Features
 
-- Feature 1
-- Feature 2
+- **EIP-7951 Compatible**: Native secp256r1 signatures without curve conversion
+- **Transaction Support**: EIP-155 legacy and EIP-1559 transactions
+- **EIP-712**: Typed structured data signing
+- **EIP-191**: Personal message signing
+- **Hardware Security**: Private keys never leave the YubiKey
+- **Cross-Platform**: Native (CCID) and browser (WebUSB) support
 
 ## Usage
 
+### Rust
+
 ```rust
-// How to use the library/binary.
+use yubikey_evm_signer_core::{Transaction, Eip1559Transaction, Address};
+use alloy_primitives::U256;
+
+// Create an EIP-1559 transaction
+let tx = Transaction::Eip1559(Eip1559Transaction {
+    chain_id: 1,
+    nonce: 0,
+    max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+    max_fee_per_gas: U256::from(100_000_000_000u64),
+    gas_limit: 21000,
+    to: Some(Address::zero()),
+    value: U256::from(1_000_000_000_000_000_000u128),
+    data: vec![],
+    access_list: vec![],
+});
+
+// Get the hash to sign
+let hash = tx.signing_hash();
 ```
+
+### JavaScript/TypeScript (Browser)
+
+```javascript
+import init, { YubiKeyDevice } from 'yubikey-evm-signer';
+
+await init();
+
+// Connect to YubiKey (requires user gesture)
+const device = await YubiKeyDevice.connect();
+
+// Generate a new key
+const address = await device.generateKey("123456");
+
+// Sign a transaction
+const signature = await device.signTransaction("123456", JSON.stringify({
+    type: "eip1559",
+    chain_id: 1,
+    nonce: 0,
+    max_priority_fee_per_gas: "1000000000",
+    max_fee_per_gas: "20000000000",
+    gas_limit: 21000,
+    to: "0x...",
+    value: "1000000000000000000",
+    input: "0x"
+}));
+
+await device.disconnect();
+```
+
+> **Note**: WebUSB is only supported in Chromium-based browsers (Chrome, Edge, Opera, Brave) and requires HTTPS.
 
 ## Contributing
 
