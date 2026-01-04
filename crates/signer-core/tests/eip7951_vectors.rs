@@ -6,7 +6,9 @@
 // Silence unused crate dependency warnings for test binary
 use alloy_primitives as _;
 use alloy_rlp as _;
+use des as _;
 use p256 as _;
+use pcsc as _;
 use thiserror as _;
 
 use serde::Deserialize;

@@ -47,9 +47,15 @@ pub mod apdu;
 pub mod piv;
 pub mod slot;
 
+#[cfg(feature = "pcsc")]
+pub mod pcsc_transport;
+
 pub use apdu::{Apdu, ApduResponse};
 pub use piv::PivSession;
 pub use slot::Slot;
+
+#[cfg(feature = "pcsc")]
+pub use pcsc_transport::PcscTransport;
 
 use crate::error::Result;
 

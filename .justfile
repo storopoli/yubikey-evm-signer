@@ -91,3 +91,39 @@ demo-serve:
 
 # Build and serve demo site locally
 demo: demo-build demo-serve
+
+# =============================================================================
+# Native CLI Demo (requires YubiKey and PC/SC - works on macOS/Linux/Windows)
+# =============================================================================
+
+# Build CLI example with PCSC support
+cli-build:
+  cargo build --example yubikey-cli -p yubikey-evm-signer-core --features pcsc
+
+# List available YubiKey devices
+cli-list:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- list
+
+# Show YubiKey connection info
+cli-info:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- info
+
+# Get Ethereum address from slot 9a
+cli-address:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- address
+
+# Generate a new P-256 key in slot 9a (requires PIN, overwrites existing key!)
+cli-generate:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate
+
+# Sign a sample EIP-1559 transaction (requires PIN)
+cli-sign-tx:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign-tx
+
+# Sign a custom 32-byte hash (requires PIN)
+cli-sign hash:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign {{hash}}
+
+# Show CLI help
+cli-help:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- --help

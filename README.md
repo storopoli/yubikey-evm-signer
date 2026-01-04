@@ -81,6 +81,58 @@ await device.disconnect();
 ```
 
 > **Note**: WebUSB is only supported in Chromium-based browsers (Chrome, Edge, Opera, Brave) and requires HTTPS.
+> WebUSB does **not** work on macOS due to kernel driver conflicts. Use the native CLI instead.
+
+### Native CLI (macOS/Linux/Windows)
+
+For native access via PC/SC (smart card interface), use the CLI example:
+
+```bash
+# List connected YubiKeys
+just cli-list
+
+# Generate a new P-256 key in slot 9a
+just cli-generate
+
+# Create a certificate (required for address retrieval)
+ykman piv keys export 9a /tmp/pubkey.pem
+ykman piv certificates generate -P 123456 \
+  -m 010203040506070801020304050607080102030405060708 \
+  -s "CN=YubiKey EVM Signer" 9a /tmp/pubkey.pem
+
+# Get Ethereum address
+just cli-address
+
+# Sign a sample EIP-1559 transaction
+just cli-sign-tx
+
+# Sign a custom 32-byte hash
+just cli-sign 0x0123456789abcdef...
+```
+
+Or run directly with cargo:
+
+```bash
+cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- <command>
+```
+
+#### Platform Requirements
+
+| Platform | Requirements |
+|----------|--------------|
+| macOS | Works out of the box (built-in smart card daemon) |
+| Linux | `pcscd` service running, may need [udev rules](https://developers.yubico.com/yubikey-manager/Device_Permissions.html) |
+| Windows | Works out of the box (built-in smart card service) |
+
+#### Default PIV Credentials
+
+| Credential | Default Value |
+|------------|---------------|
+| PIN | `123456` |
+| PUK | `12345678` |
+| Management Key | `010203040506070801020304050607080102030405060708` |
+
+> **Security**: Change default credentials for production use with `ykman piv access`.
 
 ## Contributing
 

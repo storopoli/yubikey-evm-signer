@@ -13,8 +13,17 @@ keywords.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+pcsc = ["dep:pcsc", "dep:des"]
+
+[[example]]
+name = "yubikey-cli"
+required-features = ["pcsc"]
+
 [dependencies]
 # Crypto
+des = { version = "0.8.1", optional = true }
 p256 = { workspace = true, features = ["ecdsa"] }
 
 # Ethereum
@@ -27,4 +36,5 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
+# Optional: PC/SC for native YubiKey access
+pcsc = { version = "2.9.0", optional = true }
