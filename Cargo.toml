@@ -34,8 +34,8 @@ p256 = "0.13.2"
 sha3 = "0.10.8"
 
 # Ethereum (Alloy)
-alloy-primitives = { version = "1.5.2", features = ["serde", "rlp"] }
-alloy-rlp = { version = "0.3.12", features = ["derive"] }
+alloy-primitives = { version = "1.5.7", features = ["serde", "rlp"] }
+alloy-rlp = { version = "0.3.13", features = ["derive"] }
 
 # WASM
 js-sys = "0.3.83"
@@ -46,8 +46,8 @@ web-sys = "0.3.83"
 # Utils
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-thiserror = "2.0.17"
+serde_json = "1.0.149"
+thiserror = "2.0.18"
 
 [profile.release]
 opt-level = "z"   # Optimized for size, use 3 for speed
