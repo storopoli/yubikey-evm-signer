@@ -306,11 +306,15 @@ impl WebUsbTransport {
         // Extract data length
         let data_len = u32::from_le_bytes([ccid[1], ccid[2], ccid[3], ccid[4]]) as usize;
 
-        if ccid.len() < 10 + data_len {
+        let end = 10usize
+            .checked_add(data_len)
+            .ok_or_else(|| WasmError::UsbError("CCID data length overflow".to_string()))?;
+
+        if ccid.len() < end {
             return Err(WasmError::UsbError("CCID data length mismatch".to_string()));
         }
 
-        Ok(ccid[10..10 + data_len].to_vec())
+        Ok(ccid[10..end].to_vec())
     }
 
     /// Transmits an APDU and receives the response (async version).
