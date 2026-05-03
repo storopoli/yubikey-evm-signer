@@ -94,9 +94,13 @@ impl Eip712Domain {
     ///
     /// # Returns
     ///
-    /// The 32-byte domain separator hash.
-    #[must_use]
-    pub fn separator_hash(&self) -> B256 {
+    /// A [`Result`] containing the 32-byte domain separator hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTypedData`] if `verifying_contract` is not a valid
+    /// 20-byte address or if `salt` is not a valid 32-byte value.
+    pub fn separator_hash(&self) -> Result<B256> {
         // Build the type string for EIP712Domain
         let mut type_parts = vec!["EIP712Domain("];
         let mut value_parts = Vec::new();
@@ -157,17 +161,19 @@ impl Eip712Domain {
             encoded.extend_from_slice(&buf);
         }
         if let Some(ref contract) = self.verifying_contract {
-            let addr = parse_address(contract).unwrap_or(AlloyAddress::ZERO);
+            let addr = parse_address(contract)
+                .map_err(|e| Error::InvalidTypedData(format!("invalid verifyingContract: {e}")))?;
             let mut buf = [0u8; 32];
             buf[12..].copy_from_slice(addr.as_slice());
             encoded.extend_from_slice(&buf);
         }
         if let Some(ref salt) = self.salt {
-            let salt_bytes = parse_bytes32(salt).unwrap_or([0u8; 32]);
+            let salt_bytes = parse_bytes32(salt)
+                .map_err(|e| Error::InvalidTypedData(format!("invalid salt: {e}")))?;
             encoded.extend_from_slice(&salt_bytes);
         }
 
-        keccak256(&encoded)
+        Ok(keccak256(&encoded))
     }
 }
 
@@ -237,7 +243,7 @@ impl TypedData {
     /// Returns [`Error::InvalidTypedData`] if the type definitions or message
     /// are malformed.
     pub fn signing_hash(&self) -> Result<B256> {
-        let domain_separator = self.domain.separator_hash();
+        let domain_separator = self.domain.separator_hash()?;
         let struct_hash = self.hash_struct(&self.primary_type, &self.message)?;
 
         // Compute final hash: keccak256("\x19\x01" || domainSeparator || structHash)
@@ -562,7 +568,7 @@ mod tests {
             salt: None,
         };
 
-        let hash = domain.separator_hash();
+        let hash = domain.separator_hash().unwrap();
         assert!(!hash.is_zero());
     }
 
@@ -578,7 +584,7 @@ mod tests {
             ),
         };
 
-        let hash = domain.separator_hash();
+        let hash = domain.separator_hash().unwrap();
         assert!(!hash.is_zero());
     }
 
@@ -608,6 +614,32 @@ mod tests {
         let hash = typed_data.signing_hash().unwrap();
 
         assert!(!hash.is_zero());
+    }
+
+    #[test]
+    fn domain_separator_rejects_invalid_verifying_contract() {
+        let domain = Eip712Domain {
+            name: Some("Test".to_string()),
+            version: Some("1".to_string()),
+            chain_id: Some(1),
+            verifying_contract: Some("0xdeadbeef".to_string()),
+            salt: None,
+        };
+
+        assert!(domain.separator_hash().is_err());
+    }
+
+    #[test]
+    fn domain_separator_rejects_invalid_salt() {
+        let domain = Eip712Domain {
+            name: Some("Test".to_string()),
+            version: Some("1".to_string()),
+            chain_id: Some(1),
+            verifying_contract: None,
+            salt: Some("0x01".to_string()),
+        };
+
+        assert!(domain.separator_hash().is_err());
     }
 
     #[test]
