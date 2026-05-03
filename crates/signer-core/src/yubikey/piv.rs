@@ -68,13 +68,6 @@ mod key {
     pub(super) const MANAGEMENT: u8 = 0x9B;
 }
 
-/// The default PIV management key (3DES, 24 bytes).
-#[cfg(feature = "pcsc")]
-const DEFAULT_MANAGEMENT_KEY: [u8; 24] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-];
-
 /// Algorithm identifiers.
 mod alg {
     /// `ECCP256` (secp256r1/P-256).
@@ -202,27 +195,6 @@ impl PivSession {
         Ok(())
     }
 
-    /// Authenticates with the management key using 3DES mutual authentication.
-    ///
-    /// This is required before key generation or other administrative operations.
-    /// Uses the default PIV management key if no custom key has been set.
-    ///
-    /// # Returns
-    ///
-    /// [`Ok(())`](Ok) if authentication was successful.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if authentication fails (e.g., wrong management key).
-    ///
-    /// # Note
-    ///
-    /// This method requires the `pcsc` feature to be enabled.
-    #[cfg(feature = "pcsc")]
-    pub fn authenticate_management_key(&mut self) -> Result<()> {
-        self.authenticate_management_key_with(&DEFAULT_MANAGEMENT_KEY)
-    }
-
     /// Authenticates with a custom management key.
     ///
     /// # Arguments
@@ -340,8 +312,9 @@ impl PivSession {
     ///
     /// # Note
     ///
-    /// This operation requires management key authentication, which is
-    /// handled internally using the default management key.
+    /// This operation requires prior PIN verification for PIN-protected slots
+    /// and explicit management key authentication via
+    /// [`authenticate_management_key_with`](Self::authenticate_management_key_with).
     ///
     /// # Example
     ///
@@ -354,9 +327,14 @@ impl PivSession {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
         }
 
-        // Authenticate with management key if not already done
+        if slot.requires_pin() && !self.pin_verified {
+            return Err(Error::InvalidPin);
+        }
+
         if !self.mgmt_authenticated {
-            self.authenticate_management_key()?;
+            return Err(Error::ApduError(
+                "management key not authenticated".to_string(),
+            ));
         }
 
         // Build the generate key APDU
