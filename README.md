@@ -61,11 +61,12 @@ await init();
 // Connect to YubiKey (requires user gesture)
 const device = await YubiKeyDevice.connect();
 
-// Generate a new key
-const address = await device.generateKey("123456");
+// Use an existing key's address (safe default)
+const address = await device.getAddress();
 
-// Sign a transaction
-const signature = await device.signTransaction("123456", JSON.stringify({
+// Sign a transaction (prompt user for PIN; avoid hardcoding secrets)
+const pin = "<PIN_FROM_USER_INPUT>";
+const signature = await device.signTransaction(pin, JSON.stringify({
     type: "eip1559",
     chain_id: 1,
     nonce: 0,
@@ -79,6 +80,10 @@ const signature = await device.signTransaction("123456", JSON.stringify({
 
 await device.disconnect();
 ```
+
+
+> **Warning**: `generateKey(pin)` is destructive and overwrites any existing private key in the selected PIV slot (default slot 9a).
+> Only call it when you intentionally want to replace that key, and back up account access before doing so.
 
 > **Note**: WebUSB is only supported in Chromium-based browsers (Chrome, Edge, Opera, Brave) and requires HTTPS.
 > WebUSB does **not** work on macOS due to kernel driver conflicts. Use the native CLI instead.
