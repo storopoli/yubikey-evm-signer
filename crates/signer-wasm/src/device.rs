@@ -485,44 +485,25 @@ fn parse_public_key_response(data: &[u8]) -> Option<VerifyingKey> {
     i += 2;
 
     // Skip length
-    if data[i] >= 0x80 {
-        i += 1 + (data[i] & 0x7F) as usize;
-    } else {
-        i += 1;
-    }
+    let (_, consumed) = parse_der_length(data, i)?;
+    i = i.checked_add(consumed)?;
 
     // Find tag 86
     while i < data.len() {
         if data[i] == 0x86 {
             i += 1;
-            let len = if data[i] >= 0x80 {
-                let len_bytes = (data[i] & 0x7F) as usize;
-                i += 1;
-                let mut len = 0usize;
-                for j in 0..len_bytes {
-                    len = (len << 8) | (data[i + j] as usize);
-                }
-                i += len_bytes;
-                len
-            } else {
-                let len = data[i] as usize;
-                i += 1;
-                len
-            };
+            let (len, consumed) = parse_der_length(data, i)?;
+            i = i.checked_add(consumed)?;
+            let end = i.checked_add(len)?;
 
-            if len == 65 && data[i] == 0x04 {
-                let point_bytes = &data[i..i + len];
+            if len == 65 && data.get(i) == Some(&0x04) && end <= data.len() {
+                let point_bytes = &data[i..end];
                 let point = EncodedPoint::from_bytes(point_bytes).ok()?;
                 return VerifyingKey::from_encoded_point(&point).ok();
             }
             break;
         }
         i += 1;
-        if i >= data.len() {
-            break;
-        }
-        let len = data[i] as usize;
-        i += 1 + len;
     }
 
     None
@@ -558,11 +539,8 @@ fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
     if i >= data.len() {
         return None;
     }
-    if data[i] >= 0x80 {
-        i += 1 + (data[i] & 0x7F) as usize;
-    } else {
-        i += 1;
-    }
+    let (_, consumed) = parse_der_length(data, i)?;
+    i = i.checked_add(consumed)?;
 
     // Find tag 82
     while i < data.len() {
@@ -572,26 +550,12 @@ fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
 
-            let len = if data[i] >= 0x80 {
-                let len_bytes = (data[i] & 0x7F) as usize;
-                i += 1;
-                let mut len = 0usize;
-                for j in 0..len_bytes {
-                    if i + j >= data.len() {
-                        return None;
-                    }
-                    len = (len << 8) | (data[i + j] as usize);
-                }
-                i += len_bytes;
-                len
-            } else {
-                let len = data[i] as usize;
-                i += 1;
-                len
-            };
+            let (len, consumed) = parse_der_length(data, i)?;
+            i = i.checked_add(consumed)?;
+            let end = i.checked_add(len)?;
 
-            if i + len <= data.len() {
-                return Some(data[i..i + len].to_vec());
+            if end <= data.len() {
+                return Some(data[i..end].to_vec());
             }
             break;
         }
@@ -599,6 +563,30 @@ fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+/// Parses a DER-style length at `offset` and returns `(value, consumed_bytes)`.
+fn parse_der_length(data: &[u8], offset: usize) -> Option<(usize, usize)> {
+    let first = *data.get(offset)?;
+    if first < 0x80 {
+        return Some((first as usize, 1));
+    }
+
+    let len_bytes = (first & 0x7F) as usize;
+    if len_bytes == 0 {
+        return None;
+    }
+
+    let start = offset.checked_add(1)?;
+    let end = start.checked_add(len_bytes)?;
+    let bytes = data.get(start..end)?;
+
+    let mut len = 0usize;
+    for &b in bytes {
+        len = len.checked_shl(8)? | usize::from(b);
+    }
+
+    Some((len, 1 + len_bytes))
 }
 
 #[cfg(test)]
