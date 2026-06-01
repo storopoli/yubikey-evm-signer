@@ -34,7 +34,7 @@ p256 = "0.13.2"
 sha3 = "0.10.9"
 
 # Ethereum (Alloy)
-alloy-primitives = { version = "1.5.7", features = ["serde", "rlp"] }
+alloy-primitives = { version = "1.6.0", features = ["serde", "rlp"] }
 alloy-rlp = { version = "0.3.15", features = ["derive"] }
 
 # WASM
