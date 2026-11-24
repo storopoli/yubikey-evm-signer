@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-YubiKey EVM Signer enables signing Ethereum transactions using a YubiKey's PIV applet with secp256r1 (P-256) ECDSA, leveraging EIP-7951 for native secp256r1 signature verification on the EVM.
+YubiKey EVM Signer enables signing Ethereum transactions using a YubiKey's PIV applet with secp256r1 (P-256) ECDSA, targeting EIP-7951 (`P256VERIFY` precompile at `0x100`) for native secp256r1 signature verification on the EVM.
 
 There's a justfile that provides a set of build commands and testing commands.
 See `.justfile` for more details.
@@ -33,6 +33,9 @@ cargo nextest run --all-features test_name
 
 # Run doc tests
 cargo test --doc --all-features
+
+# Verify demo HTML/JS integrity (add --check-wasm after building packages/npm/dist)
+node scripts/verify-demo.mjs
 ```
 
 ## Linting
@@ -56,22 +59,26 @@ taplo lint && taplo fmt --check
 
 ## Architecture
 
-Two-crate workspace with transport abstraction:
+Two-crate workspace with native and browser transports:
 
 - **signer-core** (`yubikey-evm-signer-core`): Platform-agnostic core library
   - `transaction.rs`: EIP-155 legacy and EIP-1559 transaction types
   - `eip712.rs`: EIP-712 typed data hashing
+  - `crypto.rs`: P-256 DER parsing, low-S normalization, recovery ID calculation, EIP-7951 `p256_verify`, and EIP-191 hashing
   - `address.rs`: Ethereum address derivation from P-256 public keys
   - `signature.rs`: Signature types with low-S normalization
+  - `bridge.rs`: Hardened local loopback HTTP/1.1 PC/SC bridge server (non-WASM targets)
   - `yubikey/`: PIV applet communication
-    - `Transport` trait for platform abstraction (CCID or WebUSB)
-    - `PivSession` for key operations and signing
+    - `Transport` trait for synchronous native/mock transports (`PcscTransport` behind the optional `pcsc` feature)
+    - `PivSession` and sans-IO PIV APDU builders/parsers in `piv.rs`
     - `Slot` enum for PIV slot management
     - `Apdu` for command encoding
+  - `examples/yubikey-cli.rs`: Native PC/SC CLI, including `yubikey-cli bridge`
 
 - **signer-wasm** (`yubikey-evm-signer-wasm`): Browser WASM bindings
-  - `device.rs`: `YubiKeyDevice` class exposed to JavaScript
-  - `transport.rs`: `WebUsbTransport` implementing core `Transport` trait
+  - `device.rs`: `YubiKeyDevice` class exposed to JavaScript (`connectBridge` and `connect`)
+  - `bridge_transport.rs`: Async `BridgeTransport` connecting to `yubikey-cli bridge` over loopback `fetch()`
+  - `transport.rs`: Async `WebUsbTransport` (browser async CCID transport; does not implement core's synchronous `Transport` trait) and shared `AsyncApduTransport` retry/chaining helpers
   - Built with wasm-pack, outputs to `packages/npm/dist/`
 
 ## Key Technical Details
