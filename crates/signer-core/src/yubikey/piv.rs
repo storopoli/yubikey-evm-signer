@@ -1,17 +1,16 @@
-//! PIV session management and operations.
+//! PIV session management, sans-IO APDU helpers, and strict BER-TLV/X.509 parsing.
 //!
-//! This module provides the [`PivSession`] type for interacting with the
-//! YubiKey PIV applet. It handles:
+//! This module provides both:
 //!
-//! - Applet selection
-//! - PIN verification
-//! - Key generation
-//! - Signing operations
-//! - Public key retrieval
+//! - [`PivSession`]: stateful session manager over any [`Transport`]
+//! - Reusable sans-IO APDU builders, management-key cryptography helpers, and
+//!   strict response parsers that async transports (such as WebUSB in WASM) can
+//!   call directly without duplicating PIV protocol logic.
 //!
 //! # Example
 //!
 //! ```ignore
+//! use yubikey_evm_signer_core::yubikey::piv::ManagementKeyAlgorithm;
 //! use yubikey_evm_signer_core::yubikey::{PivSession, Slot, Transport};
 //!
 //! let transport: Box<dyn Transport> = /* obtain transport */;
@@ -20,20 +19,26 @@
 //! // Select the PIV applet
 //! session.select()?;
 //!
-//! // Verify PIN
-//! session.verify_pin("123456")?;
-//!
-//! // Generate a P-256 key
+//! // Authenticate management key before generating a key
+//! session.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
 //! let public_key = session.generate_key(Slot::Authentication)?;
 //!
-//! // Sign data
+//! // Verify PIN and sign a 32-byte digest
+//! session.verify_pin("123456")?;
 //! let signature = session.sign(Slot::Authentication, &hash)?;
 //! ```
 
 use std::fmt;
+use std::io::Read;
 
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::{Aes128, Aes192, Aes256};
+use des::TdesEde3;
+use flate2::read::GzDecoder;
 use p256::Sec1Point;
 use p256::ecdsa::VerifyingKey;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::Transport;
 use super::apdu::Apdu;
@@ -41,7 +46,22 @@ use super::slot::Slot;
 use crate::error::{Error, Result};
 
 /// The PIV applet AID (Application Identifier).
-const PIV_AID: [u8; 9] = [0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00];
+pub const PIV_AID: [u8; 9] = [0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00];
+
+/// Maximum total bytes accepted across chained `GET RESPONSE` chunks (16 KiB).
+const MAX_APDU_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// Maximum number of `GET RESPONSE` chaining iterations.
+const MAX_RESPONSE_CHUNKS: usize = 128;
+
+/// Maximum decompressed PIV certificate size (64 KiB) to guard against zip bombs.
+const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
+
+/// DER OID bytes for `id-ecPublicKey` (`1.2.840.10045.2.1`).
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+
+/// DER OID bytes for `secp256r1` / `prime256v1` (`1.2.840.10045.3.1.7`).
+const OID_SECP256R1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
 /// PIV instruction codes.
 mod ins {
@@ -59,29 +79,588 @@ mod ins {
 
     /// `GET DATA` instruction.
     pub(super) const GET_DATA: u8 = 0xCB;
+
+    /// `GET RESPONSE` instruction (ISO 7816-4 response chaining).
+    pub(super) const GET_RESPONSE: u8 = 0xC0;
 }
 
-/// Key references.
-#[cfg(feature = "pcsc")]
+/// PIV key references.
 mod key {
-    /// Management key (3DES).
+    /// PIV Card Application Administration (management) key (`0x9B`).
     pub(super) const MANAGEMENT: u8 = 0x9B;
 }
 
-/// Algorithm identifiers.
+/// PIV algorithm identifiers.
 mod alg {
     /// `ECCP256` (secp256r1/P-256).
     pub(super) const ECCP256: u8 = 0x11;
-
-    /// `3DES` (Triple DES for management key).
-    #[cfg(feature = "pcsc")]
-    pub(super) const TDES: u8 = 0x03;
 }
+
+/// Supported YubiKey PIV management key algorithms (slot `9B`).
+///
+/// YubiKey firmware `< 5.7` defaults to [`Self::Tdes`] (24-byte Triple DES),
+/// while firmware `>= 5.7` defaults to [`Self::Aes192`] (24-byte AES-192).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManagementKeyAlgorithm {
+    /// Triple DES (3DES-EDE3, 24-byte key, 8-byte block, PIV algorithm `0x03`).
+    Tdes,
+    /// AES-128 (16-byte key, 16-byte block, PIV algorithm `0x08`).
+    Aes128,
+    /// AES-192 (24-byte key, 16-byte block, PIV algorithm `0x0A`).
+    Aes192,
+    /// AES-256 (32-byte key, 16-byte block, PIV algorithm `0x0C`).
+    Aes256,
+}
+
+impl ManagementKeyAlgorithm {
+    /// Returns the PIV algorithm identifier byte (`P1` in `GENERAL AUTHENTICATE`).
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Tdes => 0x03,
+            Self::Aes128 => 0x08,
+            Self::Aes192 => 0x0A,
+            Self::Aes256 => 0x0C,
+        }
+    }
+
+    /// Returns the required key length in bytes.
+    #[must_use]
+    pub const fn key_len(self) -> usize {
+        match self {
+            Self::Tdes | Self::Aes192 => 24,
+            Self::Aes128 => 16,
+            Self::Aes256 => 32,
+        }
+    }
+
+    /// Returns the cipher block size in bytes (`8` for 3DES, `16` for AES).
+    #[must_use]
+    pub const fn block_size(self) -> usize {
+        match self {
+            Self::Tdes => 8,
+            Self::Aes128 | Self::Aes192 | Self::Aes256 => 16,
+        }
+    }
+}
+
+// =============================================================================
+// Sans-IO APDU Builders
+// =============================================================================
+
+/// Builds the `SELECT` APDU for the PIV applet.
+#[must_use]
+pub fn build_select_piv_apdu() -> Apdu {
+    Apdu::new(0x00, ins::SELECT, 0x04, 0x00, PIV_AID.to_vec())
+}
+
+/// Builds the `VERIFY` APDU for PIV PIN authentication.
+///
+/// Enforces that `pin` is between 6 and 8 bytes inclusive so empty or malformed
+/// PINs are rejected before burning a hardware retry counter, then pads to 8
+/// bytes with `0xFF`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidPin`] if `pin.len()` is outside `6..=8`.
+pub fn build_verify_pin_apdu(pin: &str) -> Result<Apdu> {
+    let pin_bytes = pin.as_bytes();
+    if !(6..=8).contains(&pin_bytes.len()) {
+        return Err(Error::InvalidPin {
+            remaining_attempts: None,
+        });
+    }
+
+    let mut padded_pin = [0xFFu8; 8];
+    padded_pin[..pin_bytes.len()].copy_from_slice(pin_bytes);
+    let apdu = Apdu::new(0x00, ins::VERIFY, 0x00, 0x80, padded_pin.to_vec());
+    padded_pin.zeroize();
+    Ok(apdu)
+}
+
+/// Builds a `GET RESPONSE` APDU for ISO 7816-4 `0x61 XX` response chaining.
+///
+/// A `sw2` value of `0x00` requests 256 bytes.
+#[must_use]
+pub fn build_get_response_apdu(sw2: u8) -> Apdu {
+    let le = if sw2 == 0 { 256 } else { u32::from(sw2) };
+    Apdu::with_le(0x00, ins::GET_RESPONSE, 0x00, 0x00, Vec::new(), le)
+}
+
+/// Builds a `GENERATE ASYMMETRIC KEY PAIR` APDU for P-256 in the given [`Slot`].
+#[must_use]
+pub fn build_generate_key_apdu(slot: Slot) -> Apdu {
+    let template = vec![0xAC, 0x03, 0x80, 0x01, alg::ECCP256];
+    Apdu::with_le(
+        0x00,
+        ins::GENERATE_ASYMMETRIC,
+        0x00,
+        slot.id(),
+        template,
+        256,
+    )
+}
+
+/// Builds a `GET DATA` APDU to retrieve the X.509 certificate object for [`Slot`].
+#[must_use]
+pub fn build_get_certificate_apdu(slot: Slot) -> Apdu {
+    let object_id = slot.object_id();
+    let data = vec![0x5C, 0x03, object_id[0], object_id[1], object_id[2]];
+    Apdu::with_le(0x00, ins::GET_DATA, 0x3F, 0xFF, data, 256)
+}
+
+/// Builds a `GENERAL AUTHENTICATE` signing APDU for a 32-byte digest using P-256.
+#[must_use]
+pub fn build_sign_apdu(slot: Slot, hash: &[u8; 32]) -> Apdu {
+    // Template: 7C 24 82 00 81 20 <32-byte hash>
+    let mut template = Vec::with_capacity(6 + 32);
+    template.push(0x7C);
+    template.push(0x24); // 4 + 32 = 36 bytes
+    template.push(0x82);
+    template.push(0x00);
+    template.push(0x81);
+    template.push(0x20); // 32 bytes
+    template.extend_from_slice(hash);
+
+    Apdu::with_le(
+        0x00,
+        ins::AUTHENTICATE,
+        alg::ECCP256,
+        slot.id(),
+        template,
+        256,
+    )
+}
+
+/// Builds step 1 of PIV mutual management key authentication: request an encrypted witness.
+#[must_use]
+pub fn build_mgmt_auth_request_witness_apdu(alg: ManagementKeyAlgorithm) -> Apdu {
+    Apdu::with_le(
+        0x00,
+        ins::AUTHENTICATE,
+        alg.id(),
+        key::MANAGEMENT,
+        vec![0x7C, 0x02, 0x80, 0x00],
+        256,
+    )
+}
+
+/// Builds step 2 of PIV mutual management key authentication.
+///
+/// Sends the decrypted card witness in tag `0x80` and a fresh **plaintext** host
+/// challenge in tag `0x81` (per NIST SP 800-73-4 / YubiKey PIV mutual auth).
+///
+/// # Errors
+///
+/// Returns [`Error::ApduError`] if `decrypted_witness` or `host_challenge` does not
+/// match `alg.block_size()`.
+pub fn build_mgmt_auth_verify_apdu(
+    alg: ManagementKeyAlgorithm,
+    decrypted_witness: &[u8],
+    host_challenge: &[u8],
+) -> Result<Apdu> {
+    let block_size = alg.block_size();
+    if decrypted_witness.len() != block_size || host_challenge.len() != block_size {
+        return Err(Error::ApduError(format!(
+            "management auth witness and challenge must be {block_size} bytes for {alg:?}"
+        )));
+    }
+
+    let inner_len = 2 + block_size + 2 + block_size;
+    let mut auth_data = Vec::with_capacity(2 + inner_len);
+    auth_data.push(0x7C);
+    auth_data.push(inner_len as u8);
+    auth_data.push(0x80);
+    auth_data.push(block_size as u8);
+    auth_data.extend_from_slice(decrypted_witness);
+    auth_data.push(0x81);
+    auth_data.push(block_size as u8);
+    auth_data.extend_from_slice(host_challenge);
+
+    Ok(Apdu::with_le(
+        0x00,
+        ins::AUTHENTICATE,
+        alg.id(),
+        key::MANAGEMENT,
+        auth_data,
+        256,
+    ))
+}
+
+// =============================================================================
+// Management Key Cryptography Helpers
+// =============================================================================
+
+/// Decrypts the card's encrypted witness block using the specified management key algorithm.
+///
+/// # Errors
+///
+/// Returns [`Error::AuthenticationFailed`] if the key length or witness block length is invalid.
+pub fn decrypt_mgmt_witness(
+    alg: ManagementKeyAlgorithm,
+    key: &[u8],
+    witness: &[u8],
+) -> Result<Vec<u8>> {
+    if key.len() != alg.key_len() || witness.len() != alg.block_size() {
+        return Err(Error::AuthenticationFailed);
+    }
+
+    let mut block = witness.to_vec();
+    match alg {
+        ManagementKeyAlgorithm::Tdes => {
+            let cipher = TdesEde3::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.decrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes128 => {
+            let cipher = Aes128::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.decrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes192 => {
+            let cipher = Aes192::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.decrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes256 => {
+            let cipher = Aes256::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.decrypt_block(block.as_mut_slice().into());
+        }
+    }
+
+    Ok(block)
+}
+
+/// Encrypts the host's plaintext challenge block to compute the expected card response.
+///
+/// # Errors
+///
+/// Returns [`Error::AuthenticationFailed`] if the key length or challenge block length is invalid.
+pub fn encrypt_mgmt_challenge(
+    alg: ManagementKeyAlgorithm,
+    key: &[u8],
+    challenge: &[u8],
+) -> Result<Vec<u8>> {
+    if key.len() != alg.key_len() || challenge.len() != alg.block_size() {
+        return Err(Error::AuthenticationFailed);
+    }
+
+    let mut block = challenge.to_vec();
+    match alg {
+        ManagementKeyAlgorithm::Tdes => {
+            let cipher = TdesEde3::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.encrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes128 => {
+            let cipher = Aes128::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.encrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes192 => {
+            let cipher = Aes192::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.encrypt_block(block.as_mut_slice().into());
+        }
+        ManagementKeyAlgorithm::Aes256 => {
+            let cipher = Aes256::new_from_slice(key).map_err(|_| Error::AuthenticationFailed)?;
+            cipher.encrypt_block(block.as_mut_slice().into());
+        }
+    }
+
+    Ok(block)
+}
+
+/// Compares the expected encrypted challenge against the card's response in constant time.
+#[must_use]
+pub fn verify_mgmt_challenge_response(expected: &[u8], actual: &[u8]) -> bool {
+    bool::from(expected.ct_eq(actual))
+}
+
+// =============================================================================
+// Strict BER-TLV & X.509 Response Parsers
+// =============================================================================
+
+/// Parses a BER-TLV tag (1 to 4 bytes) and returns `(tag, bytes_consumed)`.
+fn parse_ber_tag(data: &[u8]) -> Option<(u32, usize)> {
+    let first = *data.first()?;
+    if (first & 0x1F) != 0x1F {
+        return Some((u32::from(first), 1));
+    }
+
+    // Multi-byte tag (e.g., 0x7F 0x49)
+    let mut tag = u32::from(first);
+    let mut idx = 1usize;
+    loop {
+        if idx >= 4 {
+            return None;
+        }
+        let next = *data.get(idx)?;
+        tag = (tag << 8) | u32::from(next);
+        idx += 1;
+        if (next & 0x80) == 0 {
+            return Some((tag, idx));
+        }
+    }
+}
+
+/// Parses a canonical DER length and returns `(value_len, bytes_consumed)`.
+///
+/// Rejects indefinite lengths, lengths exceeding 4 bytes, non-canonical leading
+/// zero length bytes, and long-form encodings of lengths `< 0x80`.
+fn parse_der_length(data: &[u8]) -> Option<(usize, usize)> {
+    let first = *data.first()?;
+    if first < 0x80 {
+        return Some((usize::from(first), 1));
+    }
+
+    let len_bytes = usize::from(first & 0x7F);
+    if len_bytes == 0 || len_bytes > 4 || len_bytes > core::mem::size_of::<usize>() {
+        return None;
+    }
+
+    let bytes = data.get(1..1 + len_bytes)?;
+    // Canonical DER: first length byte must not be 0x00
+    if bytes[0] == 0 {
+        return None;
+    }
+
+    let mut len = 0usize;
+    for &b in bytes {
+        len = len.checked_shl(8)? | usize::from(b);
+    }
+
+    // Canonical DER: long form must not be used for lengths < 0x80
+    if len < 0x80 {
+        return None;
+    }
+
+    Some((len, 1 + len_bytes))
+}
+
+/// Parses a single BER-TLV element, returning `(tag, value_slice, remaining_slice)`.
+fn parse_tlv(data: &[u8]) -> Option<(u32, &[u8], &[u8])> {
+    let (tag, tag_len) = parse_ber_tag(data)?;
+    let (val_len, len_len) = parse_der_length(data.get(tag_len..)?)?;
+    let val_start = tag_len.checked_add(len_len)?;
+    let val_end = val_start.checked_add(val_len)?;
+    let value = data.get(val_start..val_end)?;
+    let rest = data.get(val_end..)?;
+    Some((tag, value, rest))
+}
+
+/// Iterates sibling TLVs inside a constructed TLV body to find `target_tag`.
+fn find_tlv_child(mut body: &[u8], target_tag: u32) -> Option<&[u8]> {
+    while !body.is_empty() {
+        let (tag, value, rest) = parse_tlv(body)?;
+        if tag == target_tag {
+            return Some(value);
+        }
+        body = rest;
+    }
+    None
+}
+
+/// Parses the encrypted witness from a management key auth step-1 response (`7C -> 80`).
+#[must_use]
+pub fn parse_witness_response(data: &[u8], expected_block_len: usize) -> Option<Vec<u8>> {
+    let (outer_tag, outer_val, rest) = parse_tlv(data)?;
+    if outer_tag != 0x7C || !rest.is_empty() {
+        return None;
+    }
+    let witness = find_tlv_child(outer_val, 0x80)?;
+    if witness.len() != expected_block_len {
+        return None;
+    }
+    Some(witness.to_vec())
+}
+
+/// Parses the card's encrypted challenge response from management key auth step 2 (`7C -> 82`).
+#[must_use]
+pub fn parse_challenge_response(data: &[u8], expected_block_len: usize) -> Option<Vec<u8>> {
+    let (outer_tag, outer_val, rest) = parse_tlv(data)?;
+    if outer_tag != 0x7C || !rest.is_empty() {
+        return None;
+    }
+    let response = find_tlv_child(outer_val, 0x82)?;
+    if response.len() != expected_block_len {
+        return None;
+    }
+    Some(response.to_vec())
+}
+
+/// Parses a P-256 [`VerifyingKey`] from a `GENERATE ASYMMETRIC` response (`7F49 -> 86`).
+#[must_use]
+pub fn parse_public_key_response(data: &[u8]) -> Option<VerifyingKey> {
+    let (outer_tag, outer_val, rest) = parse_tlv(data)?;
+    if outer_tag != 0x7F49 || !rest.is_empty() {
+        return None;
+    }
+
+    let point_bytes = find_tlv_child(outer_val, 0x86)?;
+    if point_bytes.len() != 65 || point_bytes[0] != 0x04 {
+        return None;
+    }
+
+    let point = Sec1Point::from_bytes(point_bytes).ok()?;
+    VerifyingKey::from_sec1_point(&point).ok()
+}
+
+/// Parses the ASN.1 DER ECDSA signature from a `GENERAL AUTHENTICATE` response (`7C -> 82`).
+#[must_use]
+pub fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
+    let (outer_tag, outer_val, rest) = parse_tlv(data)?;
+    if outer_tag != 0x7C || !rest.is_empty() {
+        return None;
+    }
+
+    let sig = find_tlv_child(outer_val, 0x82)?;
+    if sig.is_empty() {
+        return None;
+    }
+    Some(sig.to_vec())
+}
+
+/// Parses a P-256 [`VerifyingKey`] from a PIV `GET DATA` certificate container (`53 -> 70 / 71`).
+///
+/// Handles optional gzip compression signaled by PIV CertInfo tag `0x71` (bit 0)
+/// with a strict 64 KiB decompressed size cap, then parses the X.509 DER
+/// `Certificate -> tbsCertificate -> subjectPublicKeyInfo` and verifies that the
+/// algorithm OID is `id-ecPublicKey` (`1.2.840.10045.2.1`) and curve parameter
+/// OID is `secp256r1` (`1.2.840.10045.3.1.7`).
+#[must_use]
+pub fn parse_certificate_public_key(data: &[u8]) -> Option<VerifyingKey> {
+    // 1. Parse PIV data object wrapper (tag 0x53)
+    let (outer_tag, mut container, rest) = parse_tlv(data)?;
+    if outer_tag != 0x53 || !rest.is_empty() {
+        return None;
+    }
+
+    let mut cert_bytes: Option<&[u8]> = None;
+    let mut cert_info: u8 = 0;
+
+    while !container.is_empty() {
+        let (tag, value, remaining) = parse_tlv(container)?;
+        match tag {
+            0x70 => cert_bytes = Some(value),
+            0x71 => {
+                if value.len() != 1 {
+                    return None;
+                }
+                cert_info = value[0];
+            }
+            _ => {}
+        }
+        container = remaining;
+    }
+
+    let raw_cert = cert_bytes?;
+    if raw_cert.is_empty() {
+        return None;
+    }
+
+    // 2. Decompress if CertInfo bit 0 (gzip) is set, enforcing strict size cap
+    let decompressed;
+    let der_cert: &[u8] = if (cert_info & 0x01) != 0 {
+        let mut decoder = GzDecoder::new(raw_cert).take((MAX_CERTIFICATE_BYTES as u64) + 1);
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).ok()?;
+        if buf.len() > MAX_CERTIFICATE_BYTES {
+            return None;
+        }
+        decompressed = buf;
+        &decompressed
+    } else {
+        if raw_cert.len() > MAX_CERTIFICATE_BYTES {
+            return None;
+        }
+        raw_cert
+    };
+
+    // 3. Parse X.509 Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let (cert_tag, cert_body, cert_rest) = parse_tlv(der_cert)?;
+    if cert_tag != 0x30 || !cert_rest.is_empty() {
+        return None;
+    }
+
+    // tbsCertificate ::= SEQUENCE
+    let (tbs_tag, mut tbs_body, _) = parse_tlv(cert_body)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
+
+    // Optional [0] EXPLICIT version (tag 0xA0)
+    let (first_tag, _, after_first) = parse_tlv(tbs_body)?;
+    if first_tag == 0xA0 {
+        tbs_body = after_first;
+    }
+
+    // serialNumber ::= INTEGER (0x02)
+    let (serial_tag, _, rest) = parse_tlv(tbs_body)?;
+    if serial_tag != 0x02 {
+        return None;
+    }
+    // signature ::= AlgorithmIdentifier SEQUENCE (0x30)
+    let (sig_alg_tag, _, rest) = parse_tlv(rest)?;
+    if sig_alg_tag != 0x30 {
+        return None;
+    }
+    // issuer ::= Name SEQUENCE (0x30)
+    let (issuer_tag, _, rest) = parse_tlv(rest)?;
+    if issuer_tag != 0x30 {
+        return None;
+    }
+    // validity ::= Validity SEQUENCE (0x30)
+    let (validity_tag, _, rest) = parse_tlv(rest)?;
+    if validity_tag != 0x30 {
+        return None;
+    }
+    // subject ::= Name SEQUENCE (0x30)
+    let (subject_tag, _, rest) = parse_tlv(rest)?;
+    if subject_tag != 0x30 {
+        return None;
+    }
+    // subjectPublicKeyInfo ::= SEQUENCE (0x30)
+    let (spki_tag, spki_body, _) = parse_tlv(rest)?;
+    if spki_tag != 0x30 {
+        return None;
+    }
+
+    // algorithm ::= AlgorithmIdentifier SEQUENCE (0x30)
+    let (alg_tag, alg_body, spki_rest) = parse_tlv(spki_body)?;
+    if alg_tag != 0x30 {
+        return None;
+    }
+    let (oid_tag, alg_oid, alg_rest) = parse_tlv(alg_body)?;
+    if oid_tag != 0x06 || alg_oid != OID_EC_PUBLIC_KEY {
+        return None;
+    }
+    let (param_tag, param_oid, alg_trailing) = parse_tlv(alg_rest)?;
+    if param_tag != 0x06 || param_oid != OID_SECP256R1 || !alg_trailing.is_empty() {
+        return None;
+    }
+
+    // subjectPublicKey ::= BIT STRING (0x03)
+    let (pk_tag, pk_bits, spki_trailing) = parse_tlv(spki_rest)?;
+    if pk_tag != 0x03 || !spki_trailing.is_empty() {
+        return None;
+    }
+    // First byte of BIT STRING is number of unused bits (must be 0)
+    if pk_bits.len() < 2 || pk_bits[0] != 0x00 {
+        return None;
+    }
+
+    let point_bytes = &pk_bits[1..];
+    if point_bytes.len() != 65 && point_bytes.len() != 33 {
+        return None;
+    }
+
+    let point = Sec1Point::from_bytes(point_bytes).ok()?;
+    VerifyingKey::from_sec1_point(&point).ok()
+}
+
+// =============================================================================
+// PivSession
+// =============================================================================
 
 /// A session with the YubiKey PIV applet.
 ///
 /// This type manages the connection to a YubiKey's PIV applet and provides
-/// methods for key management and signing operations.
+/// methods for key management, mutual authentication, and signing operations.
 pub struct PivSession {
     /// The underlying transport.
     transport: Box<dyn Transport>,
@@ -131,25 +710,92 @@ impl PivSession {
         }
     }
 
+    /// Transmits an APDU, handling `0x6C XX` (wrong `Le`) retries and `0x61 XX`
+    /// (`GET RESPONSE`) response chaining.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, APDU status-word, or malformed-response errors.
+    pub fn transmit_full(&mut self, apdu: &Apdu) -> Result<Vec<u8>> {
+        self.transmit_full_inner(apdu, None)
+    }
+
+    /// Internal full-transmit helper with optional slot-aware error mapping.
+    fn transmit_full_inner(&mut self, apdu: &Apdu, slot: Option<Slot>) -> Result<Vec<u8>> {
+        let mut response = self.transport.transmit(apdu)?;
+
+        // Handle SW1 == 0x6C (wrong Le): retry once with the card's requested Le
+        if let Some(correct_le) = response.wrong_le() {
+            let mut retry_apdu = apdu.with_le_override(Some(u32::from(correct_le)));
+            let retry_result = self.transport.transmit(&retry_apdu);
+            retry_apdu.zeroize_data();
+            response = retry_result?;
+        }
+
+        match slot {
+            Some(s) => response.check_for_slot(s)?,
+            None => response.check()?,
+        }
+
+        let mut remaining = response.remaining_bytes();
+        let mut data = response.into_data();
+        if data.len() > MAX_APDU_RESPONSE_BYTES {
+            return Err(Error::MalformedResponse(
+                "APDU response exceeded maximum allowed size".to_string(),
+            ));
+        }
+
+        let mut chunks = 0usize;
+        while let Some(sw2) = remaining {
+            chunks += 1;
+            if chunks > MAX_RESPONSE_CHUNKS {
+                return Err(Error::MalformedResponse(
+                    "APDU response exceeded maximum GET RESPONSE chunk limit".to_string(),
+                ));
+            }
+
+            let get_resp = build_get_response_apdu(sw2);
+            let mut chunk_resp = self.transport.transmit(&get_resp)?;
+
+            if let Some(correct_le) = chunk_resp.wrong_le() {
+                let retry = get_resp.with_le_override(Some(u32::from(correct_le)));
+                chunk_resp = self.transport.transmit(&retry)?;
+            }
+
+            match slot {
+                Some(s) => chunk_resp.check_for_slot(s)?,
+                None => chunk_resp.check()?,
+            }
+
+            remaining = chunk_resp.remaining_bytes();
+            let chunk = chunk_resp.into_data();
+            if data.len().saturating_add(chunk.len()) > MAX_APDU_RESPONSE_BYTES {
+                return Err(Error::MalformedResponse(
+                    "chained APDU response exceeded maximum allowed size".to_string(),
+                ));
+            }
+            data.extend_from_slice(&chunk);
+        }
+
+        Ok(data)
+    }
+
     /// Selects the PIV applet on the YubiKey.
     ///
     /// This must be called before any other PIV operations.
-    ///
-    /// # Returns
-    ///
-    /// [`Ok(())`](Ok) if selection was successful.
     ///
     /// # Errors
     ///
     /// Returns an error if communication fails or the applet is not present.
     pub fn select(&mut self) -> Result<()> {
-        let apdu = Apdu::new(0x00, ins::SELECT, 0x04, 0x00, PIV_AID.to_vec());
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
-
-        self.selected = true;
+        self.selected = false;
         self.pin_verified = false;
         self.mgmt_authenticated = false;
+
+        let apdu = build_select_piv_apdu();
+        let _ = self.transmit_full(&apdu)?;
+
+        self.selected = true;
         Ok(())
     }
 
@@ -157,139 +803,101 @@ impl PivSession {
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN string (typically 6-8 digits)
-    ///
-    /// # Returns
-    ///
-    /// [`Ok(())`](Ok) if PIN verification was successful.
+    /// * `pin` - The PIN string (6 to 8 bytes)
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidPin`] if the PIN is incorrect
+    /// - [`Error::InvalidPin`] if the PIN length is outside `6..=8` or the card rejects it
     /// - [`Error::PinLocked`] if the PIN has been locked after too many attempts
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// session.verify_pin("123456")?;
-    /// ```
     pub fn verify_pin(&mut self, pin: &str) -> Result<()> {
         if !self.selected {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
         }
 
-        let pin_bytes = pin.as_bytes();
-        if pin_bytes.len() > 8 {
-            return Err(Error::InvalidPin);
-        }
+        // Clear verification state before sending so failed retries never leave stale state
+        self.pin_verified = false;
 
-        // Pad PIN to 8 bytes with 0xFF
-        let mut padded_pin = [0xFF; 8];
-        padded_pin[..pin_bytes.len()].copy_from_slice(pin_bytes);
+        let mut apdu = build_verify_pin_apdu(pin)?;
+        let response_result = self.transport.transmit(&apdu);
+        apdu.zeroize_data();
 
-        let apdu = Apdu::new(0x00, ins::VERIFY, 0x00, 0x80, padded_pin.to_vec());
-        let response = self.transport.transmit(&apdu)?;
+        let response = response_result?;
         response.check()?;
 
         self.pin_verified = true;
         Ok(())
     }
 
-    /// Authenticates with a custom management key.
+    /// Performs mutual management key authentication with the YubiKey PIV applet.
+    ///
+    /// Supports 3DES, AES-128, AES-192, and AES-256 across all transports (native PC/SC,
+    /// mock transports, and WASM). Generates a cryptographic random challenge via
+    /// [`getrandom`], sends it in plaintext in tag `0x81`, and verifies the card's
+    /// encrypted response in tag `0x82` in constant time.
     ///
     /// # Arguments
     ///
-    /// * `key` - The 24-byte 3DES management key
+    /// * `key` - Raw management key bytes (`key.len() == alg.key_len()`)
+    /// * `alg` - The management key algorithm configured on the YubiKey
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// [`Ok(())`](Ok) if authentication was successful.
-    #[cfg(feature = "pcsc")]
-    pub fn authenticate_management_key_with(&mut self, key: &[u8; 24]) -> Result<()> {
-        use des::TdesEde3;
-        use des::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-
+    /// - [`Error::AuthenticationFailed`] if the key length is wrong, the card rejects
+    ///   our witness, or the card's challenge response fails constant-time verification
+    /// - [`Error::MalformedResponse`] if the card returns malformed TLV data
+    pub fn authenticate_management_key_with(
+        &mut self,
+        key: &[u8],
+        alg: ManagementKeyAlgorithm,
+    ) -> Result<()> {
         if !self.selected {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
         }
 
-        // Step 1: Request a witness (challenge from card)
-        // GENERAL AUTHENTICATE with algorithm 3DES, key reference 9B
-        // Data: 7C 02 80 00 (request witness)
-        let witness_request = vec![0x7C, 0x02, 0x80, 0x00];
-        let apdu = Apdu::with_le(
-            0x00,
-            ins::AUTHENTICATE,
-            alg::TDES,
-            key::MANAGEMENT,
-            witness_request,
-            256,
-        );
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
+        self.mgmt_authenticated = false;
 
-        // Parse the witness from response: 7C len 80 len witness_data
-        let witness = parse_witness(response.data())
-            .ok_or_else(|| Error::ApduError("invalid witness response".to_string()))?;
-
-        if witness.len() != 8 {
-            return Err(Error::ApduError("invalid witness length".to_string()));
+        if key.len() != alg.key_len() {
+            return Err(Error::AuthenticationFailed);
         }
 
-        // Step 2: Decrypt the witness and create our challenge
-        let cipher = TdesEde3::new_from_slice(key)
-            .map_err(|_| Error::ApduError("invalid management key".to_string()))?;
+        // Step 1: Request an encrypted witness from the card
+        let witness_apdu = build_mgmt_auth_request_witness_apdu(alg);
+        let witness_resp = self.transmit_full(&witness_apdu)?;
+        let witness = parse_witness_response(&witness_resp, alg.block_size())
+            .ok_or_else(|| Error::MalformedResponse("invalid witness response".to_string()))?;
 
-        // Decrypt the witness
-        let mut decrypted_witness = [0u8; 8];
-        decrypted_witness.copy_from_slice(&witness);
-        cipher.decrypt_block((&mut decrypted_witness).into());
+        // Step 2: Decrypt witness and generate CSPRNG host challenge
+        let decrypted_witness = Zeroizing::new(decrypt_mgmt_witness(alg, key, &witness)?);
+        let mut our_challenge = Zeroizing::new(vec![0u8; alg.block_size()]);
+        getrandom::fill(&mut our_challenge)
+            .map_err(|e| Error::ApduError(format!("CSPRNG failed: {e}")))?;
 
-        // Generate our challenge (use zeros for simplicity, or random in production)
-        let our_challenge = [0u8; 8];
+        // Step 3: Send decrypted witness (0x80) and plaintext host challenge (0x81)
+        let mut verify_apdu = build_mgmt_auth_verify_apdu(alg, &decrypted_witness, &our_challenge)?;
+        drop(decrypted_witness);
 
-        // Encrypt our challenge
-        let mut encrypted_challenge = our_challenge;
-        cipher.encrypt_block((&mut encrypted_challenge).into());
+        let transmit_result = self.transmit_full(&verify_apdu);
+        verify_apdu.zeroize_data();
 
-        // Step 3: Send response with decrypted witness and our encrypted challenge
-        // 7C len 80 08 decrypted_witness 81 08 encrypted_challenge
-        let mut auth_data = Vec::with_capacity(24);
-        auth_data.push(0x7C);
-        auth_data.push(0x14); // 20 bytes: 2 + 8 + 2 + 8
-        auth_data.push(0x80);
-        auth_data.push(0x08);
-        auth_data.extend_from_slice(&decrypted_witness);
-        auth_data.push(0x81);
-        auth_data.push(0x08);
-        auth_data.extend_from_slice(&encrypted_challenge);
+        let card_data = match transmit_result {
+            Ok(data) => data,
+            Err(Error::SecurityStatusNotSatisfied | Error::UnexpectedStatusWord(0x69, 0x82)) => {
+                return Err(Error::AuthenticationFailed);
+            }
+            Err(e) => return Err(e),
+        };
 
-        let apdu = Apdu::with_le(
-            0x00,
-            ins::AUTHENTICATE,
-            alg::TDES,
-            key::MANAGEMENT,
-            auth_data,
-            256,
+        // Step 4: Verify the card's encrypted response to our plaintext challenge in constant time
+        let expected_response = Zeroizing::new(encrypt_mgmt_challenge(alg, key, &our_challenge)?);
+        drop(our_challenge);
+
+        let actual_response = Zeroizing::new(
+            parse_challenge_response(&card_data, alg.block_size())
+                .ok_or(Error::AuthenticationFailed)?,
         );
-        let response = self.transport.transmit(&apdu)?;
 
-        if !response.is_success() && !response.has_more_data() {
-            return Err(Error::ApduError(format!(
-                "management key auth failed: SW={:04X}",
-                response.status_word()
-            )));
-        }
-
-        // Step 4: Verify card's response (optional but recommended)
-        // The card should return our challenge decrypted
-        // Note: If we get a successful response (SW=9000), authentication succeeded
-        // The response verification is optional - some implementations skip it
-        if let Some(card_response) = parse_challenge_response(response.data())
-            && card_response != our_challenge
-        {
-            // Log but don't fail - the card accepted our auth
-            // This can happen due to padding differences
+        if !verify_mgmt_challenge_response(&expected_response, &actual_response) {
+            return Err(Error::AuthenticationFailed);
         }
 
         self.mgmt_authenticated = true;
@@ -298,82 +906,38 @@ impl PivSession {
 
     /// Generates a new P-256 key pair in the specified slot.
     ///
+    /// Requires prior management key authentication via
+    /// [`authenticate_management_key_with`](Self::authenticate_management_key_with).
+    ///
     /// # Arguments
     ///
     /// * `slot` - The PIV slot to generate the key in
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the generated public key.
+    /// A [`Result`] containing the generated [`VerifyingKey`].
     ///
     /// # Errors
     ///
-    /// - [`Error::KeyGenerationFailed`] if key generation fails
-    ///
-    /// # Note
-    ///
-    /// This operation requires prior PIN verification for PIN-protected slots
-    /// and explicit management key authentication via
-    /// [`authenticate_management_key_with`](Self::authenticate_management_key_with).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let public_key = session.generate_key(Slot::Authentication)?;
-    /// ```
-    #[cfg(feature = "pcsc")]
+    /// - [`Error::SecurityStatusNotSatisfied`] if management key is not authenticated
+    /// - [`Error::KeyGenerationFailed`] if key generation or response parsing fails
     pub fn generate_key(&mut self, slot: Slot) -> Result<VerifyingKey> {
         if !self.selected {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
-        }
-
-        if slot.requires_pin() && !self.pin_verified {
-            return Err(Error::InvalidPin);
         }
 
         if !self.mgmt_authenticated {
-            return Err(Error::ApduError(
-                "management key not authenticated".to_string(),
-            ));
+            return Err(Error::SecurityStatusNotSatisfied);
         }
 
-        // Build the generate key APDU
-        // Template: AC 03 80 01 11 (algorithm P-256)
-        let template = vec![0xAC, 0x03, 0x80, 0x01, alg::ECCP256];
-        let apdu = Apdu::new(0x00, ins::GENERATE_ASYMMETRIC, 0x00, slot.id(), template);
+        let apdu = build_generate_key_apdu(slot);
+        let data = self.transmit_full_inner(&apdu, Some(slot))?;
 
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
-
-        // Parse the response to extract the public key
-        parse_public_key_response(response.data())
+        parse_public_key_response(&data)
             .ok_or_else(|| Error::KeyGenerationFailed(slot.id(), "invalid response".to_string()))
     }
 
-    /// Generates a new P-256 key pair in the specified slot (non-PCSC version).
-    ///
-    /// This version does not automatically authenticate with the management key.
-    /// You must ensure management key authentication is done externally.
-    #[cfg(not(feature = "pcsc"))]
-    pub fn generate_key(&mut self, slot: Slot) -> Result<VerifyingKey> {
-        if !self.selected {
-            return Err(Error::ApduError("PIV applet not selected".to_string()));
-        }
-
-        // Build the generate key APDU
-        // Template: AC 03 80 01 11 (algorithm P-256)
-        let template = vec![0xAC, 0x03, 0x80, 0x01, alg::ECCP256];
-        let apdu = Apdu::new(0x00, ins::GENERATE_ASYMMETRIC, 0x00, slot.id(), template);
-
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
-
-        // Parse the response to extract the public key
-        parse_public_key_response(response.data())
-            .ok_or_else(|| Error::KeyGenerationFailed(slot.id(), "invalid response".to_string()))
-    }
-
-    /// Retrieves the public key from the specified slot.
+    /// Retrieves the P-256 public key from the certificate stored in the specified slot.
     ///
     /// # Arguments
     ///
@@ -381,348 +945,645 @@ impl PivSession {
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the public key.
+    /// A [`Result`] containing the [`VerifyingKey`].
     ///
     /// # Errors
     ///
-    /// - [`Error::SlotEmpty`] if no key is present in the slot
-    /// - [`Error::InvalidKeyType`] if the key is not a P-256 key
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let public_key = session.get_public_key(Slot::Authentication)?;
-    /// ```
+    /// - [`Error::SlotEmpty`] if no certificate is present in the slot
+    /// - [`Error::InvalidKeyType`] if the certificate does not contain a valid P-256 key
     pub fn get_public_key(&mut self, slot: Slot) -> Result<VerifyingKey> {
         if !self.selected {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
         }
 
-        // GET DATA command with object ID
-        let object_id = slot.object_id();
-        let data = vec![0x5C, 0x03, object_id[0], object_id[1], object_id[2]];
-        let apdu = Apdu::with_le(0x00, ins::GET_DATA, 0x3F, 0xFF, data, 256);
+        let apdu = build_get_certificate_apdu(slot);
+        let data = self.transmit_full_inner(&apdu, Some(slot))?;
 
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
-
-        if response.data().is_empty() {
+        if data.is_empty() {
             return Err(Error::SlotEmpty(slot.id()));
         }
 
-        // Parse the certificate/attestation to extract the public key
-        parse_certificate_public_key(response.data())
-            .ok_or_else(|| Error::InvalidKeyType(slot.id()))
+        parse_certificate_public_key(&data).ok_or_else(|| Error::InvalidKeyType(slot.id()))
     }
 
-    /// Signs data using the key in the specified slot.
+    /// Signs a 32-byte digest using the P-256 key in the specified slot.
     ///
     /// # Arguments
     ///
     /// * `slot` - The PIV slot containing the signing key
-    /// * `data` - The data to sign (typically a 32-byte hash)
+    /// * `data` - The 32-byte prehashed digest to sign
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the DER-encoded ECDSA signature.
+    /// A [`Result`] containing the ASN.1 DER-encoded ECDSA signature.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidPin`] if PIN verification is required but not done
-    /// - [`Error::TouchTimeout`] if touch confirmation times out
-    ///
-    /// # Note
-    ///
-    /// For P-256 keys, the data should be a 32-byte hash (e.g., SHA-256 or Keccak-256).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let hash = keccak256(message);
-    /// let signature = session.sign(Slot::Authentication, hash.as_slice())?;
-    /// ```
+    /// - [`Error::InvalidSignature`] if `data` is not 32 bytes or the response is malformed
+    /// - [`Error::InvalidPin`] if PIN verification is required but not performed
+    /// - [`Error::SecurityStatusNotSatisfied`] if PIN expired or touch confirmation failed
+    /// - [`Error::SlotEmpty`] if the slot has no key
     pub fn sign(&mut self, slot: Slot, data: &[u8]) -> Result<Vec<u8>> {
         if !self.selected {
             return Err(Error::ApduError("PIV applet not selected".to_string()));
         }
 
+        let hash: &[u8; 32] = data.try_into().map_err(|_| {
+            Error::InvalidSignature(format!(
+                "expected 32-byte hash for P-256 signing, got {} bytes",
+                data.len()
+            ))
+        })?;
+
         if slot.requires_pin() && !self.pin_verified {
-            return Err(Error::InvalidPin);
+            return Err(Error::InvalidPin {
+                remaining_attempts: None,
+            });
         }
 
-        // Build GENERAL AUTHENTICATE command
-        // Algorithm: P-256 (0x11)
-        // Key reference: slot ID
-        // Template: 7C len 82 00 81 len data
-        let mut template = Vec::with_capacity(4 + data.len());
-        template.push(0x7C);
-        template.push((4 + data.len()) as u8);
-        template.push(0x82);
-        template.push(0x00);
-        template.push(0x81);
-        template.push(data.len() as u8);
-        template.extend_from_slice(data);
+        let apdu = build_sign_apdu(slot, hash);
+        let response_data = match self.transmit_full_inner(&apdu, Some(slot)) {
+            Ok(bytes) => bytes,
+            Err(Error::SecurityStatusNotSatisfied) => {
+                self.pin_verified = false;
+                return Err(Error::SecurityStatusNotSatisfied);
+            }
+            Err(e) => return Err(e),
+        };
 
-        let apdu = Apdu::with_le(
-            0x00,
-            ins::AUTHENTICATE,
-            alg::ECCP256,
-            slot.id(),
-            template,
-            256,
-        );
-        let response = self.transport.transmit(&apdu)?;
-        response.check()?;
+        // Slot 9c (Digital Signature) enforces PIN-always on YubiKey
+        if slot == Slot::Signature {
+            self.pin_verified = false;
+        }
 
-        // Extract signature from response (tag 7C -> 82)
-        parse_signature_response(response.data())
-            .ok_or_else(|| Error::InvalidSignature("invalid response".to_string()))
+        parse_signature_response(&response_data)
+            .ok_or_else(|| Error::InvalidSignature("invalid signature response".to_string()))
     }
 
-    /// Checks if the session is connected and active.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the transport is connected, `false` otherwise.
+    /// Checks if the underlying transport is connected.
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.transport.is_connected()
     }
 
-    /// Checks if PIN has been verified.
-    ///
-    /// # Returns
-    ///
-    /// `true` if PIN verification was successful, `false` otherwise.
+    /// Checks if the user's PIN has been verified in this session.
     #[must_use]
     pub const fn is_authenticated(&self) -> bool {
         self.pin_verified
     }
-}
 
-/// Parses the witness from a management key authentication response.
-#[cfg(feature = "pcsc")]
-fn parse_witness(data: &[u8]) -> Option<Vec<u8>> {
-    // Response format: 7C len 80 len witness_data
-    if data.len() < 4 || data[0] != 0x7C {
-        return None;
+    /// Checks if the management key has been authenticated in this session.
+    #[must_use]
+    pub const fn is_mgmt_authenticated(&self) -> bool {
+        self.mgmt_authenticated
     }
-
-    let mut i = 2; // Skip 7C and length
-
-    // Find tag 80 (witness)
-    while i < data.len() {
-        if data[i] == 0x80 {
-            i += 1;
-            if i >= data.len() {
-                return None;
-            }
-            let len = data[i] as usize;
-            i += 1;
-            if i + len <= data.len() {
-                return Some(data[i..i + len].to_vec());
-            }
-            return None;
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// Parses the challenge response from management key authentication.
-#[cfg(feature = "pcsc")]
-fn parse_challenge_response(data: &[u8]) -> Option<[u8; 8]> {
-    // Response format: 7C len 82 len response_data
-    if data.len() < 4 || data[0] != 0x7C {
-        return None;
-    }
-
-    let mut i = 2; // Skip 7C and length
-
-    // Find tag 82 (response)
-    while i < data.len() {
-        if data[i] == 0x82 {
-            i += 1;
-            if i >= data.len() {
-                return None;
-            }
-            let len = data[i] as usize;
-            i += 1;
-            if len == 8 && i + len <= data.len() {
-                let mut result = [0u8; 8];
-                result.copy_from_slice(&data[i..i + 8]);
-                return Some(result);
-            }
-            return None;
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// Parses the public key from a [`GENERATE ASYMMETRIC`](ins::GENERATE_ASYMMETRIC) response.
-fn parse_public_key_response(data: &[u8]) -> Option<VerifyingKey> {
-    // Response format: 7F 49 len 86 len point
-    // Skip TLV headers to find the public key point
-    let mut i = 0;
-
-    // Skip outer tag (7F 49)
-    if data.len() < 2 || data[i] != 0x7F || data[i + 1] != 0x49 {
-        return None;
-    }
-    i += 2;
-
-    // Skip length (may be 1 or 2 bytes)
-    if data[i] >= 0x80 {
-        i += 1 + (data[i] & 0x7F) as usize;
-    } else {
-        i += 1;
-    }
-
-    // Find tag 86 (public key)
-    while i < data.len() {
-        if data[i] == 0x86 {
-            i += 1;
-            let len = if data[i] >= 0x80 {
-                let len_bytes = (data[i] & 0x7F) as usize;
-                i += 1;
-                let mut len = 0usize;
-                for j in 0..len_bytes {
-                    len = (len << 8) | (data[i + j] as usize);
-                }
-                i += len_bytes;
-                len
-            } else {
-                let len = data[i] as usize;
-                i += 1;
-                len
-            };
-
-            // Extract the public key point (should be 65 bytes for uncompressed P-256)
-            if len == 65 && data[i] == 0x04 {
-                let point_bytes = &data[i..i + len];
-                let point = Sec1Point::from_bytes(point_bytes).ok()?;
-                return VerifyingKey::from_sec1_point(&point).ok();
-            }
-            break;
-        }
-        // Skip this TLV
-        i += 1;
-        if i >= data.len() {
-            break;
-        }
-        let len = data[i] as usize;
-        i += 1 + len;
-    }
-
-    None
-}
-
-/// Parses the public key from a certificate response.
-fn parse_certificate_public_key(data: &[u8]) -> Option<VerifyingKey> {
-    // Simplified: Look for the uncompressed point (0x04 followed by 64 bytes)
-    for i in 0..data.len().saturating_sub(65) {
-        if data[i] == 0x04 {
-            let point_bytes = &data[i..i + 65];
-            if let Ok(point) = Sec1Point::from_bytes(point_bytes)
-                && let Ok(key) = VerifyingKey::from_sec1_point(&point)
-            {
-                return Some(key);
-            }
-        }
-    }
-    None
-}
-
-/// Parses the signature from a [`GENERAL AUTHENTICATE`](ins::AUTHENTICATE) response.
-fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
-    // Response format: 7C len 82 len signature
-    let mut i = 0;
-
-    // Check outer tag (7C)
-    if data.is_empty() || data[i] != 0x7C {
-        return None;
-    }
-    i += 1;
-
-    // Skip outer length
-    if i >= data.len() {
-        return None;
-    }
-    if data[i] >= 0x80 {
-        i += 1 + (data[i] & 0x7F) as usize;
-    } else {
-        i += 1;
-    }
-
-    // Find tag 82 (signature)
-    while i < data.len() {
-        if data[i] == 0x82 {
-            i += 1;
-            if i >= data.len() {
-                return None;
-            }
-
-            let len = if data[i] >= 0x80 {
-                let len_bytes = (data[i] & 0x7F) as usize;
-                i += 1;
-                let mut len = 0usize;
-                for j in 0..len_bytes {
-                    if i + j >= data.len() {
-                        return None;
-                    }
-                    len = (len << 8) | (data[i + j] as usize);
-                }
-                i += len_bytes;
-                len
-            } else {
-                let len = data[i] as usize;
-                i += 1;
-                len
-            };
-
-            if i + len <= data.len() {
-                return Some(data[i..i + len].to_vec());
-            }
-            break;
-        }
-        i += 1;
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
+    use crate::yubikey::ApduResponse;
+
+    /// NIST P-256 generator point G (65-byte uncompressed SEC1).
+    fn sample_p256_uncompressed_point() -> Vec<u8> {
+        hex::decode(concat!(
+            "04",
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+            "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+        ))
+        .unwrap()
+    }
+
+    /// Second valid P-256 point (2*G) for testing bogus embedded points in cert subject.
+    fn second_p256_uncompressed_point() -> Vec<u8> {
+        let sk = p256::ecdsa::SigningKey::from_bytes(&{
+            let mut b = [0u8; 32];
+            b[31] = 2;
+            b.into()
+        })
+        .unwrap();
+        sk.verifying_key().to_sec1_point(false).as_bytes().to_vec()
+    }
+
+    /// DER-encodes a TLV element with canonical length.
+    fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if value.len() < 0x80 {
+            out.push(value.len() as u8);
+        } else if value.len() <= 0xFF {
+            out.push(0x81);
+            out.push(value.len() as u8);
+        } else {
+            out.push(0x82);
+            out.push((value.len() >> 8) as u8);
+            out.push((value.len() & 0xFF) as u8);
+        }
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// Builds a minimal valid X.509 DER certificate with arbitrary subject bytes and SPKI.
+    fn build_test_x509_der(
+        subject_payload: &[u8],
+        alg_oid: &[u8],
+        param_oid: &[u8],
+        pubkey_point: &[u8],
+    ) -> Vec<u8> {
+        let version = der_tlv(0xA0, &der_tlv(0x02, &[0x02])); // v3
+        let serial = der_tlv(0x02, &[0x01]);
+        let sig_alg = der_tlv(
+            0x30,
+            &der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]),
+        );
+        let issuer = der_tlv(0x30, &[]);
+        let validity = der_tlv(0x30, &[]);
+        let subject = der_tlv(0x30, subject_payload);
+
+        let mut spki_alg = Vec::new();
+        spki_alg.extend_from_slice(&der_tlv(0x06, alg_oid));
+        if !param_oid.is_empty() {
+            spki_alg.extend_from_slice(&der_tlv(0x06, param_oid));
+        }
+        let spki_alg_seq = der_tlv(0x30, &spki_alg);
+
+        let mut bit_string_val = vec![0x00]; // 0 unused bits
+        bit_string_val.extend_from_slice(pubkey_point);
+        let spki_pk = der_tlv(0x03, &bit_string_val);
+
+        let mut spki_inner = Vec::new();
+        spki_inner.extend_from_slice(&spki_alg_seq);
+        spki_inner.extend_from_slice(&spki_pk);
+        let spki = der_tlv(0x30, &spki_inner);
+
+        let mut tbs_inner = Vec::new();
+        tbs_inner.extend_from_slice(&version);
+        tbs_inner.extend_from_slice(&serial);
+        tbs_inner.extend_from_slice(&sig_alg);
+        tbs_inner.extend_from_slice(&issuer);
+        tbs_inner.extend_from_slice(&validity);
+        tbs_inner.extend_from_slice(&subject);
+        tbs_inner.extend_from_slice(&spki);
+        let tbs = der_tlv(0x30, &tbs_inner);
+
+        let mut cert_inner = Vec::new();
+        cert_inner.extend_from_slice(&tbs);
+        cert_inner.extend_from_slice(&sig_alg);
+        cert_inner.extend_from_slice(&der_tlv(0x03, &[0x00, 0x30, 0x00]));
+        der_tlv(0x30, &cert_inner)
+    }
+
+    /// Wraps a certificate payload into a PIV `0x53` data object container.
+    fn wrap_piv_cert(cert_bytes: &[u8], compressed: bool) -> Vec<u8> {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&der_tlv(0x70, cert_bytes));
+        inner.extend_from_slice(&der_tlv(0x71, &[u8::from(compressed)]));
+        inner.extend_from_slice(&der_tlv(0xFE, &[]));
+        der_tlv(0x53, &inner)
+    }
+
+    type HandlerFn = Box<dyn FnMut(&Apdu) -> Result<ApduResponse>>;
+
+    /// Scriptable mock transport for testing `PivSession`.
+    struct MockTransport {
+        handler: HandlerFn,
+        sent: Arc<Mutex<Vec<Apdu>>>,
+    }
+
+    impl MockTransport {
+        fn from_responses(responses: Vec<ApduResponse>) -> (Self, Arc<Mutex<Vec<Apdu>>>) {
+            let mut queue: VecDeque<ApduResponse> = responses.into_iter().collect();
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let transport = Self {
+                handler: Box::new(move |_apdu| {
+                    queue
+                        .pop_front()
+                        .ok_or_else(|| Error::ApduError("no mock response left".to_string()))
+                }),
+                sent: Arc::clone(&sent),
+            };
+            (transport, sent)
+        }
+
+        fn with_handler<F>(handler: F) -> (Self, Arc<Mutex<Vec<Apdu>>>)
+        where
+            F: FnMut(&Apdu) -> Result<ApduResponse> + 'static,
+        {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let transport = Self {
+                handler: Box::new(handler),
+                sent: Arc::clone(&sent),
+            };
+            (transport, sent)
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn transmit(&mut self, apdu: &Apdu) -> Result<ApduResponse> {
+            self.sent.lock().unwrap().push(apdu.clone());
+            (self.handler)(apdu)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
-    fn piv_aid() {
+    fn piv_aid_valid() {
         assert_eq!(PIV_AID.len(), 9);
         assert_eq!(PIV_AID[0], 0xA0);
     }
 
     #[test]
-    fn parse_signature_response_works() {
-        // Minimal valid response: 7C 04 82 02 AB CD
+    fn parse_signature_response_strict() {
         let response = vec![0x7C, 0x04, 0x82, 0x02, 0xAB, 0xCD];
-        let sig = parse_signature_response(&response);
-        assert_eq!(sig, Some(vec![0xAB, 0xCD]));
+        assert_eq!(parse_signature_response(&response), Some(vec![0xAB, 0xCD]));
+
+        // Empty, wrong outer tag, trailing garbage, truncated length, non-canonical length
+        assert!(parse_signature_response(&[]).is_none());
+        assert!(parse_signature_response(&[0x80, 0x04, 0x82, 0x02, 0xAB, 0xCD]).is_none());
+        assert!(parse_signature_response(&[0x7C, 0x04, 0x82, 0x02, 0xAB, 0xCD, 0x00]).is_none());
+        assert!(parse_signature_response(&[0x7C, 0x04, 0x82, 0x05, 0xAB, 0xCD]).is_none());
+        // Non-canonical long form 0x81 0x04 for length 4 (< 0x80)
+        assert!(parse_signature_response(&[0x7C, 0x81, 0x04, 0x82, 0x02, 0xAB, 0xCD]).is_none());
+        // Indefinite length 0x80
+        assert!(parse_signature_response(&[0x7C, 0x80, 0x82, 0x02, 0xAB, 0xCD]).is_none());
     }
 
     #[test]
-    fn parse_signature_response_empty() {
-        let response = vec![];
-        let sig = parse_signature_response(&response);
-        assert!(sig.is_none());
+    fn parse_certificate_public_key_der_gzip_bogus_point_and_zip_bomb() {
+        let real_point = sample_p256_uncompressed_point();
+        let bogus_point = second_p256_uncompressed_point();
+        let expected_vk =
+            VerifyingKey::from_sec1_point(&Sec1Point::from_bytes(&real_point).unwrap()).unwrap();
+
+        // 1. Real X.509 DER P-256 cert with a bogus valid P-256 point embedded in subject
+        let bogus_subject_attr = der_tlv(0x04, &bogus_point);
+        let cert_der = build_test_x509_der(
+            &bogus_subject_attr,
+            OID_EC_PUBLIC_KEY,
+            OID_SECP256R1,
+            &real_point,
+        );
+        let piv_obj = wrap_piv_cert(&cert_der, false);
+        let parsed = parse_certificate_public_key(&piv_obj).unwrap();
+        assert_eq!(
+            parsed.to_sec1_point(false),
+            expected_vk.to_sec1_point(false)
+        );
+
+        // 2. Gzip-compressed PIV certificate (tag 0x71 = 0x01)
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&cert_der).unwrap();
+        let compressed_cert = gz.finish().unwrap();
+        let piv_gz_obj = wrap_piv_cert(&compressed_cert, true);
+        let parsed_gz = parse_certificate_public_key(&piv_gz_obj).unwrap();
+        assert_eq!(
+            parsed_gz.to_sec1_point(false),
+            expected_vk.to_sec1_point(false)
+        );
+
+        // 3. RSA / non-P-256 OID certificate rejected even if bogus P-256 point is present
+        let rsa_oid = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]; // rsaEncryption
+        let rsa_cert = build_test_x509_der(&bogus_subject_attr, rsa_oid, &[], &real_point);
+        assert!(parse_certificate_public_key(&wrap_piv_cert(&rsa_cert, false)).is_none());
+
+        // 4. Wrong EC curve (secp256k1 OID 1.3.132.0.10 = 2B 81 04 00 0A) rejected
+        let secp256k1_oid = &[0x2B, 0x81, 0x04, 0x00, 0x0A];
+        let k1_cert = build_test_x509_der(&[], OID_EC_PUBLIC_KEY, secp256k1_oid, &real_point);
+        assert!(parse_certificate_public_key(&wrap_piv_cert(&k1_cert, false)).is_none());
+
+        // 5. Zip bomb (> 64 KiB decompressed) rejected cleanly
+        let mut bomb_gz = GzEncoder::new(Vec::new(), Compression::best());
+        bomb_gz
+            .write_all(&vec![0u8; MAX_CERTIFICATE_BYTES + 1024])
+            .unwrap();
+        let bomb_bytes = bomb_gz.finish().unwrap();
+        assert!(parse_certificate_public_key(&wrap_piv_cert(&bomb_bytes, true)).is_none());
     }
 
     #[test]
-    fn parse_signature_response_invalid_tag() {
-        let response = vec![0x80, 0x04, 0x82, 0x02, 0xAB, 0xCD];
-        let sig = parse_signature_response(&response);
-        assert!(sig.is_none());
+    fn piv_session_verify_pin_validation_and_status_words() {
+        let (transport, sent) = MockTransport::from_responses(vec![
+            ApduResponse::new(vec![0x90, 0x00]), // select
+            ApduResponse::new(vec![0x90, 0x00]), // verify ok
+            ApduResponse::new(vec![0x63, 0xC2]), // wrong pin (2 left)
+            ApduResponse::new(vec![0x63, 0xC0]), // locked
+        ]);
+
+        let mut session = PivSession::new(Box::new(transport));
+        session.select().unwrap();
+
+        // Empty or short PIN must fail WITHOUT transmitting to card
+        assert!(matches!(
+            session.verify_pin(""),
+            Err(Error::InvalidPin {
+                remaining_attempts: None
+            })
+        ));
+        assert!(matches!(
+            session.verify_pin("12345"),
+            Err(Error::InvalidPin {
+                remaining_attempts: None
+            })
+        ));
+        assert!(matches!(
+            session.verify_pin("123456789"),
+            Err(Error::InvalidPin {
+                remaining_attempts: None
+            })
+        ));
+        assert_eq!(sent.lock().unwrap().len(), 1); // Only SELECT was sent!
+
+        // Valid PIN
+        session.verify_pin("123456").unwrap();
+        assert!(session.is_authenticated());
+
+        // Wrong PIN clears pin_verified and reports remaining attempts
+        let err = session.verify_pin("000000").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidPin {
+                remaining_attempts: Some(2)
+            }
+        ));
+        assert!(!session.is_authenticated());
+
+        // Locked PIN
+        assert!(matches!(
+            session.verify_pin("000000"),
+            Err(Error::PinLocked)
+        ));
+        assert!(!session.is_authenticated());
+    }
+
+    #[test]
+    fn piv_session_mutual_auth_all_algorithms_and_spoof_rejection() {
+        let cases: &[(ManagementKeyAlgorithm, Vec<u8>)] = &[
+            (ManagementKeyAlgorithm::Tdes, vec![0x01; 24]),
+            (ManagementKeyAlgorithm::Aes128, vec![0x11; 16]),
+            (ManagementKeyAlgorithm::Aes192, vec![0x22; 24]),
+            (ManagementKeyAlgorithm::Aes256, vec![0x33; 32]),
+        ];
+
+        for (alg, key) in cases {
+            let alg = *alg;
+            let card_key = key.clone();
+            let card_plaintext_witness = vec![0xA5; alg.block_size()];
+            let encrypted_witness =
+                encrypt_mgmt_challenge(alg, &card_key, &card_plaintext_witness).unwrap();
+
+            // Simulate a real card for mutual auth
+            let mut step = 0u8;
+            let expected_witness = card_plaintext_witness.clone();
+            let card_key_clone = card_key.clone();
+            let (transport, sent) = MockTransport::with_handler(move |apdu| {
+                step += 1;
+                match step {
+                    1 => Ok(ApduResponse::new(vec![0x90, 0x00])), // SELECT
+                    2 => {
+                        assert_eq!(apdu.p1(), alg.id());
+                        assert_eq!(apdu.p2(), key::MANAGEMENT);
+                        let mut resp = der_tlv(0x7C, &der_tlv(0x80, &encrypted_witness));
+                        resp.extend_from_slice(&[0x90, 0x00]);
+                        Ok(ApduResponse::new(resp))
+                    }
+                    3 => {
+                        assert_eq!(apdu.p1(), alg.id());
+                        let (outer_tag, outer_val, _) = parse_tlv(apdu.data()).unwrap();
+                        assert_eq!(outer_tag, 0x7C);
+                        let got_witness = find_tlv_child(outer_val, 0x80).unwrap();
+                        let host_challenge = find_tlv_child(outer_val, 0x81).unwrap();
+                        assert_eq!(got_witness, expected_witness.as_slice());
+                        assert_eq!(host_challenge.len(), alg.block_size());
+
+                        // Card encrypts the plaintext host challenge with shared key
+                        let card_resp =
+                            encrypt_mgmt_challenge(alg, &card_key_clone, host_challenge).unwrap();
+                        let mut resp = der_tlv(0x7C, &der_tlv(0x82, &card_resp));
+                        resp.extend_from_slice(&[0x90, 0x00]);
+                        Ok(ApduResponse::new(resp))
+                    }
+                    _ => panic!("unexpected APDU"),
+                }
+            });
+
+            let mut session = PivSession::new(Box::new(transport));
+            session.select().unwrap();
+            session.authenticate_management_key_with(key, alg).unwrap();
+            assert!(session.is_mgmt_authenticated());
+            assert_eq!(sent.lock().unwrap().len(), 3);
+
+            // Now test a spoofed card that returns garbage in tag 0x82 -> MUST FAIL!
+            let enc_w2 = encrypt_mgmt_challenge(alg, &card_key, &card_plaintext_witness).unwrap();
+            let mut step2 = 0u8;
+            let (spoof_transport, _) = MockTransport::with_handler(move |_apdu| {
+                step2 += 1;
+                match step2 {
+                    1 => Ok(ApduResponse::new(vec![0x90, 0x00])),
+                    2 => {
+                        let mut resp = der_tlv(0x7C, &der_tlv(0x80, &enc_w2));
+                        resp.extend_from_slice(&[0x90, 0x00]);
+                        Ok(ApduResponse::new(resp))
+                    }
+                    3 => {
+                        // Spoofed wrong response even with SW=9000
+                        let mut resp = der_tlv(0x7C, &der_tlv(0x82, &vec![0x00; alg.block_size()]));
+                        resp.extend_from_slice(&[0x90, 0x00]);
+                        Ok(ApduResponse::new(resp))
+                    }
+                    _ => panic!("unexpected APDU"),
+                }
+            });
+
+            let mut spoof_session = PivSession::new(Box::new(spoof_transport));
+            spoof_session.select().unwrap();
+            assert!(matches!(
+                spoof_session.authenticate_management_key_with(key, alg),
+                Err(Error::AuthenticationFailed)
+            ));
+            assert!(!spoof_session.is_mgmt_authenticated());
+        }
+    }
+
+    #[test]
+    fn piv_session_chaining_61xx_and_wrong_le_6cxx() {
+        let real_point = sample_p256_uncompressed_point();
+        let cert_der = build_test_x509_der(&[], OID_EC_PUBLIC_KEY, OID_SECP256R1, &real_point);
+        let piv_obj = wrap_piv_cert(&cert_der, false);
+
+        // Split PIV cert into 3 chunks to test 6C retry + 61 chaining
+        let split1 = piv_obj.len() / 3;
+        let split2 = (piv_obj.len() * 2) / 3;
+        let chunk1 = piv_obj[..split1].to_vec();
+        let chunk2 = piv_obj[split1..split2].to_vec();
+        let chunk3 = piv_obj[split2..].to_vec();
+
+        let mut resp1 = chunk1;
+        resp1.extend_from_slice(&[0x61, chunk2.len() as u8]);
+        let mut resp2 = chunk2;
+        resp2.extend_from_slice(&[0x61, chunk3.len() as u8]);
+        let mut resp3 = chunk3;
+        resp3.extend_from_slice(&[0x90, 0x00]);
+
+        let (transport, sent) = MockTransport::from_responses(vec![
+            ApduResponse::new(vec![0x90, 0x00]), // SELECT
+            ApduResponse::new(vec![0x6C, 0x40]), // GET DATA wrong Le -> retry with Le=0x40
+            ApduResponse::new(resp1),            // chunk 1 + 61
+            ApduResponse::new(resp2),            // chunk 2 + 61
+            ApduResponse::new(resp3),            // chunk 3 + 9000
+        ]);
+
+        let mut session = PivSession::new(Box::new(transport));
+        session.select().unwrap();
+        let pk = session.get_public_key(Slot::Authentication).unwrap();
+        assert_eq!(pk.to_sec1_point(false).as_bytes(), real_point.as_slice());
+
+        let sent_apdus = sent.lock().unwrap();
+        assert_eq!(sent_apdus.len(), 5);
+        // Second GET DATA retry must have Le = Some(0x40)
+        assert_eq!(sent_apdus[2].le(), Some(0x40));
+        // Chained requests must use GET RESPONSE (INS = 0xC0)
+        assert_eq!(sent_apdus[3].ins(), ins::GET_RESPONSE);
+        assert_eq!(sent_apdus[4].ins(), ins::GET_RESPONSE);
+    }
+
+    #[test]
+    fn piv_session_generate_key_requires_mgmt_auth_and_sign_rules() {
+        let real_point = sample_p256_uncompressed_point();
+        let mut gen_resp = vec![0x7F, 0x49, 67, 0x86, 65];
+        gen_resp.extend_from_slice(&real_point);
+        gen_resp.extend_from_slice(&[0x90, 0x00]);
+
+        let mut sign_resp = der_tlv(
+            0x7C,
+            &der_tlv(0x82, &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]),
+        );
+        sign_resp.extend_from_slice(&[0x90, 0x00]);
+
+        let alg = ManagementKeyAlgorithm::Aes192;
+        let mgmt_key = vec![0x44u8; 24];
+        let witness_plain = vec![0x77u8; 16];
+        let witness_enc = encrypt_mgmt_challenge(alg, &mgmt_key, &witness_plain).unwrap();
+
+        let mgmt_key_clone = mgmt_key.clone();
+        let mut step = 0u8;
+        let (transport, sent) = MockTransport::with_handler(move |apdu| {
+            step += 1;
+            match step {
+                1 => Ok(ApduResponse::new(vec![0x90, 0x00])), // SELECT
+                2 => {
+                    // Mgmt auth step 1: witness
+                    let mut r = der_tlv(0x7C, &der_tlv(0x80, &witness_enc));
+                    r.extend_from_slice(&[0x90, 0x00]);
+                    Ok(ApduResponse::new(r))
+                }
+                3 => {
+                    // Mgmt auth step 2: verify & respond
+                    let (_, outer_val, _) = parse_tlv(apdu.data()).unwrap();
+                    let host_chal = find_tlv_child(outer_val, 0x81).unwrap();
+                    let card_resp =
+                        encrypt_mgmt_challenge(alg, &mgmt_key_clone, host_chal).unwrap();
+                    let mut r = der_tlv(0x7C, &der_tlv(0x82, &card_resp));
+                    r.extend_from_slice(&[0x90, 0x00]);
+                    Ok(ApduResponse::new(r))
+                }
+                4 => {
+                    // GENERATE ASYMMETRIC must include Le = Some(256)
+                    assert_eq!(apdu.ins(), ins::GENERATE_ASYMMETRIC);
+                    assert_eq!(apdu.le(), Some(256));
+                    Ok(ApduResponse::new(gen_resp.clone()))
+                }
+                5 => Ok(ApduResponse::new(vec![0x6A, 0x82])), // GET DATA slot empty (9c)
+                6 => Ok(ApduResponse::new(vec![0x90, 0x00])), // VERIFY PIN
+                7 => Ok(ApduResponse::new(sign_resp.clone())), // SIGN on Slot::Signature (9c)
+                8 => Ok(ApduResponse::new(vec![0x90, 0x00])), // VERIFY PIN again
+                9 => Ok(ApduResponse::new(vec![0x69, 0x82])), // SIGN returns 69 82 (touch/security)
+                _ => panic!("unexpected APDU step {step}"),
+            }
+        });
+
+        let mut session = PivSession::new(Box::new(transport));
+        session.select().unwrap();
+
+        // generate_key without mgmt auth fails before touching transport
+        assert!(matches!(
+            session.generate_key(Slot::Authentication),
+            Err(Error::SecurityStatusNotSatisfied)
+        ));
+
+        // Authenticate management key, then generate_key succeeds
+        session
+            .authenticate_management_key_with(&mgmt_key, alg)
+            .unwrap();
+        let generated_pk = session.generate_key(Slot::Authentication).unwrap();
+        assert_eq!(
+            generated_pk.to_sec1_point(false).as_bytes(),
+            real_point.as_slice()
+        );
+
+        // get_public_key maps 6A 82 to SlotEmpty with the actual slot ID (0x9C)
+        assert!(matches!(
+            session.get_public_key(Slot::Signature),
+            Err(Error::SlotEmpty(0x9C))
+        ));
+
+        // sign rejects non-32-byte input
+        session.verify_pin("123456").unwrap();
+        assert!(matches!(
+            session.sign(Slot::Authentication, &[0u8; 31]),
+            Err(Error::InvalidSignature(_))
+        ));
+
+        // sign on Slot::Signature succeeds AND resets pin_verified
+        let sig = session.sign(Slot::Signature, &[0x42u8; 32]).unwrap();
+        assert_eq!(sig, vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]);
+        assert!(!session.is_authenticated());
+
+        // sign returning 69 82 returns SecurityStatusNotSatisfied and resets pin_verified
+        session.verify_pin("123456").unwrap();
+        assert!(session.is_authenticated());
+        assert!(matches!(
+            session.sign(Slot::Authentication, &[0x42u8; 32]),
+            Err(Error::SecurityStatusNotSatisfied)
+        ));
+        assert!(!session.is_authenticated());
+
+        assert_eq!(sent.lock().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn tlv_parsers_handle_malformed_and_truncated_inputs_without_panic() {
+        let edge_cases: &[&[u8]] = &[
+            &[],
+            &[0x7F],
+            &[0x7F, 0x49],
+            &[0x7F, 0x49, 0x80],
+            &[0x7F, 0x49, 0x85, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x7F, 0x49, 0x84, 0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x7F, 0x49, 0x82, 0x00, 0x01, 0x86],
+            &[0x7F, 0x81, 0x81, 0x81, 0x81, 0x01],
+            &[0x7C, 0x02, 0x80, 0xFF],
+            &[0x7C, 0x02, 0x82, 0x08],
+            &[0x53, 0x00],
+            &[0x53, 0x04, 0x70, 0x02, 0x30, 0x80],
+            &[0x53, 0x05, 0x71, 0x02, 0x00, 0x00, 0x00],
+            &[0x53, 0x06, 0x70, 0x01, 0xFF, 0x71, 0x01, 0x01],
+        ];
+
+        for input in edge_cases {
+            assert!(parse_witness_response(input, 8).is_none());
+            assert!(parse_challenge_response(input, 16).is_none());
+            assert!(parse_public_key_response(input).is_none());
+            assert!(parse_signature_response(input).is_none());
+            assert!(parse_certificate_public_key(input).is_none());
+        }
     }
 }

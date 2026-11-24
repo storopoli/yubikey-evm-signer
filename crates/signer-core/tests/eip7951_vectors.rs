@@ -4,14 +4,19 @@
 //! originally sourced from the Wycheproof project.
 
 // Silence unused crate dependency warnings for test binary
+use aes as _;
 use alloy_primitives as _;
 use alloy_rlp as _;
-#[cfg(feature = "pcsc")]
 use des as _;
+use flate2 as _;
+use getrandom as _;
 use p256 as _;
 #[cfg(feature = "pcsc")]
 use pcsc as _;
+use rpassword as _;
+use subtle as _;
 use thiserror as _;
+use zeroize as _;
 
 use serde::Deserialize;
 use yubikey_evm_signer_core::crypto::p256_verify;
