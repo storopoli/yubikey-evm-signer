@@ -91,7 +91,7 @@ Two-crate workspace with native and browser transports:
 
 - **signer-wasm** (`yubikey-evm-signer-wasm`): Browser WASM bindings
   - `device.rs`: `YubiKeyDevice` class exposed to JavaScript (`connectBridge`, `connect`, `getPublicKey`, `getAddress`, `hasStaleCertificate`, signing methods); one call at a time; session-ending errors clear PIN/management state
-  - `bridge_transport.rs`: Async `BridgeTransport` connecting to `yubikey-cli bridge` over `fetch()`; accepts only `http://127.0.0.1:<port>` (port `80` excluded) and tokens of at least 32 visible ASCII characters; maps `409`/`503` to `Disconnected`
+  - `bridge_transport.rs`: Async `BridgeTransport` connecting to `yubikey-cli bridge` over `fetch()`; accepts only `http://127.0.0.1:<port>` (port `80` excluded) and tokens of at least 32 visible ASCII characters; maps `409`/`503`, and on an established session an unreachable bridge or `401`/`500`, to `Disconnected`
   - `transport.rs`: Async `WebUsbTransport` (browser async CCID transport; does not implement core's synchronous `Transport` trait; closes itself after an unrecoverable CCID error) and shared `AsyncApduTransport` retry/chaining helpers
   - `error.rs`: `WasmError`, whose `Display` strings are the JavaScript error messages documented in `packages/npm/README.md`
   - Built with wasm-pack, outputs to `packages/npm/dist/` (`just wasm-build` also runs `just npm-licenses`)

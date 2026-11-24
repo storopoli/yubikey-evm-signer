@@ -195,8 +195,10 @@ pub fn public_key_to_hex(public_key: &VerifyingKey) -> String {
 /// # Lost sessions
 ///
 /// When a call finds that the session or the device is gone (the bridge
-/// answered `409` or `503`, the card was reset, the YubiKey was unplugged, or
-/// the WebUSB connection was closed after an unrecoverable CCID error), it
+/// answered `409` or `503`, stopped answering, rejected the token because it
+/// was restarted (`401`), or failed internally (`500`); the card was reset, the
+/// YubiKey was unplugged, or the WebUSB connection was closed after an
+/// unrecoverable CCID error), it
 /// fails with an error starting with `Disconnected:` (or the card-reset
 /// message), the verified PIN, management key authentication and cached public
 /// key are discarded, and [`is_connected`](Self::is_connected) returns `false`.
@@ -1427,9 +1429,19 @@ mod tests {
 
     #[test]
     fn session_loss_clears_state_and_disconnects() {
+        use crate::bridge_transport::{
+            body_read_failure_error, bridge_http_error, fetch_failure_error,
+        };
+
+        let (url, origin) = ("http://127.0.0.1:8765", "https://app.example");
         for lost in [
             WasmError::Disconnected("bridge session ended (409 Conflict): x; reconnect".into()),
             WasmError::CardReset,
+            // The bridge stopped, crashed, or was restarted with a new token.
+            fetch_failure_error(url, origin, true),
+            body_read_failure_error("failed to await bridge response text", url, origin, true),
+            bridge_http_error(401, "missing or invalid bearer token", true),
+            bridge_http_error(500, "bridge state lock poisoned", true),
         ] {
             let key = signing_key(1);
             let expected = lost.clone();
@@ -1466,6 +1478,27 @@ mod tests {
         assert!(dev.is_connected());
         assert!(dev.mgmt_authenticated);
         assert!(dev.cached_public_key.is_some());
+
+        // Transient bridge errors leave the session (and its state) usable.
+        for transient in [
+            bridge_http_error(403, "APDU rejected by bridge policy", true),
+            bridge_http_error(408, "request deadline", true),
+            bridge_http_error(502, "APDU transmit failed", true),
+        ] {
+            let expected = transient.clone();
+            let (transport, _) = ScriptedTransport::new(Box::new(move |_| Err(transient.clone())));
+            let mut dev = YubiKeyDevice::with_transport(DeviceTransport::Scripted(transport));
+            dev.mgmt_authenticated = true;
+            dev.cached_public_key = Some(*key.verifying_key());
+            let result = block_on(async {
+                let result = dev.verify_pin_internal(PIN).await;
+                dev.settle(result).await
+            });
+            assert_eq!(result, Err(expected));
+            assert!(dev.is_connected());
+            assert!(dev.mgmt_authenticated);
+            assert!(dev.cached_public_key.is_some());
+        }
     }
 
     /// Every APDU the device sends must pass the bridge's allowlist byte for byte.

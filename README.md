@@ -115,7 +115,7 @@ const signature = await device.signTransaction(pin, JSON.stringify({
 await device.disconnect();
 ```
 
-A `YubiKeyDevice` handles one call at a time: await each call before starting the next, or the second call throws. If a call fails because the session or device is gone (an error starting with `Disconnected:`, or the card-reset error), the device discards its PIN and management key state, `isConnected()` returns `false`, and you must connect again.
+A `YubiKeyDevice` handles one call at a time: await each call before starting the next, or the second call throws. If a call fails because the session or device is gone (an error starting with `Disconnected:`, or the card-reset error; over the bridge this includes a bridge that stopped answering or was restarted with a new token), the device discards its PIN and management key state, `isConnected()` returns `false`, and you must connect again.
 
 `getAddress()` and `getPublicKey()` read the key from the slot metadata on YubiKey firmware 5.3 and newer, so no certificate is needed there; older firmware needs a certificate in the slot. If the slot's certificate belongs to a different key, it is ignored and `hasStaleCertificate()` returns `true`.
 

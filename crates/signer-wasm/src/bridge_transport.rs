@@ -96,16 +96,80 @@ pub fn fetch_failure_message(base_url: &str, page_origin: &str) -> String {
     )
 }
 
+/// Advice ending every error that discards an established bridge session.
+const RECONNECT_ADVICE: &str = "reconnect with the bearer token the bridge currently prints (a \
+     restarted bridge prints a new one); PIV selection, PIN and management key authentication \
+     must be repeated";
+
+/// Maps a `fetch()` that rejected without an HTTP response to a [`WasmError`].
+///
+/// Before a session is `established` (during `/v1/connect`) this is a
+/// [`WasmError::BridgeError`] with [`fetch_failure_message`]. On an established
+/// session it is [`WasmError::Disconnected`]: the bridge stopped, crashed, or
+/// was restarted without this page's origin, so the session is gone.
+#[must_use]
+pub fn fetch_failure_error(base_url: &str, page_origin: &str, established: bool) -> WasmError {
+    let reason = fetch_failure_message(base_url, page_origin);
+    if established {
+        WasmError::Disconnected(format!(
+            "lost the bridge session because the bridge stopped answering. {reason} Then \
+             {RECONNECT_ADVICE}"
+        ))
+    } else {
+        WasmError::BridgeError(reason)
+    }
+}
+
+/// Maps a failure to read a bridge response body (`detail`) to a [`WasmError`].
+///
+/// Before a session is `established` this is a [`WasmError::BridgeError`]
+/// with `detail`. On an established session the connection to the bridge broke
+/// mid-reply, so the session is treated as gone: [`WasmError::Disconnected`]
+/// with the [`fetch_failure_message`] diagnostic.
+#[must_use]
+pub fn body_read_failure_error(
+    detail: &str,
+    base_url: &str,
+    page_origin: &str,
+    established: bool,
+) -> WasmError {
+    if established {
+        WasmError::Disconnected(format!(
+            "lost the bridge session because the connection broke while reading the bridge's \
+             reply ({detail}). {} Then {RECONNECT_ADVICE}",
+            fetch_failure_message(base_url, page_origin)
+        ))
+    } else {
+        WasmError::BridgeError(detail.to_string())
+    }
+}
+
 /// Maps a non-success bridge HTTP status and its `error` message to a [`WasmError`].
 ///
-/// `409` (session unknown, replaced, expired, or closed after another PC/SC
-/// client reset the card) and `503` (YubiKey or reader lost, or bridge shutting
-/// down) end the session and map to [`WasmError::Disconnected`]; everything
-/// else is a [`WasmError::BridgeError`]. The server's message is always kept
-/// verbatim.
+/// These statuses end the session and map to [`WasmError::Disconnected`]:
+///
+/// - `409`: session unknown, replaced, expired, or closed after another PC/SC
+///   client reset the card;
+/// - `503`: YubiKey or reader lost, or bridge shutting down;
+/// - on an `established` session only, `401` (the bridge was restarted, so the
+///   token is no longer valid) and `500` (the bridge's state is broken for good).
+///
+/// Everything else is a [`WasmError::BridgeError`] that keeps the session: the
+/// bridge did not touch it (`400`, `403` APDU policy, `404`, `405`, `408`,
+/// `413`, `415`, `431`, and `502` card communication errors). Before a session
+/// is established, `401` means a mistyped token. The server's message is always
+/// kept verbatim.
 #[must_use]
-pub fn bridge_http_error(status: u16, server_msg: &str) -> WasmError {
+pub fn bridge_http_error(status: u16, server_msg: &str, established: bool) -> WasmError {
     match status {
+        401 if established => WasmError::Disconnected(format!(
+            "bridge rejected the bearer token (401 Unauthorized): the bridge was restarted and \
+             this session's token is no longer valid; {RECONNECT_ADVICE}"
+        )),
+        500 if established => WasmError::Disconnected(format!(
+            "bridge internal error (500 Internal Server Error): {server_msg}; the bridge can no \
+             longer serve this session. Restart the bridge, then {RECONNECT_ADVICE}"
+        )),
         401 => WasmError::BridgeError(
             "Bridge authentication failed (401 Unauthorized): verify your session bearer token"
                 .to_string(),
@@ -229,8 +293,9 @@ impl BridgeTransport {
     /// # Errors
     ///
     /// Returns [`WasmError::BridgeError`] or [`WasmError::CoreError`];
-    /// [`WasmError::Disconnected`] if the session is closed or the bridge answers
-    /// `409`/`503` (the transport is then disconnected).
+    /// [`WasmError::Disconnected`] if the session is closed, the bridge stopped
+    /// answering, or it answers `401`, `409`, `500` or `503` (the transport is
+    /// then disconnected; see [`bridge_http_error`]).
     pub async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
         let session_id = self
             .session_id
@@ -297,19 +362,22 @@ impl BridgeTransport {
 
     /// Disconnects the active bridge session (`POST /v1/disconnect`).
     ///
+    /// The transport is marked disconnected before the request is sent, and
+    /// any failure (including an unreachable bridge) is ignored.
+    ///
     /// # Errors
     ///
     /// Always returns `Ok(())` after best-effort disconnect cleanup.
     pub async fn close(&mut self) -> WasmResult<()> {
+        let was_connected = std::mem::replace(&mut self.connected, false);
         if let Some(session_id) = self.session_id.take()
-            && self.connected
+            && was_connected
             && let Ok(payload) = serde_json::to_string(&DisconnectRequest {
                 session_id: session_id.as_str(),
             })
         {
             let _ = self.post_json("/v1/disconnect", &payload).await;
         }
-        self.connected = false;
         Ok(())
     }
 
@@ -319,8 +387,28 @@ impl BridgeTransport {
         self.connected
     }
 
-    /// Executes a `POST` request with JSON body and Bearer auth against the local bridge.
+    /// Executes a `POST` request with JSON body and Bearer auth against the local
+    /// bridge, ending the session on an error that means it cannot be used again.
     async fn post_json(&mut self, path: &str, body: &str) -> WasmResult<String> {
+        let result = self.send_json(path, body).await;
+        self.end_session_on_error(result)
+    }
+
+    /// Marks the transport disconnected if `result` is an error that ends the
+    /// session (see [`WasmError::ends_session`]), so the session is never reused.
+    fn end_session_on_error<T>(&mut self, result: WasmResult<T>) -> WasmResult<T> {
+        if matches!(&result, Err(e) if e.ends_session()) {
+            self.connected = false;
+            self.session_id = None;
+        }
+        result
+    }
+
+    /// Sends one `POST` request and maps every failure to a [`WasmError`]
+    /// according to whether a session is established (see
+    /// [`fetch_failure_error`], [`body_read_failure_error`], [`bridge_http_error`]).
+    async fn send_json(&self, path: &str, body: &str) -> WasmResult<String> {
+        let established = self.connected;
         let window = web_sys::window().ok_or_else(|| {
             WasmError::BridgeError("browser Window object is not available".to_string())
         })?;
@@ -348,20 +436,20 @@ impl BridgeTransport {
 
         let resp_value = JsFuture::from(window.fetch_with_request(&request))
             .await
-            .map_err(|_| {
-                let origin = window.origin();
-                WasmError::BridgeError(fetch_failure_message(&self.base_url, &origin))
-            })?;
+            .map_err(|_| fetch_failure_error(&self.base_url, &window.origin(), established))?;
 
         let response: Response = resp_value.unchecked_into();
         let status = response.status();
 
-        let text_promise = response.text().map_err(|e| {
-            WasmError::BridgeError(format!("failed to read bridge response body: {e:?}"))
-        })?;
-        let text_js = JsFuture::from(text_promise).await.map_err(|e| {
-            WasmError::BridgeError(format!("failed to await bridge response text: {e:?}"))
-        })?;
+        let body_error = |detail: String| {
+            body_read_failure_error(&detail, &self.base_url, &window.origin(), established)
+        };
+        let text_promise = response
+            .text()
+            .map_err(|e| body_error(format!("failed to read bridge response body: {e:?}")))?;
+        let text_js = JsFuture::from(text_promise)
+            .await
+            .map_err(|e| body_error(format!("failed to await bridge response text: {e:?}")))?;
         let text = text_js.as_string().unwrap_or_default();
 
         if response.ok() {
@@ -378,13 +466,7 @@ impl BridgeTransport {
                 }
             });
 
-        let error = bridge_http_error(status, &server_msg);
-        if error.ends_session() {
-            // The bridge dropped (or never had) this session: never reuse it.
-            self.connected = false;
-            self.session_id = None;
-        }
-        Err(error)
+        Err(bridge_http_error(status, &server_msg, established))
     }
 }
 
@@ -502,33 +584,195 @@ mod tests {
         let generate_disabled = "APDU rejected by bridge policy: APDU command failed: key \
             generation is disabled on this bridge (...); restart the bridge with \
             --allow-generate to permit it";
-        let forbidden = bridge_http_error(403, generate_disabled);
-        assert!(!forbidden.ends_session());
-        assert!(forbidden.to_string().contains("403 Forbidden"));
-        assert!(forbidden.to_string().contains(generate_disabled));
+        for established in [false, true] {
+            let forbidden = bridge_http_error(403, generate_disabled, established);
+            assert!(!forbidden.ends_session());
+            assert!(forbidden.to_string().contains("403 Forbidden"));
+            assert!(forbidden.to_string().contains(generate_disabled));
 
-        for status in [409, 503] {
-            let err = bridge_http_error(status, "server says why");
-            assert!(err.ends_session(), "{status}");
-            let text = err.to_string();
-            assert!(text.starts_with("Disconnected: "), "{text}");
-            assert!(text.contains(&status.to_string()));
-            assert!(text.contains("server says why"));
-            assert!(text.contains("reconnect"));
+            for status in [409, 503] {
+                let err = bridge_http_error(status, "server says why", established);
+                assert!(err.ends_session(), "{status}");
+                let text = err.to_string();
+                assert!(text.starts_with("Disconnected: "), "{text}");
+                assert!(text.contains(&status.to_string()));
+                assert!(text.contains("server says why"));
+                assert!(text.contains("reconnect"));
+            }
+            assert!(
+                bridge_http_error(409, "x", established)
+                    .to_string()
+                    .contains("reset")
+            );
+            assert!(
+                bridge_http_error(409, "x", established)
+                    .to_string()
+                    .contains("expired")
+            );
+
+            // The bridge left the session untouched: it stays usable.
+            for (status, marker) in [
+                (400, "HTTP 400"),
+                (404, "404"),
+                (405, "HTTP 405"),
+                (408, "408 Request Timeout"),
+                (413, "413 Payload Too Large"),
+                (415, "HTTP 415"),
+                (431, "HTTP 431"),
+                (502, "HTTP 502"),
+            ] {
+                let err = bridge_http_error(status, "detail", established);
+                assert!(!err.ends_session(), "{status}");
+                assert!(
+                    matches!(&err, WasmError::BridgeError(_)),
+                    "{status}: {err:?}"
+                );
+                assert!(err.to_string().contains(marker), "{status}: {err}");
+            }
         }
-        assert!(bridge_http_error(409, "x").to_string().contains("reset"));
-        assert!(bridge_http_error(409, "x").to_string().contains("expired"));
 
-        for (status, marker) in [
-            (401, "401 Unauthorized"),
-            (404, "404"),
-            (408, "408 Request Timeout"),
-            (413, "413 Payload Too Large"),
-            (502, "HTTP 502"),
+        // During /v1/connect a 401 is a mistyped token and a 500 a failed connect.
+        let wrong_token = bridge_http_error(401, "missing or invalid bearer token", false);
+        assert!(!wrong_token.ends_session());
+        assert!(wrong_token.to_string().contains("401 Unauthorized"));
+        assert!(
+            wrong_token
+                .to_string()
+                .contains("verify your session bearer token")
+        );
+        let internal = bridge_http_error(500, "failed to generate session ID", false);
+        assert!(!internal.ends_session());
+        assert!(internal.to_string().contains("HTTP 500"));
+
+        // On an established session a 401 means the bridge was restarted with a
+        // new token, and a 500 that its state is broken for good.
+        let restarted = bridge_http_error(401, "missing or invalid bearer token", true);
+        assert!(restarted.ends_session());
+        let text = restarted.to_string();
+        assert!(text.starts_with("Disconnected: "), "{text}");
+        assert!(text.contains("401 Unauthorized"));
+        assert!(text.contains("no longer valid"));
+        assert!(text.contains("reconnect with the bearer token the bridge currently prints"));
+
+        let broken = bridge_http_error(500, "bridge state lock poisoned", true);
+        assert!(broken.ends_session());
+        let text = broken.to_string();
+        assert!(text.starts_with("Disconnected: "), "{text}");
+        assert!(text.contains("500 Internal Server Error"));
+        assert!(text.contains("bridge state lock poisoned"));
+        assert!(text.contains("Restart the bridge"));
+        assert!(text.contains("reconnect"));
+    }
+
+    #[test]
+    fn unreachable_bridge_ends_only_an_established_session() {
+        let (url, origin) = ("http://127.0.0.1:8765", "https://app.example");
+        let diagnostic = fetch_failure_message(url, origin);
+        let detail = "failed to await bridge response text: JsValue(TypeError)";
+
+        // Initial /v1/connect: keep the plain reachability / origin diagnostic.
+        assert_eq!(
+            fetch_failure_error(url, origin, false),
+            WasmError::BridgeError(diagnostic.clone())
+        );
+        assert_eq!(
+            body_read_failure_error(detail, url, origin, false),
+            WasmError::BridgeError(detail.to_string())
+        );
+
+        // Established session: the session is gone, with the same diagnostic.
+        for (err, specific) in [
+            (fetch_failure_error(url, origin, true), "stopped answering"),
+            (
+                body_read_failure_error(detail, url, origin, true),
+                "connection broke while reading the bridge's reply",
+            ),
         ] {
-            let err = bridge_http_error(status, "detail");
-            assert!(!err.ends_session(), "{status}");
-            assert!(err.to_string().contains(marker), "{status}: {err}");
+            assert!(err.ends_session(), "{err}");
+            let text = err.to_string();
+            assert!(
+                text.starts_with("Disconnected: lost the bridge session"),
+                "{text}"
+            );
+            assert!(text.contains(specific), "{text}");
+            assert!(text.contains(&diagnostic), "{text}");
+            assert!(text.contains("not running"), "{text}");
+            assert!(
+                text.contains("yubikey-cli bridge --allow-origin https://app.example"),
+                "{text}"
+            );
+            assert!(
+                text.contains("reconnect with the bearer token the bridge currently prints"),
+                "{text}"
+            );
         }
+        assert!(
+            body_read_failure_error(detail, url, origin, true)
+                .to_string()
+                .contains(detail)
+        );
+    }
+
+    fn connected_transport() -> BridgeTransport {
+        BridgeTransport {
+            base_url: "http://127.0.0.1:8765".to_string(),
+            token: Zeroizing::new("t".repeat(BRIDGE_MIN_TOKEN_LEN)),
+            session_id: Some(Zeroizing::new(
+                "00112233445566778899aabbccddeeff".to_string(),
+            )),
+            connected: true,
+        }
+    }
+
+    #[test]
+    fn session_ending_errors_disconnect_the_transport() {
+        use crate::transport::test_support::block_on;
+
+        let (url, origin) = ("http://127.0.0.1:8765", "https://app.example");
+        for err in [
+            fetch_failure_error(url, origin, true),
+            body_read_failure_error("detail", url, origin, true),
+            bridge_http_error(401, "x", true),
+            bridge_http_error(409, "x", true),
+            bridge_http_error(500, "x", true),
+            bridge_http_error(503, "x", true),
+        ] {
+            let mut transport = connected_transport();
+            let result: WasmResult<String> = transport.end_session_on_error(Err(err.clone()));
+            assert_eq!(result, Err(err.clone()));
+            assert!(!transport.is_connected(), "{err}");
+            assert!(transport.session_id.is_none(), "{err}");
+
+            // Later calls fail fast without contacting the bridge...
+            let apdu = Apdu::new(0x00, 0xCB, 0x3F, 0xFF, Vec::new());
+            assert!(matches!(
+                block_on(transport.transmit_async(&apdu)),
+                Err(WasmError::Disconnected(msg)) if msg.contains("reconnect")
+            ));
+            // ...and closing the dead session sends nothing and never fails.
+            assert_eq!(block_on(transport.close()), Ok(()));
+            assert!(!transport.is_connected());
+        }
+
+        for err in [
+            bridge_http_error(403, "APDU rejected by bridge policy", true),
+            bridge_http_error(408, "x", true),
+            bridge_http_error(413, "x", true),
+            bridge_http_error(502, "x", true),
+            WasmError::BridgeError("failed to build fetch Request".to_string()),
+        ] {
+            let mut transport = connected_transport();
+            let result: WasmResult<String> = transport.end_session_on_error(Err(err.clone()));
+            assert_eq!(result, Err(err.clone()));
+            assert!(transport.is_connected(), "{err}");
+            assert!(transport.session_id.is_some(), "{err}");
+        }
+
+        let mut transport = connected_transport();
+        assert_eq!(
+            transport.end_session_on_error(Ok("{}".to_string())),
+            Ok("{}".to_string())
+        );
+        assert!(transport.is_connected());
     }
 }

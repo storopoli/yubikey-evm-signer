@@ -100,7 +100,7 @@ Await each call before starting the next one: a `YubiKeyDevice` handles one call
 ## Usage rules
 
 - **One call at a time.** A `YubiKeyDevice` handles one call at a time. While a call is pending (for example a signature waiting for a touch), any other call on the same object, including `getSlot()`, `setSlot()`, `hasStaleCertificate()`, and `isConnected()`, throws synchronously with `recursive use of an object detected which would lead to unsafe aliasing in rust`; the pending call is unaffected. Await each call, or route all calls through one queue.
-- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. Create a new device with `connectBridge()` or `connect()` to continue.
+- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. Over the bridge this includes a bridge that stopped answering or was restarted (its old token is rejected with `401`). Create a new device with `connectBridge()` or `connect()` to continue, using the token the bridge currently prints.
 - **PINs.** Prompt for the PIN at runtime and pass it to each signing call; never hardcode it or keep it in browser storage.
 
 ## API Reference
@@ -320,12 +320,16 @@ Methods throw JavaScript `Error` objects (async methods reject). The message sta
 | `Failed to open device: …` / `Failed to claim interface: …` / `USB error: …` | WebUSB could not open or claim the device (for example the protected CCID class or the OS smart card driver), or another WebUSB call failed |
 | `Bridge error: Bridge URL must be http://127.0.0.1:<port> with a port other than 80 (localhost and [::1] are not accepted)` | `connectBridge()` URL rejected before any request |
 | `Bridge error: Bridge bearer token must be at least 32 visible ASCII characters …` | `connectBridge()` token rejected before any request |
-| `Bridge error: Failed to reach the local PC/SC bridge at …` | The bridge is not running, or it does not allow this page's origin; the message names the `yubikey-cli bridge --allow-origin <origin>` command to use |
-| `Bridge error: Bridge authentication failed (401 Unauthorized): …` | Wrong bearer token |
+| `Bridge error: Failed to reach the local PC/SC bridge at …` | `connectBridge()`: the bridge is not running, or it does not allow this page's origin; the message names the `yubikey-cli bridge --allow-origin <origin>` command to use |
+| `Bridge error: Bridge authentication failed (401 Unauthorized): …` | `connectBridge()`: wrong bearer token |
 | `Bridge error: Bridge refused the request (403 Forbidden): …` | The bridge refused a command. Key generation commands without `--allow-generate` get a message naming that flag |
 | `Bridge error: Bridge found no YubiKey (404): …` | No YubiKey available to the local PC/SC daemon |
 | `Bridge error: Bridge timed out reading the request (408 Request Timeout): …` | The request did not reach the bridge in time; retry |
-| `Bridge error: Bridge rejected an oversized request (413 Payload Too Large): …` / `Bridge error: Bridge request failed (HTTP …): …` | Other bridge HTTP errors |
+| `Bridge error: Bridge rejected an oversized request (413 Payload Too Large): …` / `Bridge error: Bridge request failed (HTTP …): …` | Other bridge HTTP errors, including `502` card communication errors and, from `connectBridge()`, `500` |
+| `Disconnected: lost the bridge session because the bridge stopped answering. Failed to reach the local PC/SC bridge at …` | After connecting: the bridge stopped or crashed, or was restarted without this page's origin. Ends the session; reconnect with the token the bridge currently prints |
+| `Disconnected: lost the bridge session because the connection broke while reading the bridge's reply (…). …` | After connecting: the bridge went away while answering. Ends the session |
+| `Disconnected: bridge rejected the bearer token (401 Unauthorized): …` | After connecting: the bridge was restarted and prints a new token. Ends the session; reconnect with the new token |
+| `Disconnected: bridge internal error (500 Internal Server Error): …` | After connecting: the bridge can no longer serve the session. Ends the session; restart the bridge and reconnect |
 | `Disconnected: bridge session ended (409 Conflict): …` | The bridge session expired after the idle timeout, was replaced by another connection, or was closed because another PC/SC client reset the card. Ends the session |
 | `Disconnected: bridge lost the YubiKey or is shutting down (503 Service Unavailable): …` | YubiKey or reader removed, or the bridge is stopping. Ends the session |
 | `Disconnected: …` (other) | The YubiKey was unplugged, the session was already closed, or the WebUSB connection was closed after an unrecoverable CCID error or timeout. Ends the session |

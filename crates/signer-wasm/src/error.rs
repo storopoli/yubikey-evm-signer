@@ -41,7 +41,8 @@ pub enum WasmError {
     CardReset,
 
     /// The session or the device is gone (bridge session expired, replaced or
-    /// closed by a card reset, bridge or reader lost, YubiKey unplugged, or the
+    /// closed by a card reset; bridge stopped answering, restarted with a new
+    /// token, or failed internally; reader lost, YubiKey unplugged, or the
     /// WebUSB transport was closed after an unrecoverable error).
     ///
     /// The device must be reconnected; the message says why.
