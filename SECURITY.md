@@ -17,7 +17,8 @@ This is a maintainer-run open-source project without a bug bounty program. Repor
 
 | Version | Supported |
 |---------|-----------|
-| `0.0.1` / `main` | Yes |
+| `0.1.x` / `main` | Yes |
+| `< 0.1.0` | No |
 
 This library is pre-1.0 and has not undergone an independent security audit. Review the code before relying on it to protect anything of value.
 
