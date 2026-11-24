@@ -489,6 +489,10 @@ struct SharedContext {
     request_timeout: Duration,
     state: Mutex<BridgeState>,
     /// Signalled when a session is created and on shutdown (wakes the idle watchdog).
+    ///
+    /// The watchdog checks its predicate and enters the wait while holding
+    /// `state`, so every change it must observe is made while holding `state`
+    /// and is followed by `notify_all` (see [`SharedContext::signal_shutdown`]).
     session_changed: Condvar,
     active_connections: AtomicUsize,
     shutdown: AtomicBool,
@@ -501,6 +505,27 @@ impl SharedContext {
     /// session even after a panic poisoned the mutex.
     fn lock_state_for_cleanup(&self) -> MutexGuard<'_, BridgeState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sets `shutdown`, closes the active session and wakes the idle watchdog
+    /// so it exits. The caller then joins the watchdog thread.
+    ///
+    /// Locking rule: [`session_watchdog`] holds `state` from its `shutdown`
+    /// check until `session_changed.wait` atomically releases it, so the flag
+    /// is stored while holding `state` and `notify_all` is issued only after
+    /// that. A watchdog that has not yet checked the flag then sees it set,
+    /// and one that already checked it is waiting by the time this acquires
+    /// `state`, so the notification cannot fall between its check and its
+    /// wait. A poisoned lock is recovered; it still orders the two threads.
+    fn signal_shutdown(&self) {
+        let closed = {
+            let mut state = self.lock_state_for_cleanup();
+            self.shutdown.store(true, Ordering::SeqCst);
+            state.active_session.take()
+        };
+        // Dropping the transport ends the PC/SC handle and resets the card.
+        drop(closed);
+        self.session_changed.notify_all();
     }
 }
 
@@ -592,8 +617,7 @@ impl BridgeServer {
         {
             Ok(thread) => thread,
             Err(e) => {
-                ctx.shutdown.store(true, Ordering::SeqCst);
-                ctx.session_changed.notify_all();
+                ctx.signal_shutdown();
                 let _ = watchdog.join();
                 return Err(Error::ConnectionFailed(format!(
                     "failed to spawn bridge thread: {e}"
@@ -690,9 +714,7 @@ impl BridgeHandle {
         // Close the session explicitly: dropping its transport ends the PC/SC
         // handle and resets the card, discarding PIN and management key state.
         // `/v1/connect` refuses to open a new session once `shutdown` is set.
-        let closed = self.ctx.lock_state_for_cleanup().active_session.take();
-        drop(closed);
-        self.ctx.session_changed.notify_all();
+        self.ctx.signal_shutdown();
 
         if let Some(handle) = self.watchdog.take() {
             let _ = handle.join();
@@ -2598,6 +2620,54 @@ mod tests {
             .unwrap();
         assert!(head.framing_error.is_none());
         assert_eq!(head.content_length, 12);
+    }
+
+    fn idle_watchdog_context() -> Arc<SharedContext> {
+        Arc::new(SharedContext {
+            expected_host: "127.0.0.1:8545".to_string(),
+            allowed_origins: origins(),
+            auth_token: Zeroizing::new(TEST_TOKEN.to_string()),
+            backend_name: "test".to_string(),
+            allow_key_generation: false,
+            idle_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            state: Mutex::new(BridgeState {
+                connector: Box::new(|| Err(Error::DeviceNotFound)),
+                active_session: None,
+            }),
+            session_changed: Condvar::new(),
+            active_connections: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn signal_shutdown_always_stops_an_idle_watchdog() {
+        // With no session the watchdog blocks in an untimed wait, so a lost
+        // wakeup would leave it blocked forever. Each iteration races the
+        // signal against a freshly started watchdog; the bounded receive turns
+        // a hang into a failure.
+        for iteration in 0..500 {
+            let ctx = idle_watchdog_context();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let watchdog_ctx = Arc::clone(&ctx);
+            let watchdog = thread::spawn(move || {
+                session_watchdog(&watchdog_ctx);
+                let _ = done_tx.send(());
+            });
+            for _ in 0..iteration % 8 {
+                thread::yield_now();
+            }
+
+            ctx.signal_shutdown();
+
+            assert!(
+                done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "watchdog missed the shutdown signal in iteration {iteration}"
+            );
+            watchdog.join().unwrap();
+            assert!(ctx.shutdown.load(Ordering::SeqCst));
+        }
     }
 
     #[test]
