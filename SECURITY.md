@@ -9,6 +9,3 @@ As a general rule, an issue is a security vulnerability if it could lead to:
 
 In general, use your best judgement in determining whether an issue is a security issue.
 If not, go ahead and post it to the public issue tracker.
-
-**If you believe you are aware of a security issue**, please contact Alpen Labs at
-`security@alpenlabs.io`.
