@@ -90,6 +90,16 @@ impl DeviceTransport {
             Self::Scripted(t) => t.is_connected(),
         }
     }
+
+    /// The transport's own [`WasmError::Disconnected`] error unless it is usable.
+    fn ensure_usable(&self) -> WasmResult<()> {
+        match self {
+            Self::WebUsb(t) => t.ensure_usable(),
+            Self::Bridge(t) => t.ensure_usable(),
+            #[cfg(test)]
+            Self::Scripted(t) => t.ensure_usable(),
+        }
+    }
 }
 
 /// Parses a PIV slot string (`"9a"`, `"9c"`, `"9d"`, `"9e"`, case-insensitive).
@@ -203,6 +213,10 @@ pub fn public_key_to_hex(public_key: &VerifyingKey) -> String {
 /// fails with an error starting with `Disconnected:` (or the card-reset
 /// message), the verified PIN, management key authentication and cached public
 /// key are discarded, and [`is_connected`](Self::is_connected) returns `false`.
+/// Once `isConnected()` is `false` (for WebUSB also when the YubiKey was
+/// unplugged between calls), every async method except
+/// [`disconnect`](Self::disconnect) fails with a `Disconnected:` error as soon
+/// as it is called, without returning anything cached from the ended session.
 /// A key generated before the session was lost stays available through
 /// [`last_generated_public_key`](Self::last_generated_public_key).
 /// Create a new device with [`connect_bridge`](Self::connect_bridge) or
@@ -372,10 +386,12 @@ impl YubiKeyDevice {
         key_hex: &str,
         algorithm: Option<String>,
     ) -> Result<(), JsValue> {
-        let result = self
-            .authenticate_management_key_internal(key_hex, algorithm.as_deref())
-            .await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| {
+            dev.authenticate_management_key_internal(key_hex, algorithm.as_deref())
+                .await
+        })
+        .await
+        .map_err(JsValue::from)
     }
 
     /// Internal mutual management key authentication.
@@ -459,8 +475,9 @@ impl YubiKeyDevice {
     /// or locked, or the session is lost.
     #[wasm_bindgen(js_name = "verifyPin")]
     pub async fn verify_pin(&mut self, pin: &str) -> Result<(), JsValue> {
-        let result = self.verify_pin_internal(pin).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| dev.verify_pin_internal(pin).await)
+            .await
+            .map_err(JsValue::from)
     }
 
     /// Internal PIN verification.
@@ -519,8 +536,9 @@ impl YubiKeyDevice {
     /// generation fails or is refused by the bridge, or the session is lost.
     #[wasm_bindgen(js_name = "generateKey")]
     pub async fn generate_key(&mut self, pin: Option<String>) -> Result<String, JsValue> {
-        let result = self.generate_key_internal(pin.as_deref()).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| dev.generate_key_internal(pin.as_deref()).await)
+            .await
+            .map_err(JsValue::from)
     }
 
     /// Internal key generation.
@@ -600,11 +618,13 @@ impl YubiKeyDevice {
     /// is lost.
     #[wasm_bindgen(js_name = "getAddress")]
     pub async fn get_address(&mut self) -> Result<String, JsValue> {
-        let result = self
-            .resolve_public_key()
-            .await
-            .map(|key| Address::from_public_key(&key).to_checksum_hex());
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| {
+            dev.resolve_public_key()
+                .await
+                .map(|key| Address::from_public_key(&key).to_checksum_hex())
+        })
+        .await
+        .map_err(JsValue::from)
     }
 
     /// Returns the P-256 public key of the active slot as uncompressed SEC1 hex
@@ -622,11 +642,13 @@ impl YubiKeyDevice {
     /// Same as [`get_address`](Self::get_address).
     #[wasm_bindgen(js_name = "getPublicKey")]
     pub async fn get_public_key(&mut self) -> Result<String, JsValue> {
-        let result = self
-            .resolve_public_key()
-            .await
-            .map(|key| public_key_to_hex(&key));
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| {
+            dev.resolve_public_key()
+                .await
+                .map(|key| public_key_to_hex(&key))
+        })
+        .await
+        .map_err(JsValue::from)
     }
 
     /// Returns `true` if the active slot's certificate object is known **not** to
@@ -664,8 +686,9 @@ impl YubiKeyDevice {
     /// read from the card again until a certificate for it is stored.
     ///
     /// It is reset to `undefined` when `generateKey()` starts (so after a
-    /// rejected `generateKey()` it is `undefined`) and when
-    /// [`set_slot`](Self::set_slot) changes the slot, so a defined value always
+    /// rejected `generateKey()` it is `undefined`, unless the call was rejected
+    /// because the device was already disconnected, which leaves it unchanged)
+    /// and when [`set_slot`](Self::set_slot) changes the slot, so a defined value always
     /// belongs to the slot returned by [`get_slot`](Self::get_slot). If
     /// `generateKey()` rejects because the session ended while the card was
     /// generating, the slot's key may still have been replaced without the new
@@ -700,9 +723,12 @@ impl YubiKeyDevice {
     /// lost.
     #[wasm_bindgen(js_name = "signHash")]
     pub async fn sign_hash(&mut self, pin: &str, hash: &str) -> Result<String, JsValue> {
-        let hash_bytes = parse_hash_hex(hash).map_err(JsValue::from)?;
-        let result = self.sign_digest_internal(pin, &hash_bytes).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| {
+            let hash_bytes = parse_hash_hex(hash)?;
+            dev.sign_digest_internal(pin, &hash_bytes).await
+        })
+        .await
+        .map_err(JsValue::from)
     }
 
     /// Internal 32-byte digest signing (shared by every sign entry point).
@@ -776,8 +802,9 @@ impl YubiKeyDevice {
     /// hardware signing fails, or the session is lost.
     #[wasm_bindgen(js_name = "signTransaction")]
     pub async fn sign_transaction(&mut self, pin: &str, tx_json: &str) -> Result<String, JsValue> {
-        let result = self.sign_transaction_internal(pin, tx_json).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| dev.sign_transaction_internal(pin, tx_json).await)
+            .await
+            .map_err(JsValue::from)
     }
 
     /// Internal transaction signing.
@@ -815,8 +842,9 @@ impl YubiKeyDevice {
         pin: &str,
         typed_data_json: &str,
     ) -> Result<String, JsValue> {
-        let result = self.sign_typed_data_internal(pin, typed_data_json).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| dev.sign_typed_data_internal(pin, typed_data_json).await)
+            .await
+            .map_err(JsValue::from)
     }
 
     /// Internal EIP-712 signing.
@@ -854,9 +882,12 @@ impl YubiKeyDevice {
     /// is lost.
     #[wasm_bindgen(js_name = "signMessage")]
     pub async fn sign_message(&mut self, pin: &str, message: &str) -> Result<String, JsValue> {
-        let hash: [u8; 32] = eip191_hash(message.as_bytes()).into();
-        let result = self.sign_digest_internal(pin, &hash).await;
-        self.settle(result).await.map_err(JsValue::from)
+        self.in_session(async |dev| {
+            let hash: [u8; 32] = eip191_hash(message.as_bytes()).into();
+            dev.sign_digest_internal(pin, &hash).await
+        })
+        .await
+        .map_err(JsValue::from)
     }
 
     /// Disconnects from the YubiKey and clears all cached session state.
@@ -907,6 +938,26 @@ impl YubiKeyDevice {
         self.authenticated = false;
         self.mgmt_authenticated = false;
         self.cached_public_key = None;
+    }
+
+    /// Runs an exported operation that needs the session, then settles its
+    /// result (see [`Self::settle`]).
+    ///
+    /// If the transport no longer reports itself connected when the call
+    /// starts (for WebUSB, the YubiKey may have been unplugged since the last
+    /// call), `op` does not run: the call fails with the transport's own
+    /// [`WasmError::Disconnected`] error, so nothing cached from the ended
+    /// session (such as the public key) is returned and no session state is
+    /// changed except being discarded.
+    async fn in_session<T>(
+        &mut self,
+        op: impl AsyncFnOnce(&mut Self) -> WasmResult<T>,
+    ) -> WasmResult<T> {
+        let result = match self.transport.ensure_usable() {
+            Ok(()) => op(self).await,
+            Err(e) => Err(e),
+        };
+        self.settle(result).await
     }
 
     /// Post-processes the result of an exported operation.
@@ -1218,6 +1269,43 @@ mod tests {
         sent.borrow().iter().map(|apdu| apdu[1]).collect()
     }
 
+    /// Simulates the WebUSB `disconnect` event firing between two calls.
+    fn unplug(dev: &YubiKeyDevice) {
+        let DeviceTransport::Scripted(transport) = &dev.transport else {
+            unreachable!("tests use the scripted transport");
+        };
+        transport.unplugged().set(true);
+    }
+
+    /// `getAddress()` as the exported method runs it.
+    fn get_address(dev: &mut YubiKeyDevice) -> WasmResult<String> {
+        block_on(dev.in_session(async |dev| {
+            dev.resolve_public_key()
+                .await
+                .map(|key| Address::from_public_key(&key).to_checksum_hex())
+        }))
+    }
+
+    /// `getPublicKey()` as the exported method runs it.
+    fn get_public_key(dev: &mut YubiKeyDevice) -> WasmResult<String> {
+        block_on(dev.in_session(async |dev| {
+            dev.resolve_public_key()
+                .await
+                .map(|key| public_key_to_hex(&key))
+        }))
+    }
+
+    /// `verifyPin()` as the exported method runs it.
+    fn verify_pin(dev: &mut YubiKeyDevice) -> WasmResult<String> {
+        block_on(dev.in_session(async |dev| dev.verify_pin_internal(PIN).await))
+            .map(|()| String::new())
+    }
+
+    /// `generateKey()` as the exported method runs it.
+    fn generate_key(dev: &mut YubiKeyDevice) -> WasmResult<String> {
+        block_on(dev.in_session(async |dev| dev.generate_key_internal(None).await))
+    }
+
     const PIN: &str = "123456";
     const DIGEST: [u8; 32] = [0x11; 32];
 
@@ -1457,11 +1545,7 @@ mod tests {
             let (mut dev, sent) = device(handler, Slot::Authentication);
             dev.mgmt_authenticated = true;
             dev.authenticated = true;
-            let address = block_on(async {
-                let result = dev.generate_key_internal(None).await;
-                dev.settle(result).await
-            })
-            .unwrap();
+            let address = generate_key(&mut dev).unwrap();
             assert_eq!(address, address_of(&new_key));
             assert!(dev.has_stale_certificate());
             assert!(!dev.is_connected());
@@ -1473,8 +1557,21 @@ mod tests {
                 Some(new_key_hex.as_str())
             );
 
-            // Reading it needs no card access, and disconnect() keeps it.
+            // Reading it needs no card access, later session calls fail
+            // without clearing it, and disconnect() keeps it.
             let sent_before = sent.borrow().len();
+            assert!(matches!(
+                get_public_key(&mut dev),
+                Err(WasmError::Disconnected(_))
+            ));
+            assert!(matches!(
+                generate_key(&mut dev),
+                Err(WasmError::Disconnected(_))
+            ));
+            assert_eq!(
+                dev.last_generated_public_key().as_deref(),
+                Some(new_key_hex.as_str())
+            );
             block_on(dev.disconnect()).unwrap();
             assert_eq!(
                 dev.last_generated_public_key().as_deref(),
@@ -1633,6 +1730,123 @@ mod tests {
             assert!(dev.is_connected());
             assert!(dev.mgmt_authenticated);
             assert!(dev.cached_public_key.is_some());
+        }
+    }
+
+    #[test]
+    fn a_session_ended_between_calls_serves_nothing_cached() {
+        let (key_a, new_key) = (signing_key(1), signing_key(3));
+        let new_key_hex = public_key_to_hex(new_key.verifying_key());
+        type Op = fn(&mut YubiKeyDevice) -> WasmResult<String>;
+        let ops: [(&str, Op); 6] = [
+            ("getAddress", get_address),
+            ("getPublicKey", get_public_key),
+            ("verifyPin", verify_pin),
+            ("authenticateManagementKey", |dev| {
+                block_on(dev.in_session(async |dev| {
+                    dev.authenticate_management_key_internal(&"00".repeat(24), None)
+                        .await
+                }))
+                .map(|()| String::new())
+            }),
+            ("generateKey", generate_key),
+            ("signHash", |dev| {
+                block_on(dev.in_session(async |dev| dev.sign_digest_internal(PIN, &DIGEST).await))
+            }),
+        ];
+
+        for (name, op) in ops {
+            let handler = card(
+                reply(ok(metadata_body(0x11, &point(&key_a)))),
+                reply(sw(0x6A, 0x82)),
+                key_a.clone(),
+                reply(sw(0x90, 0x00)),
+            );
+            let (mut dev, sent) = device(handler, Slot::Authentication);
+            assert_eq!(get_address(&mut dev), Ok(address_of(&key_a)));
+            dev.authenticated = true;
+            dev.mgmt_authenticated = true;
+            dev.last_generated_public_key = Some(*new_key.verifying_key());
+            sent.borrow_mut().clear();
+
+            // The YubiKey is unplugged while no call is running.
+            unplug(&dev);
+            assert!(!dev.is_connected());
+            let expected = dev.transport.ensure_usable().unwrap_err();
+            assert!(expected.to_string().starts_with("Disconnected: "));
+
+            assert_eq!(op(&mut dev), Err(expected.clone()), "{name}");
+            assert!(sent.borrow().is_empty(), "{name}");
+            assert!(!dev.authenticated, "{name}");
+            assert!(!dev.mgmt_authenticated, "{name}");
+            assert!(dev.cached_public_key.is_none(), "{name}");
+            assert!(!dev.is_connected(), "{name}");
+            assert_eq!(get_address(&mut dev), Err(expected), "{name}");
+
+            // Session-independent getters and disconnect() keep working.
+            assert_eq!(
+                dev.last_generated_public_key().as_deref(),
+                Some(new_key_hex.as_str()),
+                "{name}"
+            );
+            assert_eq!(dev.get_slot(), "9a");
+            assert!(!dev.has_stale_certificate());
+            block_on(dev.disconnect()).unwrap();
+            assert!(!dev.is_connected());
+            assert_eq!(
+                dev.last_generated_public_key().as_deref(),
+                Some(new_key_hex.as_str()),
+                "{name}"
+            );
+            assert!(sent.borrow().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_session_ended_by_an_earlier_call_serves_nothing_cached() {
+        use crate::bridge_transport::{bridge_http_error, fetch_failure_error};
+
+        let key_a = signing_key(1);
+        for lost in [
+            bridge_http_error(409, "session expired", true),
+            bridge_http_error(503, "YubiKey removed", true),
+            fetch_failure_error("http://127.0.0.1:8765", "https://app.example", true),
+        ] {
+            let failure: Rc<RefCell<Option<WasmError>>> = Rc::default();
+            let mut answer = card(
+                reply(ok(metadata_body(0x11, &point(&key_a)))),
+                reply(sw(0x6A, 0x82)),
+                key_a.clone(),
+                reply(sw(0x90, 0x00)),
+            );
+            let failing = Rc::clone(&failure);
+            let handler: Handler = Box::new(move |apdu: &Apdu| {
+                let injected = failing.borrow().clone();
+                injected.map_or_else(|| answer(apdu), Err)
+            });
+            let (mut dev, sent) = device(handler, Slot::Authentication);
+            assert_eq!(
+                get_public_key(&mut dev),
+                Ok(public_key_to_hex(key_a.verifying_key()))
+            );
+            dev.authenticated = true;
+            dev.mgmt_authenticated = true;
+
+            *failure.borrow_mut() = Some(lost.clone());
+            assert_eq!(verify_pin(&mut dev), Err(lost.clone()));
+            assert!(!dev.is_connected());
+            assert!(!dev.authenticated);
+            assert!(!dev.mgmt_authenticated);
+            assert!(dev.cached_public_key.is_none());
+
+            // Even if the card would answer again, the ended session is not
+            // reused and the key cached before it ended is not served.
+            *failure.borrow_mut() = None;
+            sent.borrow_mut().clear();
+            let expected = dev.transport.ensure_usable().unwrap_err();
+            assert_eq!(get_address(&mut dev), Err(expected.clone()), "{lost}");
+            assert_eq!(get_public_key(&mut dev), Err(expected), "{lost}");
+            assert!(sent.borrow().is_empty(), "{lost}");
         }
     }
 

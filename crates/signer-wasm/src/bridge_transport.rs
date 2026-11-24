@@ -101,6 +101,11 @@ const RECONNECT_ADVICE: &str = "reconnect with the bearer token the bridge curre
      restarted bridge prints a new one); PIV selection, PIN and management key authentication \
      must be repeated";
 
+/// Error for a call on a bridge session that is already closed.
+fn session_closed_error() -> WasmError {
+    WasmError::Disconnected("the bridge session is closed; reconnect to the bridge".to_string())
+}
+
 /// Maps a `fetch()` that rejected without an HTTP response to a [`WasmError`].
 ///
 /// Before a session is `established` (during `/v1/connect`) this is a
@@ -301,11 +306,7 @@ impl BridgeTransport {
             .session_id
             .as_ref()
             .filter(|_| self.connected)
-            .ok_or_else(|| {
-                WasmError::Disconnected(
-                    "the bridge session is closed; reconnect to the bridge".to_string(),
-                )
-            })?
+            .ok_or_else(session_closed_error)?
             .clone();
 
         let apdu_bytes = Zeroizing::new(
@@ -385,6 +386,15 @@ impl BridgeTransport {
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// Fails fast with [`WasmError::Disconnected`] unless the session is open.
+    pub(crate) fn ensure_usable(&self) -> WasmResult<()> {
+        if self.connected {
+            Ok(())
+        } else {
+            Err(session_closed_error())
+        }
     }
 
     /// Executes a `POST` request with JSON body and Bearer auth against the local
@@ -743,12 +753,15 @@ mod tests {
             assert!(!transport.is_connected(), "{err}");
             assert!(transport.session_id.is_none(), "{err}");
 
-            // Later calls fail fast without contacting the bridge...
+            // Later calls fail fast without contacting the bridge, with the
+            // same error the device's start-of-call guard reports...
             let apdu = Apdu::new(0x00, 0xCB, 0x3F, 0xFF, Vec::new());
+            let closed = block_on(transport.transmit_async(&apdu));
             assert!(matches!(
-                block_on(transport.transmit_async(&apdu)),
+                &closed,
                 Err(WasmError::Disconnected(msg)) if msg.contains("reconnect")
             ));
+            assert_eq!(transport.ensure_usable(), closed.map(drop));
             // ...and closing the dead session sends nothing and never fails.
             assert_eq!(block_on(transport.close()), Ok(()));
             assert!(!transport.is_connected());
@@ -766,6 +779,7 @@ mod tests {
             assert_eq!(result, Err(err.clone()));
             assert!(transport.is_connected(), "{err}");
             assert!(transport.session_id.is_some(), "{err}");
+            assert_eq!(transport.ensure_usable(), Ok(()));
         }
 
         let mut transport = connected_transport();

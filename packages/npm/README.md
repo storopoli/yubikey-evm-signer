@@ -100,7 +100,7 @@ Await each call before starting the next one: a `YubiKeyDevice` handles one call
 ## Usage rules
 
 - **One call at a time.** A `YubiKeyDevice` handles one call at a time. While a call is pending (for example a signature waiting for a touch), any other call on the same object, including `getSlot()`, `setSlot()`, `hasStaleCertificate()`, `lastGeneratedPublicKey()`, and `isConnected()`, throws synchronously with `recursive use of an object detected which would lead to unsafe aliasing in rust`; the pending call is unaffected. Await each call, or route all calls through one queue.
-- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. A key generated before the session ended stays available from `lastGeneratedPublicKey()`. Over the bridge this includes a bridge that stopped answering or was restarted (its old token is rejected with `401`). Create a new device with `connectBridge()` or `connect()` to continue, using the token the bridge currently prints.
+- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. Once `isConnected()` is `false` (for WebUSB also when the YubiKey was unplugged between calls), every async method except `disconnect()` fails with a `Disconnected:` error as soon as it is called, without returning anything cached from the ended session. A key generated before the session ended stays available from `lastGeneratedPublicKey()`. Over the bridge this includes a bridge that stopped answering or was restarted (its old token is rejected with `401`). Create a new device with `connectBridge()` or `connect()` to continue, using the token the bridge currently prints.
 - **PINs.** Prompt for the PIN at runtime and pass it to each signing call; never hardcode it or keep it in browser storage.
 
 ## API Reference
@@ -186,7 +186,7 @@ Return the P-256 public key of the active slot as uncompressed SEC1 hex, `0x04�
 
 Return the P-256 public key created by the last successful `generateKey()` in the active slot, as `0x04‖X‖Y` hex (the `getPublicKey()` format), or `undefined`. It is synchronous, sends nothing to the card, and survives the end of the session and `disconnect()`: whenever `generateKey()` resolved, the new key is here, even if `isConnected()` is now `false`.
 
-It is reset to `undefined` when `generateKey()` starts (so it is `undefined` after a rejected `generateKey()`) and when `setSlot()` changes the slot, so a defined value always belongs to the slot `getSlot()` returns. If `generateKey()` rejects because the session ended while the card was generating, the slot's key may have been replaced without the new key being reported.
+It is reset to `undefined` when `generateKey()` starts (so it is `undefined` after a rejected `generateKey()`, unless the call was rejected because the device was already disconnected, which leaves it unchanged) and when `setSlot()` changes the slot, so a defined value always belongs to the slot `getSlot()` returns. If `generateKey()` rejects because the session ended while the card was generating, the slot's key may have been replaced without the new key being reported.
 
 #### `hasStaleCertificate(): boolean`
 

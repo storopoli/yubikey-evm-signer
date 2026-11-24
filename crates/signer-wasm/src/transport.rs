@@ -712,7 +712,7 @@ impl WebUsbTransport {
     }
 
     /// Fails fast with [`WasmError::Disconnected`] unless the transport is usable.
-    fn ensure_usable(&self) -> WasmResult<()> {
+    pub(crate) fn ensure_usable(&self) -> WasmResult<()> {
         if self.unplugged.get() {
             return Err(WasmError::Disconnected(
                 "the YubiKey was unplugged; reconnect it".to_string(),
@@ -1061,11 +1061,13 @@ pub(crate) mod test_support {
 
     /// In-memory transport that records every APDU it sends and answers it with
     /// a handler. A session-ending error from the handler disconnects it, like
-    /// the bridge and WebUSB transports do.
+    /// the bridge and WebUSB transports do, and [`Self::unplugged`] models the
+    /// WebUSB `disconnect` event that can fire between calls.
     pub(crate) struct ScriptedTransport {
         handler: Handler,
         sent: Rc<RefCell<Vec<Vec<u8>>>>,
         connected: bool,
+        unplugged: Rc<Cell<bool>>,
     }
 
     impl ScriptedTransport {
@@ -1077,9 +1079,28 @@ pub(crate) mod test_support {
                     handler,
                     sent: Rc::clone(&sent),
                     connected: true,
+                    unplugged: Rc::new(Cell::new(false)),
                 },
                 sent,
             )
+        }
+
+        /// Flag that, once set, makes the transport report the device unplugged.
+        pub(crate) fn unplugged(&self) -> Rc<Cell<bool>> {
+            Rc::clone(&self.unplugged)
+        }
+
+        /// Fails fast with [`WasmError::Disconnected`] unless the transport is usable.
+        pub(crate) fn ensure_usable(&self) -> WasmResult<()> {
+            if self.unplugged.get() {
+                return Err(WasmError::Disconnected(
+                    "scripted YubiKey unplugged; reconnect it".into(),
+                ));
+            }
+            if !self.connected {
+                return Err(WasmError::Disconnected("scripted transport closed".into()));
+            }
+            Ok(())
         }
 
         pub(crate) async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
@@ -1107,16 +1128,14 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        pub(crate) const fn is_connected(&self) -> bool {
-            self.connected
+        pub(crate) fn is_connected(&self) -> bool {
+            self.connected && !self.unplugged.get()
         }
     }
 
     impl AsyncApduTransport for ScriptedTransport {
         async fn transmit_one(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
-            if !self.connected {
-                return Err(WasmError::Disconnected("scripted transport closed".into()));
-            }
+            self.ensure_usable()?;
             self.sent.borrow_mut().push(apdu.to_bytes().unwrap());
             let result = (self.handler)(apdu);
             if matches!(&result, Err(e) if e.ends_session()) {
