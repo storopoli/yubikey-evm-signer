@@ -177,7 +177,7 @@ cli-info:
 cli-address:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- address
 
-# Generate a new P-256 key in slot 9a (requires PIN, overwrites existing key!)
+# Generate a new P-256 key in slot 9a (requires management key and typed confirmation; destroys existing key!)
 [group('cli')]
 cli-generate:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate

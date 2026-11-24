@@ -35,13 +35,15 @@
 //!
 //! session.select()?;
 //!
-//! // Authenticate management key to generate a key in slot 9a
-//! session.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
-//! let public_key = session.generate_key(Slot::Authentication)?;
+//! // Authenticate management key and generate a key in slot 9a in one exclusive scope
+//! let generated = session.exclusive(|piv| {
+//!     piv.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
+//!     piv.generate_key(Slot::Authentication)
+//! })?;
+//! let public_key = generated.public_key;
 //!
-//! // Verify PIN and sign a 32-byte digest
-//! session.verify_pin("123456")?;
-//! let signature = session.sign(Slot::Authentication, &data_to_sign)?;
+//! // Verify PIN and sign a 32-byte digest in one exclusive scope
+//! let signature = session.verify_pin_and_sign("123456", Slot::Authentication, &data_to_sign)?;
 //! ```
 
 pub mod apdu;
@@ -52,7 +54,9 @@ pub mod slot;
 pub mod pcsc_transport;
 
 pub use apdu::{Apdu, ApduResponse};
-pub use piv::{ManagementKeyAlgorithm, PivSession};
+pub use piv::{
+    GeneratedKey, ManagementKeyAlgorithm, PivExclusive, PivSession, PublicKeySource, SlotPublicKey,
+};
 pub use slot::Slot;
 
 #[cfg(feature = "pcsc")]
@@ -64,7 +68,10 @@ use crate::error::Result;
 ///
 /// This trait abstracts over different communication methods (CCID, WebUSB)
 /// allowing the same PIV operations to work across native and WASM targets.
-pub trait Transport {
+///
+/// The trait is object-safe (`Box<dyn Transport>`); its [`AsDynTransport`]
+/// supertrait is implemented automatically for every implementor.
+pub trait Transport: AsDynTransport {
     /// Sends an APDU command and receives a response.
     ///
     /// # Arguments
@@ -86,6 +93,56 @@ pub trait Transport {
     ///
     /// `true` if connected, `false` otherwise.
     fn is_connected(&self) -> bool;
+
+    /// Runs `f` as one exclusive scope with respect to other clients of the card.
+    ///
+    /// Every APDU that `f` sends through the [`Transport`] it receives is
+    /// exchanged without another application being able to interleave its own
+    /// commands (for PC/SC, inside one `SCardBeginTransaction` /
+    /// `SCardEndTransaction` pair). Use it for multi-APDU operations whose
+    /// card-side state must not be disturbed: `SELECT` → `VERIFY` →
+    /// `GENERAL AUTHENTICATE`, both management key authentication steps, or a
+    /// command together with its `0x6C XX` retry and `0x61 XX` `GET RESPONSE`
+    /// chain.
+    ///
+    /// The default implementation simply calls `f(self)`, which is correct for
+    /// transports that have no other clients (mocks, a WebUSB device claimed by a
+    /// single page). Calling `exclusive` again on the transport handed to `f`
+    /// runs the nested closure inline in the same scope and never deadlocks.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The operation to run while the card is held exclusively
+    ///
+    /// # Returns
+    ///
+    /// The result of `f`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from `f`, or a transport error if the exclusive scope
+    /// could not be started (for example [`Error::CardReset`](crate::Error::CardReset)
+    /// or [`Error::DeviceDisconnected`](crate::Error::DeviceDisconnected)); in
+    /// the latter case `f` is not called.
+    fn exclusive(&mut self, f: &mut dyn FnMut(&mut dyn Transport) -> Result<()>) -> Result<()> {
+        f(self.as_dyn_transport())
+    }
+}
+
+/// Upcasts a concrete [`Transport`] to `&mut dyn Transport`.
+///
+/// This is implemented automatically for every sized [`Transport`]; it only
+/// exists so the provided [`Transport::exclusive`] can hand `self` to its closure
+/// as a trait object. Implementors never need to implement it by hand.
+pub trait AsDynTransport {
+    /// Returns `self` as a `&mut dyn Transport`.
+    fn as_dyn_transport(&mut self) -> &mut dyn Transport;
+}
+
+impl<T: Transport> AsDynTransport for T {
+    fn as_dyn_transport(&mut self) -> &mut dyn Transport {
+        self
+    }
 }
 
 #[cfg(test)]

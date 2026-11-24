@@ -17,7 +17,7 @@
 //! # Using justfile (recommended)
 //! just cli-list          # List connected YubiKeys
 //! just cli-generate      # Generate a new P-256 key in slot 9a
-//! just cli-address       # Get Ethereum address (requires certificate)
+//! just cli-address       # Get Ethereum address
 //! just cli-sign-tx       # Sign a sample EIP-1559 transaction
 //!
 //! # Using cargo directly
@@ -27,13 +27,16 @@
 //!
 //! # Workflow
 //!
-//! 1. **Generate a key** (overwrites existing key in slot 9a):
+//! 1. **Generate a key** (replaces and destroys any existing key in slot 9a):
 //!    ```bash
 //!    just cli-generate
-//!    # Select management key algorithm and enter management key when prompted
+//!    # Shows what slot 9a currently holds, asks you to type `9a` to confirm
+//!    # (`generate --force` skips this), then prompts for the management key
+//!    # algorithm and management key. The slot's old certificate is deleted.
 //!    ```
 //!
-//! 2. **Create a certificate** (required for address retrieval):
+//! 2. **Create a certificate** (only needed on firmware older than 5.3, where the
+//!    key can only be read back through a certificate):
 //!    ```bash
 //!    ykman piv keys export 9a /tmp/pubkey.pem
 //!    ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a /tmp/pubkey.pem
@@ -54,33 +57,47 @@
 #![allow(unused_crate_dependencies)]
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use yubikey_evm_signer_core::Error;
 use yubikey_evm_signer_core::bridge::{BridgeConfig, BridgeServer, DEFAULT_BRIDGE_PORT};
 use yubikey_evm_signer_core::crypto::create_ethereum_signature;
 use yubikey_evm_signer_core::yubikey::{
-    ManagementKeyAlgorithm, PcscTransport, PivSession, Slot, Transport,
+    ManagementKeyAlgorithm, PcscTransport, PivSession, PublicKeySource, Slot, SlotPublicKey,
+    Transport,
 };
 use yubikey_evm_signer_core::{Address, Eip1559Transaction, Transaction, U256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = match env::args_os()
+        .skip(1)
+        .map(OsString::into_string)
+        .collect::<Result<_, _>>()
+    {
+        Ok(args) => args,
+        Err(_) => {
+            eprintln!("Error: command-line arguments must be valid UTF-8.");
+            eprintln!("Run `yubikey-cli help` for usage.");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    if args.len() < 2 {
+    let Some(command) = args.first() else {
         print_help();
         return ExitCode::SUCCESS;
-    }
+    };
 
-    match args[1].as_str() {
+    match command.as_str() {
         "list" => cmd_list(),
         "info" => cmd_info(),
         "address" => cmd_address(),
-        "generate" => cmd_generate(),
-        "sign" => cmd_sign(&args[2..]),
+        "generate" => cmd_generate(&args[1..]),
+        "sign" => cmd_sign(&args[1..]),
         "sign-tx" => cmd_sign_tx(),
-        "bridge" => cmd_bridge(&args[2..]),
+        "bridge" => cmd_bridge(&args[1..]),
         "--help" | "-h" | "help" => {
             print_help();
             ExitCode::SUCCESS
@@ -110,6 +127,9 @@ COMMANDS:
     bridge      Start hardened local PC/SC HTTP bridge for browser apps
     help        Show this help message
 
+GENERATE OPTIONS:
+    --force     Skip the typed slot confirmation (for scripted use)
+
 BRIDGE OPTIONS:
     --port <port>             Loopback TCP port (default: {DEFAULT_BRIDGE_PORT})
     --allow-origin <origin>   Additional allowed browser Origin (repeatable)
@@ -117,6 +137,7 @@ BRIDGE OPTIONS:
 EXAMPLES:
     cargo run --example yubikey-cli --features pcsc -- list
     cargo run --example yubikey-cli --features pcsc -- address
+    cargo run --example yubikey-cli --features pcsc -- generate
     cargo run --example yubikey-cli --features pcsc -- bridge --port 8765
     cargo run --example yubikey-cli --features pcsc -- sign 0x$(printf '00%.0s' {{1..32}})
 "#
@@ -124,11 +145,74 @@ EXAMPLES:
 }
 
 fn print_certificate_guidance() {
-    eprintln!("No valid P-256 certificate found in slot 9a.");
+    eprintln!("No valid P-256 public key could be read from slot 9a.");
     eprintln!();
-    eprintln!("After generating a key, export the public key and generate a certificate:");
+    eprintln!("On YubiKey firmware 5.3 or later the key is read directly from the slot;");
+    eprintln!("if the slot is empty, create a key with `generate`.");
+    eprintln!();
+    eprintln!("Older firmware can only report the key through a certificate. After");
+    eprintln!("generating a key, export the public key and store a certificate:");
     eprintln!("  ykman piv keys export 9a /tmp/pubkey.pem");
     eprintln!("  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a /tmp/pubkey.pem");
+}
+
+/// Prints a one-line warning when the slot's certificate describes another key.
+fn warn_if_stale_certificate(info: &SlotPublicKey) {
+    if info.stale_certificate {
+        eprintln!(
+            "Warning: the certificate in slot 9a does not match the slot's key; ignoring the stale certificate."
+        );
+    }
+}
+
+/// Connects to the first YubiKey and wraps it in a PIV session.
+fn connect_session() -> Option<PivSession> {
+    match PcscTransport::connect() {
+        Ok(transport) => Some(PivSession::new(Box::new(transport))),
+        Err(e) => {
+            eprintln!("Failed to connect: {e}");
+            None
+        }
+    }
+}
+
+/// Selects the PIV applet and reads slot 9a's public key in one PC/SC transaction.
+fn read_slot_public_key(session: &mut PivSession) -> Result<SlotPublicKey, Error> {
+    session.exclusive(|piv| {
+        piv.select()?;
+        piv.get_slot_public_key(Slot::Authentication)
+    })
+}
+
+/// Selects the PIV applet, checks that slot 9a still holds `expected`, verifies the
+/// PIN, and signs `hash`, all in one PC/SC transaction.
+fn sign_in_one_transaction(
+    session: &mut PivSession,
+    expected: &SlotPublicKey,
+    pin: &str,
+    hash: &[u8; 32],
+) -> Result<Vec<u8>, Error> {
+    session.exclusive(|piv| {
+        piv.select()?;
+        // Fail before spending a PIN attempt if the key was replaced meanwhile.
+        if piv.get_public_key(Slot::Authentication)? != expected.public_key {
+            return Err(Error::InvalidPublicKey(
+                "the key in slot 9a changed since it was read; aborting before PIN verification"
+                    .to_string(),
+            ));
+        }
+        piv.verify_pin_and_sign(pin, Slot::Authentication, hash)
+    })
+}
+
+/// Reports a failure from [`sign_in_one_transaction`].
+fn report_sign_error(e: &Error) {
+    match e {
+        Error::InvalidPin { .. } | Error::PinLocked => {
+            eprintln!("PIN verification failed: {e}");
+        }
+        other => eprintln!("Signing failed: {other}"),
+    }
 }
 
 fn cmd_list() -> ExitCode {
@@ -161,15 +245,9 @@ fn cmd_list() -> ExitCode {
 fn cmd_info() -> ExitCode {
     println!("Connecting to YubiKey...\n");
 
-    let transport = match PcscTransport::connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            return ExitCode::FAILURE;
-        }
+    let Some(mut session) = connect_session() else {
+        return ExitCode::FAILURE;
     };
-
-    let mut session = PivSession::new(Box::new(transport));
 
     match session.select() {
         Ok(()) => {
@@ -194,27 +272,24 @@ fn cmd_info() -> ExitCode {
 fn cmd_address() -> ExitCode {
     println!("Getting Ethereum address from slot 9a...\n");
 
-    let transport = match PcscTransport::connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            return ExitCode::FAILURE;
-        }
+    let Some(mut session) = connect_session() else {
+        return ExitCode::FAILURE;
     };
 
-    let mut session = PivSession::new(Box::new(transport));
-
-    if let Err(e) = session.select() {
-        eprintln!("Failed to select PIV applet: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    match session.get_public_key(Slot::Authentication) {
-        Ok(public_key) => {
-            let address = Address::from_public_key(&public_key);
+    match read_slot_public_key(&mut session) {
+        Ok(info) => {
+            warn_if_stale_certificate(&info);
+            let address = Address::from_public_key(&info.public_key);
             println!("Public Key (uncompressed):");
-            let encoded = public_key.to_sec1_point(false);
+            let encoded = info.public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
+            println!(
+                "  (read from {})",
+                match info.source {
+                    PublicKeySource::Metadata => "the key slot",
+                    PublicKeySource::Certificate => "the slot's certificate",
+                }
+            );
             println!();
             println!("Ethereum Address:");
             println!("  {address}");
@@ -229,25 +304,74 @@ fn cmd_address() -> ExitCode {
     }
 }
 
-fn cmd_generate() -> ExitCode {
-    println!("Generating new P-256 key in slot 9a...\n");
-    println!("WARNING: This will overwrite any existing key in slot 9a!");
-    println!();
+fn cmd_generate(args: &[String]) -> ExitCode {
+    const USAGE: &str = "Usage: yubikey-cli generate [--force]";
 
-    // Connect and select before prompting for sensitive credentials
-    let transport = match PcscTransport::connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            return ExitCode::FAILURE;
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            unknown => {
+                eprintln!("Unknown generate option: {unknown}");
+                eprintln!("{USAGE}");
+                return ExitCode::FAILURE;
+            }
         }
+    }
+
+    println!("Generating new P-256 key in slot 9a...\n");
+
+    // Connect and inspect the slot before prompting for sensitive credentials
+    let Some(mut session) = connect_session() else {
+        return ExitCode::FAILURE;
     };
 
-    let mut session = PivSession::new(Box::new(transport));
+    match read_slot_public_key(&mut session) {
+        Ok(info) => {
+            warn_if_stale_certificate(&info);
+            println!("Slot 9a already holds a P-256 key:");
+            println!(
+                "  Ethereum Address: {}",
+                Address::from_public_key(&info.public_key)
+            );
+        }
+        Err(Error::SlotEmpty(_)) => {
+            println!("Slot 9a appears to be empty.");
+            println!(
+                "(On firmware older than 5.3 a key without a certificate cannot be detected.)"
+            );
+        }
+        Err(Error::InvalidKeyType(_)) => {
+            println!("Slot 9a holds a key or certificate that is not P-256.");
+        }
+        Err(e) => {
+            eprintln!("Failed to inspect slot 9a: {e}");
+            eprintln!("Aborting; no changes were made.");
+            return ExitCode::FAILURE;
+        }
+    }
 
-    if let Err(e) = session.select() {
-        eprintln!("Failed to select PIV applet: {e}");
-        return ExitCode::FAILURE;
+    println!();
+    println!("WARNING: This replaces any existing key in slot 9a. The old private key is");
+    println!("destroyed and cannot be recovered; funds held by its address become inaccessible.");
+    println!();
+
+    if !force {
+        match confirm_slot("9a") {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("Confirmation did not match; aborting. No changes were made.");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let alg = match prompt_management_key_algorithm() {
@@ -258,48 +382,64 @@ fn cmd_generate() -> ExitCode {
         }
     };
 
-    let mut mgmt_key = match prompt_management_key(alg) {
-        Ok(key) => key,
+    let mgmt_key = match prompt_management_key(alg) {
+        Ok(key) => Zeroizing::new(key),
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
 
-    println!("Authenticating with management key ({alg:?})...");
-    let auth_result = session.authenticate_management_key_with(&mgmt_key, alg);
-    mgmt_key.zeroize();
+    println!(
+        "Authenticating with management key ({alg:?}) and generating a P-256 key in slot 9a..."
+    );
 
-    if let Err(e) = auth_result {
-        eprintln!("Management key authentication failed: {e}");
-        eprintln!();
-        eprintln!(
-            "Note: YubiKey firmware 5.7+ defaults to AES-192, while older firmware defaults to 3DES."
-        );
-        return ExitCode::FAILURE;
-    }
+    // SELECT -> management key auth -> GENERATE -> certificate delete in one PC/SC transaction
+    let outcome = session.exclusive(|piv| {
+        piv.select()?;
+        if let Err(auth_error) = piv.authenticate_management_key_with(&mgmt_key, alg) {
+            return Ok(Err(auth_error));
+        }
+        piv.generate_key(Slot::Authentication).map(Ok)
+    });
+    drop(mgmt_key);
 
-    println!("Management key authenticated. Generating P-256 key in slot 9a...");
-
-    match session.generate_key(Slot::Authentication) {
-        Ok(public_key) => {
-            let address = Address::from_public_key(&public_key);
+    match outcome {
+        Ok(Ok(generated)) => {
+            let address = Address::from_public_key(&generated.public_key);
             println!();
             println!("Key generated successfully!");
             println!();
             println!("Public Key (uncompressed):");
-            let encoded = public_key.to_sec1_point(false);
+            let encoded = generated.public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
             println!();
             println!("Ethereum Address:");
             println!("  {address}");
             println!();
-            println!("To retrieve this address later with `address`, store a certificate:");
+            if let Some(e) = &generated.certificate_delete_error {
+                eprintln!(
+                    "Warning: the old certificate in slot 9a could not be removed ({e}). It describes the previous key; delete or replace it (e.g. `ykman piv certificates delete 9a`)."
+                );
+                eprintln!();
+            }
+            println!(
+                "On YubiKey firmware 5.3 or later, `address` reads this key directly from the slot."
+            );
+            println!("On older firmware, store a certificate so that `address` can find it:");
             println!("  ykman piv keys export 9a /tmp/pubkey.pem");
             println!(
                 "  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a /tmp/pubkey.pem"
             );
             ExitCode::SUCCESS
+        }
+        Ok(Err(auth_error)) => {
+            eprintln!("Management key authentication failed: {auth_error}");
+            eprintln!();
+            eprintln!(
+                "Note: YubiKey firmware 5.7+ defaults to AES-192, while older firmware defaults to 3DES."
+            );
+            ExitCode::FAILURE
         }
         Err(e) => {
             eprintln!("Failed to generate key: {e}");
@@ -339,25 +479,13 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 
     println!("Signing hash: 0x{}\n", hex::encode(hash));
 
-    // Connect and select before prompting for PIN
-    let transport = match PcscTransport::connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            return ExitCode::FAILURE;
-        }
+    // Connect and read the public key before prompting for PIN
+    let Some(mut session) = connect_session() else {
+        return ExitCode::FAILURE;
     };
 
-    let mut session = PivSession::new(Box::new(transport));
-
-    if let Err(e) = session.select() {
-        eprintln!("Failed to select PIV applet: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    // Retrieve the public key before prompting for PIN
-    let public_key = match session.get_public_key(Slot::Authentication) {
-        Ok(pk) => pk,
+    let key_info = match read_slot_public_key(&mut session) {
+        Ok(info) => info,
         Err(e) => {
             eprintln!("Failed to get public key: {e}");
             eprintln!();
@@ -365,32 +493,28 @@ fn cmd_sign(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    warn_if_stale_certificate(&key_info);
 
-    let mut pin = match prompt_pin() {
-        Ok(pin) => pin,
+    let pin = match prompt_pin() {
+        Ok(pin) => Zeroizing::new(pin),
         Err(e) => {
             eprintln!("Failed to read PIN: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let pin_result = session.verify_pin(&pin);
-    pin.zeroize();
+    println!("Verifying PIN and signing (touch YubiKey if required)...");
 
-    if let Err(e) = pin_result {
-        eprintln!("PIN verification failed: {e}");
-        return ExitCode::FAILURE;
-    }
+    let sign_result = sign_in_one_transaction(&mut session, &key_info, &pin, &hash);
+    drop(pin);
 
-    println!("PIN verified. Signing (touch YubiKey if required)...");
-
-    match session.sign(Slot::Authentication, &hash) {
+    match sign_result {
         Ok(der_signature) => {
             println!();
             println!("DER Signature:");
             println!("  {}", hex::encode(&der_signature));
 
-            match create_ethereum_signature(&der_signature, &hash, &public_key) {
+            match create_ethereum_signature(&der_signature, &hash, &key_info.public_key) {
                 Ok(eth_sig) => {
                     println!();
                     println!("Normalized Signature Components (low-S):");
@@ -409,7 +533,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("Signing failed: {e}");
+            report_sign_error(&e);
             ExitCode::FAILURE
         }
     }
@@ -418,24 +542,13 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 fn cmd_sign_tx() -> ExitCode {
     println!("Creating and signing a sample EIP-1559 transaction...\n");
 
-    // Connect and select before prompting for PIN
-    let transport = match PcscTransport::connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            return ExitCode::FAILURE;
-        }
+    // Connect and read the public key before prompting for PIN
+    let Some(mut session) = connect_session() else {
+        return ExitCode::FAILURE;
     };
 
-    let mut session = PivSession::new(Box::new(transport));
-
-    if let Err(e) = session.select() {
-        eprintln!("Failed to select PIV applet: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let public_key = match session.get_public_key(Slot::Authentication) {
-        Ok(pk) => pk,
+    let key_info = match read_slot_public_key(&mut session) {
+        Ok(info) => info,
         Err(e) => {
             eprintln!("Failed to get public key: {e}");
             eprintln!();
@@ -443,24 +556,9 @@ fn cmd_sign_tx() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    warn_if_stale_certificate(&key_info);
 
-    let mut pin = match prompt_pin() {
-        Ok(pin) => pin,
-        Err(e) => {
-            eprintln!("Failed to read PIN: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let pin_result = session.verify_pin(&pin);
-    pin.zeroize();
-
-    if let Err(e) = pin_result {
-        eprintln!("PIN verification failed: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let address = Address::from_public_key(&public_key);
+    let address = Address::from_public_key(&key_info.public_key);
     println!("Signing from: {address}\n");
 
     let tx = Transaction::Eip1559(Eip1559Transaction {
@@ -494,11 +592,22 @@ fn cmd_sign_tx() -> ExitCode {
     println!("Signing Hash: 0x{}", hex::encode(hash_bytes));
     println!();
 
-    println!("Signing (touch YubiKey if required)...");
+    let pin = match prompt_pin() {
+        Ok(pin) => Zeroizing::new(pin),
+        Err(e) => {
+            eprintln!("Failed to read PIN: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match session.sign(Slot::Authentication, &hash_bytes) {
+    println!("Verifying PIN and signing (touch YubiKey if required)...");
+
+    let sign_result = sign_in_one_transaction(&mut session, &key_info, &pin, &hash_bytes);
+    drop(pin);
+
+    match sign_result {
         Ok(der_signature) => {
-            match create_ethereum_signature(&der_signature, &hash_bytes, &public_key) {
+            match create_ethereum_signature(&der_signature, &hash_bytes, &key_info.public_key) {
                 Ok(eth_sig) => {
                     println!();
                     println!("Transaction signed successfully!");
@@ -519,7 +628,7 @@ fn cmd_sign_tx() -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("Signing failed: {e}");
+            report_sign_error(&e);
             ExitCode::FAILURE
         }
     }
@@ -614,6 +723,22 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
 
 fn prompt_pin() -> io::Result<String> {
     rpassword::prompt_password("Enter PIN: ")
+}
+
+/// Asks the user to type `slot_id`; returns `Ok(true)` only on an exact
+/// (case-insensitive) match. End of input counts as a mismatch.
+fn confirm_slot(slot_id: &str) -> Result<bool, String> {
+    print!("Type the slot id ({slot_id}) to confirm replacing its key: ");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("failed to flush stdout: {e}"))?;
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read confirmation: {e}"))?;
+
+    Ok(line.trim().eq_ignore_ascii_case(slot_id))
 }
 
 fn prompt_management_key_algorithm() -> Result<ManagementKeyAlgorithm, String> {

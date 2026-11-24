@@ -44,6 +44,8 @@
 //! assert!(!bytes.is_empty());
 //! ```
 
+use core::fmt;
+
 use zeroize::Zeroize;
 
 use super::slot::Slot;
@@ -52,7 +54,10 @@ use crate::error::{Error, Result};
 /// An APDU command.
 ///
 /// Represents an ISO 7816-4 APDU command to be sent to a smart card.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The [`Debug`](fmt::Debug) implementation never prints the command data (which
+/// may carry a PIN or management key authentication material), only its length.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Apdu {
     /// Class byte.
     cla: u8,
@@ -314,10 +319,27 @@ impl Apdu {
     }
 }
 
+impl fmt::Debug for Apdu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Apdu")
+            .field("cla", &format_args!("{:#04x}", self.cla))
+            .field("ins", &format_args!("{:#04x}", self.ins))
+            .field("p1", &format_args!("{:#04x}", self.p1))
+            .field("p2", &format_args!("{:#04x}", self.p2))
+            .field("data_len", &self.data.len())
+            .field("le", &self.le)
+            .finish()
+    }
+}
+
 /// An APDU response from a smart card.
 ///
 /// Contains the response data and status word indicating success or failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The [`Debug`](fmt::Debug) implementation prints only the data length and the
+/// status word, because some PIV data objects (for example a PIN-protected
+/// management key) can carry secret material.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApduResponse {
     /// Response data.
     data: Vec<u8>,
@@ -519,6 +541,15 @@ impl ApduResponse {
     }
 }
 
+impl fmt::Debug for ApduResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApduResponse")
+            .field("data_len", &self.data.len())
+            .field("sw", &format_args!("{:04X}", self.status_word()))
+            .finish()
+    }
+}
+
 impl TryFrom<Vec<u8>> for ApduResponse {
     type Error = Error;
 
@@ -593,6 +624,22 @@ mod tests {
         assert_eq!(bytes.len(), 4 + 3 + 256 + 2);
         assert_eq!(&bytes[4..7], &[0x00, 0x01, 0x00]);
         assert_eq!(&bytes[bytes.len() - 2..], &[0x00, 0x00]);
+
+        // Case 4E: data len 256 + Le 256 -> Le is extended-encoded as 0x01 0x00
+        let c4e_256 = Apdu::with_le(0x00, 0x87, 0x11, 0x9A, vec![0xBB; 256], 256);
+        let bytes = c4e_256.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 4 + 3 + 256 + 2);
+        assert_eq!(&bytes[..4], &[0x00, 0x87, 0x11, 0x9A]);
+        assert_eq!(&bytes[4..7], &[0x00, 0x01, 0x00]);
+        assert!(bytes[7..7 + 256].iter().all(|&b| b == 0xBB));
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x01, 0x00]);
+
+        // Case 3E: data len 256, no Le -> 0x00 0x01 0x00 <data> with no trailing Le
+        let c3e = Apdu::new(0x00, 0xDB, 0x3F, 0xFF, vec![0xCC; 256]);
+        let bytes = c3e.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 4 + 3 + 256);
+        assert_eq!(&bytes[4..7], &[0x00, 0x01, 0x00]);
+        assert_eq!(bytes[bytes.len() - 1], 0xCC);
 
         // Reject Le = Some(0)
         assert!(matches!(
@@ -678,6 +725,32 @@ mod tests {
             not_found.to_error_for_slot(Slot::Signature),
             Error::SlotEmpty(0x9C)
         ));
+    }
+
+    #[test]
+    fn apdu_debug_never_prints_command_or_response_data() {
+        // VERIFY APDU carrying PIN "123456" padded with 0xFF
+        let verify = Apdu::new(0x00, 0x20, 0x00, 0x80, b"123456\xFF\xFF".to_vec());
+        let rendered = format!("{verify:?}");
+        assert!(rendered.contains("data_len: 8"), "{rendered}");
+        assert!(rendered.contains("0x20"), "{rendered}");
+        assert!(!rendered.contains("123456"), "{rendered}");
+        assert!(!rendered.contains("49, 50, 51"), "{rendered}");
+        assert!(!rendered.contains("[0x31"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("313233"),
+            "{rendered}"
+        );
+
+        let response = ApduResponse::new(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x90, 0x00]);
+        let rendered = format!("{response:?}");
+        assert!(rendered.contains("data_len: 4"), "{rendered}");
+        assert!(rendered.contains("9000"), "{rendered}");
+        assert!(!rendered.contains("222"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("dead"),
+            "{rendered}"
+        );
     }
 
     #[test]

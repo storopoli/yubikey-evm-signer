@@ -57,6 +57,19 @@ pub enum Error {
     #[error("YubiKey device disconnected")]
     DeviceDisconnected,
 
+    /// The card was reset by another application (or a power event) while connected.
+    ///
+    /// The transport handle has been re-established where possible, but the PIV
+    /// applet selection, PIN verification, and management key authentication are
+    /// gone: callers must select the PIV applet again and re-verify credentials
+    /// before retrying the failed operation.
+    #[error("YubiKey was reset by another application; select the PIV applet and verify again")]
+    CardReset,
+
+    /// The operation needs a verified PIN, but the PIN has not been verified in this session.
+    #[error("PIN verification required before this operation")]
+    PinRequired,
+
     /// The provided PIN is invalid.
     #[error(
         "invalid PIN{}",
@@ -205,6 +218,12 @@ mod tests {
             err.to_string(),
             "unexpected status word: SW1=0x69, SW2=0x82"
         );
+
+        assert_eq!(
+            Error::PinRequired.to_string(),
+            "PIN verification required before this operation"
+        );
+        assert!(Error::CardReset.to_string().contains("reset"));
     }
 
     #[test]

@@ -37,6 +37,12 @@ pub enum WasmError {
     /// The PIV applet could not be selected.
     PivSelectFailed(String),
 
+    /// The YubiKey was reset by another application; re-select and re-verify the PIN.
+    CardReset,
+
+    /// The operation needs a verified PIN, but the PIN has not been verified yet.
+    PinRequired,
+
     /// PIN verification failed.
     InvalidPin {
         /// Remaining attempts reported by the card, if known.
@@ -110,6 +116,15 @@ impl fmt::Display for WasmError {
             Self::PivSelectFailed(msg) => {
                 write!(f, "Failed to select PIV applet: {msg}")
             }
+            Self::CardReset => {
+                write!(
+                    f,
+                    "YubiKey was reset by another application; reconnect and verify the PIN again"
+                )
+            }
+            Self::PinRequired => {
+                write!(f, "PIN verification required before this operation")
+            }
             Self::InvalidPin {
                 remaining_attempts: Some(n),
             } => {
@@ -179,6 +194,8 @@ impl From<CoreError> for WasmError {
     fn from(error: CoreError) -> Self {
         match error {
             CoreError::DeviceNotFound => Self::DeviceNotFound,
+            CoreError::CardReset => Self::CardReset,
+            CoreError::PinRequired => Self::PinRequired,
             CoreError::InvalidPin { remaining_attempts } => Self::InvalidPin { remaining_attempts },
             CoreError::PinLocked => Self::PinLocked,
             CoreError::SecurityStatusNotSatisfied => Self::SecurityStatusNotSatisfied,
@@ -233,5 +250,12 @@ mod tests {
 
         let auth_err: WasmError = CoreError::AuthenticationFailed.into();
         assert_eq!(auth_err, WasmError::AuthenticationFailed);
+
+        let reset_err: WasmError = CoreError::CardReset.into();
+        assert_eq!(reset_err, WasmError::CardReset);
+        assert!(reset_err.to_string().contains("reset"));
+
+        let pin_required: WasmError = CoreError::PinRequired.into();
+        assert_eq!(pin_required, WasmError::PinRequired);
     }
 }
