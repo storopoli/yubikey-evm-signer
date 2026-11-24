@@ -117,7 +117,7 @@ await device.disconnect();
 
 A `YubiKeyDevice` handles one call at a time: await each call before starting the next, or the second call throws. If a call fails because the session or device is gone (an error starting with `Disconnected:`, or the card-reset error; over the bridge this includes a bridge that stopped answering or was restarted with a new token), the device discards its PIN and management key state, `isConnected()` returns `false`, and you must connect again.
 
-`getAddress()` and `getPublicKey()` read the key from the slot metadata on YubiKey firmware 5.3 and newer, so no certificate is needed there; older firmware needs a certificate in the slot. If the slot's certificate belongs to a different key, it is ignored and `hasStaleCertificate()` returns `true`.
+`getAddress()` and `getPublicKey()` read the key from the slot metadata on YubiKey firmware 5.3 and newer, so no certificate is needed there; older firmware needs a certificate in the slot. After `generateKey()` on older firmware, call `getPublicKey()` before the session ends and store a certificate for that key (see [`packages/npm/README.md`](packages/npm/README.md#generatekeypin-string-promisestring)). If the slot's certificate belongs to a different key, it is ignored and `hasStaleCertificate()` returns `true`.
 
 Use `signTypedData`, `signMessage`, and `signHash` for EIP-712 typed data, EIP-191 personal messages, and raw 32-byte digests.
 
@@ -154,12 +154,11 @@ just cli-list
 # Check PIV applet connection status
 just cli-info
 
-# Generate a new P-256 key in slot 9a (overwrites any existing key)
-just cli-generate
+# Generate a new P-256 key in slot 9a (overwrites any existing key) and save its PEM
+just cli-generate --pubkey-out pubkey.pem
 
 # Only on firmware older than 5.3: store a certificate so the key can be read back
-ykman piv keys export 9a /tmp/pubkey.pem
-ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a /tmp/pubkey.pem
+ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a pubkey.pem
 
 # Show the slot 9a P-256 public key and its derived address
 just cli-address
@@ -182,7 +181,7 @@ cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- <c
 
 `address`, `sign`, and `sign-tx` read the slot's public key from the slot metadata on firmware 5.3 and newer and fall back to the slot certificate on older firmware. If the certificate belongs to a different key, the CLI prints a warning and ignores it. `sign` and `sign-tx` read the key before prompting for the PIN, then select the PIV applet, check that the key has not changed, verify the PIN, and sign in one PC/SC transaction.
 
-`just cli-generate` shows what slot `9a` currently holds and asks you to type the slot id (`9a`) to confirm; `generate --force` skips that confirmation. It then prompts for the management key algorithm and key, generates the key, and deletes the slot's old certificate in one PC/SC transaction, printing a warning if the certificate could not be deleted. YubiKey firmware 5.7 and newer defaults to an AES-192 management key, older firmware defaults to 3DES, and the CLI also supports AES-128 and AES-256 management keys.
+`just cli-generate` shows what slot `9a` currently holds and asks you to type the slot id (`9a`) to confirm; `generate --force` skips that confirmation. It then prompts for the management key algorithm and key, generates the key, and deletes the slot's old certificate in one PC/SC transaction, printing a warning if the certificate could not be deleted. It prints the new public key as uncompressed hex and as a `-----BEGIN PUBLIC KEY-----` PEM; `--pubkey-out <path>` also writes the PEM to a new file (an existing file is never replaced, and an unusable path fails before the card is changed). Firmware older than 5.3 needs a certificate for that PEM, as shown above. Because the old certificate is deleted, `ykman piv keys export 9a` can recover the PEM later only on firmware 4.3 and newer. YubiKey firmware 5.7 and newer defaults to an AES-192 management key, older firmware defaults to 3DES, and the CLI also supports AES-128 and AES-256 management keys.
 
 If another PC/SC application resets the YubiKey during an operation, the CLI reports that the card was reset; run the command again. Command-line arguments must be valid UTF-8.
 

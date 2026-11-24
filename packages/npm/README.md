@@ -159,6 +159,17 @@ Generate a new P-256 key pair in the active PIV slot and return the checksummed 
 
 After generating the key, the slot's certificate, which described the destroyed key, is deleted. If that deletion fails, the call still succeeds with the new key and `hasStaleCertificate()` returns `true`; remove or replace the old certificate before any other software relies on it.
 
+On firmware older than 5.3, the key can only be read back through a certificate. Call `getPublicKey()` before the session ends (it returns the new key from the cache), convert it to PEM, and store a certificate for it:
+
+```bash
+PUBKEY=0x04...   # the getPublicKey() result
+printf '3059301306072a8648ce3d020106082a8648ce3d030107034200%s' "${PUBKEY#0x}" \
+  | xxd -r -p | openssl pkey -pubin -inform DER -out pubkey.pem
+ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a pubkey.pem
+```
+
+Use the active slot in place of `9a`. On firmware 4.3 and newer, `ykman piv keys export 9a pubkey.pem` also produces the PEM.
+
 **Warning:** Permanently overwrites any existing key in the active slot!
 
 #### `getAddress(): Promise<string>`

@@ -29,18 +29,21 @@
 //!
 //! 1. **Generate a key** (replaces and destroys any existing key in slot 9a):
 //!    ```bash
-//!    just cli-generate
+//!    just cli-generate --pubkey-out pubkey.pem
 //!    # Shows what slot 9a currently holds, asks you to type `9a` to confirm
 //!    # (`generate --force` skips this), then prompts for the management key
 //!    # algorithm and management key. The slot's old certificate is deleted.
+//!    # The new public key is printed (hex and PEM) and, with `--pubkey-out`,
+//!    # also written as PEM to a new file.
 //!    ```
 //!
 //! 2. **Create a certificate** (only needed on firmware older than 5.3, where the
 //!    key can only be read back through a certificate):
 //!    ```bash
-//!    ykman piv keys export 9a /tmp/pubkey.pem
-//!    ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a /tmp/pubkey.pem
+//!    ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a pubkey.pem
 //!    ```
+//!    On firmware 4.3 or later, `ykman piv keys export 9a pubkey.pem` can also
+//!    recover the PEM.
 //!
 //! 3. **Show the public key and derived address**:
 //!    ```bash
@@ -61,12 +64,16 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use p256::ecdsa::VerifyingKey;
+use p256::pkcs8::{EncodePublicKey, LineEnding};
 use yubikey_evm_signer_core::Error;
 use yubikey_evm_signer_core::bridge::{
     BridgeConfig, BridgeServer, DEFAULT_BRIDGE_PORT, DEFAULT_IDLE_TIMEOUT,
@@ -137,7 +144,9 @@ COMMANDS:
     help        Show this help message
 
 GENERATE OPTIONS:
-    --force     Skip the typed slot confirmation (for scripted use)
+    --force               Skip the typed slot confirmation (for scripted use)
+    --pubkey-out <path>   Also write the new public key as PEM to <path>, which
+                          must not exist yet (checked before the card is changed)
 
 BRIDGE OPTIONS:
     --port <port>             TCP port on 127.0.0.1 (default: {DEFAULT_BRIDGE_PORT})
@@ -164,10 +173,10 @@ fn print_certificate_guidance() {
     eprintln!("On YubiKey firmware 5.3 or later the key is read directly from the slot;");
     eprintln!("if the slot is empty, create a key with `generate`.");
     eprintln!();
-    eprintln!("Older firmware can only report the key through a certificate. After");
-    eprintln!("generating a key, export the public key and store a certificate:");
-    eprintln!("  ykman piv keys export 9a /tmp/pubkey.pem");
-    eprintln!("  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a /tmp/pubkey.pem");
+    eprintln!("Older firmware can only report the key through a certificate. Store one");
+    eprintln!("for the PEM that `generate` printed (or saved with `--pubkey-out`):");
+    eprintln!("  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a pubkey.pem");
+    eprintln!("On firmware 4.3 or later, `ykman piv keys export 9a pubkey.pem` also works.");
 }
 
 /// Prints a one-line warning when the slot's certificate describes another key.
@@ -341,24 +350,126 @@ fn cmd_address() -> ExitCode {
     }
 }
 
-fn cmd_generate(args: &[String]) -> ExitCode {
-    const USAGE: &str = "Usage: yubikey-cli generate [--force]";
+const GENERATE_USAGE: &str = "Usage: yubikey-cli generate [--force] [--pubkey-out <path>]";
 
+/// What `yubikey-cli generate` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum GenerateCommand {
+    /// Print the usage line.
+    Help,
+    /// Generate a key.
+    Run {
+        /// Skip the typed slot confirmation.
+        force: bool,
+        /// New file to write the public key PEM to.
+        pubkey_out: Option<PathBuf>,
+    },
+}
+
+/// Parses the arguments that follow `generate`.
+fn parse_generate_args(args: &[String]) -> Result<GenerateCommand, String> {
     let mut force = false;
-    for arg in args {
+    let mut pubkey_out = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--force" => force = true,
-            "--help" | "-h" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
+            "--pubkey-out" => {
+                let path = match args.next() {
+                    Some(path) if !path.is_empty() && !path.starts_with('-') => path,
+                    _ => return Err("Error: --pubkey-out requires a file path".to_string()),
+                };
+                if pubkey_out.replace(PathBuf::from(path)).is_some() {
+                    return Err("Error: --pubkey-out given more than once".to_string());
+                }
             }
-            unknown => {
-                eprintln!("Unknown generate option: {unknown}");
-                eprintln!("{USAGE}");
-                return ExitCode::FAILURE;
-            }
+            "--help" | "-h" => return Ok(GenerateCommand::Help),
+            unknown => return Err(format!("Unknown generate option: {unknown}")),
         }
     }
+    Ok(GenerateCommand::Run { force, pubkey_out })
+}
+
+/// Encodes `key` as a SubjectPublicKeyInfo PEM (`-----BEGIN PUBLIC KEY-----`).
+fn public_key_pem(key: &VerifyingKey) -> Result<String, String> {
+    key.to_public_key_pem(LineEnding::LF)
+        .map_err(|e| format!("failed to encode the public key as PEM: {e}"))
+}
+
+/// The `--pubkey-out` file, created before the card is touched.
+///
+/// The file is created exclusively (an existing file or symlink is never
+/// replaced) and is removed again when dropped unless [`Self::write_pem`]
+/// succeeded, so an aborted or failed run leaves no empty or partial file.
+#[derive(Debug)]
+struct PubkeyOutFile {
+    path: PathBuf,
+    file: File,
+    written: bool,
+}
+
+impl PubkeyOutFile {
+    /// Creates `path`, failing if it already exists or cannot be created.
+    fn create(path: PathBuf) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+        let file = options.open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            written: false,
+        })
+    }
+
+    /// Writes `pem` to the file and flushes it to disk.
+    fn write_pem(&mut self, pem: &str) -> io::Result<()> {
+        self.file.write_all(pem.as_bytes())?;
+        self.file.sync_all()?;
+        self.written = true;
+        Ok(())
+    }
+}
+
+impl Drop for PubkeyOutFile {
+    fn drop(&mut self) {
+        if !self.written {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn cmd_generate(args: &[String]) -> ExitCode {
+    let (force, pubkey_out) = match parse_generate_args(args) {
+        Ok(GenerateCommand::Run { force, pubkey_out }) => (force, pubkey_out),
+        Ok(GenerateCommand::Help) => {
+            println!("{GENERATE_USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("{GENERATE_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Claim the output file before anything else, so an unusable path fails
+    // while the slot is still untouched.
+    let mut pubkey_file = match pubkey_out {
+        Some(path) => match PubkeyOutFile::create(path.clone()) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!(
+                    "Error: cannot create {} for --pubkey-out: {e}. It must be a new file in an \
+                     existing, writable directory. No changes were made.",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
 
     println!("Generating new P-256 key in slot 9a...\n");
 
@@ -448,6 +559,8 @@ fn cmd_generate(args: &[String]) -> ExitCode {
 
     match outcome {
         Ok(Ok(generated)) => {
+            // The key now exists on the card: print it before anything that can
+            // fail, so it is never lost.
             let address = Address::from_public_key(&generated.public_key);
             println!();
             println!("Key generated successfully!");
@@ -455,6 +568,18 @@ fn cmd_generate(args: &[String]) -> ExitCode {
             println!("Public Key (uncompressed):");
             let encoded = generated.public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
+            println!();
+            let pem = match public_key_pem(&generated.public_key) {
+                Ok(pem) => {
+                    println!("Public Key (PEM):");
+                    print!("{pem}");
+                    Some(pem)
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    None
+                }
+            };
             println!();
             println!("{ADDRESS_LABEL}:");
             println!("  {address}");
@@ -467,15 +592,49 @@ fn cmd_generate(args: &[String]) -> ExitCode {
                 );
                 eprintln!();
             }
+
+            let mut status = if pem.is_some() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+            let mut pem_path = None;
+            if let Some(file) = pubkey_file.as_mut() {
+                match pem.as_deref().map(|pem| file.write_pem(pem)) {
+                    Some(Ok(())) => {
+                        println!("Public key PEM written to {}", file.path.display());
+                        println!();
+                        pem_path = Some(file.path.display().to_string());
+                    }
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "Error: the key WAS generated, but writing {} failed: {e}. Save the \
+                             public key printed above; the incomplete file is removed.",
+                            file.path.display()
+                        );
+                        eprintln!();
+                        status = ExitCode::FAILURE;
+                    }
+                    None => {}
+                }
+            }
+
             println!(
                 "On YubiKey firmware 5.3 or later, `address` reads this key directly from the slot."
             );
             println!("On older firmware, store a certificate so that `address` can find it:");
-            println!("  ykman piv keys export 9a /tmp/pubkey.pem");
-            println!(
-                "  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a /tmp/pubkey.pem"
-            );
-            ExitCode::SUCCESS
+            match pem_path {
+                Some(path) => println!(
+                    "  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a {path}"
+                ),
+                None => {
+                    println!("  (save the PEM above as pubkey.pem first)");
+                    println!(
+                        "  ykman piv certificates generate -s \"CN=YubiKey EVM Signer\" 9a pubkey.pem"
+                    );
+                }
+            }
+            status
         }
         Ok(Err(auth_error)) => {
             eprintln!("Management key authentication failed: {auth_error}");
@@ -907,4 +1066,130 @@ fn prompt_management_key(alg: ManagementKeyAlgorithm) -> Result<Vec<u8>, String>
     }
 
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
+    /// A fresh, empty directory removed when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("yubikey-cli-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn public_key_pem_matches_openssl() {
+        // The P-256 base point G (private key 1). Expected value produced by
+        // `openssl pkey -pubin -inform DER` from the SubjectPublicKeyInfo DER.
+        let point = hex::decode(
+            "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\
+             4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        )
+        .unwrap();
+        let key = VerifyingKey::from_sec1_bytes(&point).unwrap();
+        assert_eq!(
+            public_key_pem(&key).unwrap(),
+            "-----BEGIN PUBLIC KEY-----\n\
+             MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt\n\
+             6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9Q==\n\
+             -----END PUBLIC KEY-----\n"
+        );
+    }
+
+    #[test]
+    fn parse_generate_args_accepts_options() {
+        assert_eq!(
+            parse_generate_args(&[]),
+            Ok(GenerateCommand::Run {
+                force: false,
+                pubkey_out: None
+            })
+        );
+        assert_eq!(
+            parse_generate_args(&args(&["--pubkey-out", "out/key.pem", "--force"])),
+            Ok(GenerateCommand::Run {
+                force: true,
+                pubkey_out: Some(PathBuf::from("out/key.pem"))
+            })
+        );
+        assert_eq!(
+            parse_generate_args(&args(&["--force", "--help"])),
+            Ok(GenerateCommand::Help)
+        );
+    }
+
+    #[test]
+    fn parse_generate_args_rejects_bad_pubkey_out() {
+        for bad in [
+            &["--pubkey-out"][..],
+            &["--pubkey-out", ""],
+            &["--pubkey-out", "--force"],
+            &["--pubkey-out", "-"],
+        ] {
+            assert_eq!(
+                parse_generate_args(&args(bad)),
+                Err("Error: --pubkey-out requires a file path".to_string()),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_generate_args(&args(&["--pubkey-out", "a.pem", "--pubkey-out", "b.pem"])),
+            Err("Error: --pubkey-out given more than once".to_string())
+        );
+        assert_eq!(
+            parse_generate_args(&args(&["--pubkey-out=a.pem"])),
+            Err("Unknown generate option: --pubkey-out=a.pem".to_string())
+        );
+    }
+
+    #[test]
+    fn pubkey_out_file_refuses_unusable_paths() {
+        let dir = TempDir::new("unusable");
+        let existing = dir.0.join("existing.pem");
+        fs::write(&existing, "keep me").unwrap();
+
+        let err = PubkeyOutFile::create(existing.clone()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "keep me");
+
+        assert!(PubkeyOutFile::create(dir.0.join("missing").join("key.pem")).is_err());
+    }
+
+    #[test]
+    fn pubkey_out_file_is_removed_unless_written() {
+        let dir = TempDir::new("cleanup");
+        let path = dir.0.join("key.pem");
+
+        drop(PubkeyOutFile::create(path.clone()).unwrap());
+        assert!(!path.exists(), "an unwritten file must be removed");
+
+        let mut file = PubkeyOutFile::create(path.clone()).unwrap();
+        file.write_pem("PEM\n").unwrap();
+        drop(file);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "PEM\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & !0o644, 0, "mode {mode:o}");
+        }
+    }
 }

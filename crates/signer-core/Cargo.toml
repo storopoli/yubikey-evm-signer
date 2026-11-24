@@ -21,6 +21,7 @@ pcsc = ["dep:pcsc"]
 [[example]]
 name = "yubikey-cli"
 required-features = ["pcsc"]
+test = true
 
 [dependencies]
 # Crypto
