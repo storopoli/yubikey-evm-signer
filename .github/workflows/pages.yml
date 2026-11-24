@@ -25,8 +25,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
 
       - name: Rust cache
@@ -35,7 +36,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: wasm-pack
 
       - name: Build WASM package
         # --no-opt skips wasm-opt which doesn't support bulk-memory ops from Rust 2024 edition

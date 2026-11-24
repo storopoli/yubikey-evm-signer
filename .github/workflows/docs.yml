@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
@@ -25,14 +29,26 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
 
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
 
-      - name: Check docs leaving the dependencies out
+      - name: Check docs for native crates
         env:
           RUSTDOCFLAGS: -A rustdoc::private-doc-tests -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features --workspace --exclude yubikey-evm-signer-wasm --locked
+
+      - name: Check docs for WASM crate
+        env:
+          RUSTFLAGS: --cfg=web_sys_unstable_apis
+          RUSTDOCFLAGS: -A rustdoc::private-doc-tests -D warnings
+        run: cargo doc --no-deps -p yubikey-evm-signer-wasm --target wasm32-unknown-unknown --all-features --locked

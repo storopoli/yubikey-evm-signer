@@ -79,7 +79,7 @@
 //! - Management key is required for key generation
 //! - Consider changing default PIN/PUK/management key for production use
 
-#![expect(unused_crate_dependencies, reason = "needed for CLI example")]
+#![allow(unused_crate_dependencies)]
 
 use std::env;
 use std::io::{self, Write};
@@ -212,7 +212,7 @@ fn cmd_address() {
         Ok(public_key) => {
             let address = Address::from_public_key(&public_key);
             println!("Public Key (uncompressed):");
-            let encoded = public_key.to_encoded_point(false);
+            let encoded = public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
             println!();
             println!("Ethereum Address:");
@@ -267,7 +267,7 @@ fn cmd_generate() {
             println!("Key generated successfully!");
             println!();
             println!("Public Key (uncompressed):");
-            let encoded = public_key.to_encoded_point(false);
+            let encoded = public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
             println!();
             println!("Ethereum Address:");

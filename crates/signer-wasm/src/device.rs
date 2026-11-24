@@ -25,7 +25,7 @@
 use std::fmt;
 
 use alloy_primitives::keccak256;
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use p256::ecdsa::VerifyingKey;
 use wasm_bindgen::prelude::*;
 
@@ -498,8 +498,8 @@ fn parse_public_key_response(data: &[u8]) -> Option<VerifyingKey> {
 
             if len == 65 && data.get(i) == Some(&0x04) && end <= data.len() {
                 let point_bytes = &data[i..end];
-                let point = EncodedPoint::from_bytes(point_bytes).ok()?;
-                return VerifyingKey::from_encoded_point(&point).ok();
+                let point = Sec1Point::from_bytes(point_bytes).ok()?;
+                return VerifyingKey::from_sec1_point(&point).ok();
             }
             break;
         }
@@ -515,8 +515,8 @@ fn parse_certificate_public_key(data: &[u8]) -> Option<VerifyingKey> {
     for i in 0..data.len().saturating_sub(65) {
         if data[i] == 0x04 {
             let point_bytes = &data[i..i + 65];
-            if let Ok(point) = EncodedPoint::from_bytes(point_bytes)
-                && let Ok(key) = VerifyingKey::from_encoded_point(&point)
+            if let Ok(point) = Sec1Point::from_bytes(point_bytes)
+                && let Ok(key) = VerifyingKey::from_sec1_point(&point)
             {
                 return Some(key);
             }

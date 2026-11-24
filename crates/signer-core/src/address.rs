@@ -123,7 +123,7 @@ impl Address {
     #[must_use]
     pub fn from_public_key(public_key: &VerifyingKey) -> Self {
         // Get the uncompressed public key (65 bytes: 0x04 || x || y)
-        let encoded = public_key.to_encoded_point(false);
+        let encoded = public_key.to_sec1_point(false);
         let uncompressed = encoded.as_bytes();
 
         // Remove the 0x04 prefix to get just the x and y coordinates (64 bytes)
