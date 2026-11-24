@@ -154,7 +154,10 @@ jobs:
           wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
           rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
-      - name: Verify package files exist and npm pack includes dist
+      - name: Copy license files into the npm package
+        run: cp LICENSE-MIT LICENSE-APACHE packages/npm/
+
+      - name: Verify package files exist and npm pack includes dist and licenses
         working-directory: packages/npm
         run: |
           test -f dist/yubikey_evm_signer_wasm.js
@@ -165,6 +168,8 @@ jobs:
           echo "$pack_output" | grep -Fq "dist/yubikey_evm_signer_wasm.js"
           echo "$pack_output" | grep -Fq "dist/yubikey_evm_signer_wasm_bg.wasm"
           echo "$pack_output" | grep -Fq "dist/yubikey_evm_signer_wasm.d.ts"
+          echo "$pack_output" | grep -Fq "LICENSE-MIT"
+          echo "$pack_output" | grep -Fq "LICENSE-APACHE"
 
       - name: Verify demo integrity and WASM TypeScript exports
         run: node scripts/verify-demo.mjs --check-wasm

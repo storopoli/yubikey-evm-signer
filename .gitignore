@@ -95,5 +95,9 @@ coverage.xml
 # NPM package build output
 packages/npm/dist/
 
+# License files copied into the npm package at build time (`just npm-licenses`)
+packages/npm/LICENSE-MIT
+packages/npm/LICENSE-APACHE
+
 # Demo WASM build output
 demo/wasm/

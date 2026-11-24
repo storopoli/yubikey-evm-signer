@@ -16,6 +16,10 @@ const state = {
     wasmReady: false,
     webUsbAvailable: false,
     device: null,
+    // True while a call into the WASM module / device is pending (see runDeviceTask)
+    busy: false,
+    // Last PIV slot reported by the device itself (`getSlot()`)
+    slot: null,
     pinVerified: false,
     mgmtAuthenticated: false,
     address: null
@@ -122,20 +126,78 @@ function log(message, level = 'info') {
 // ============================================
 
 function updateTransportUI() {
-    const mode = elements.transportMode.value;
-    const isBridge = mode === 'bridge';
+    const isBridge = elements.transportMode.value === 'bridge';
     elements.bridgeConfig.classList.toggle('hidden', !isBridge);
 
     if (isBridge) {
         elements.transportHint.textContent =
             'Connects to the hardened local PC/SC bridge using constant-time Bearer auth and a PIV-only APDU allowlist.';
-        elements.connectBtn.disabled = !state.wasmReady || Boolean(state.device);
     } else {
         elements.transportHint.textContent = state.webUsbAvailable
             ? 'Experimental: Chromium blocks YubiKey VID 0x1050 and CCID class 0x0B on standard web pages. Prefer Local PC/SC Bridge.'
             : 'WebUSB is not available in this browser or context. Switch back to Local PC/SC Bridge.';
-        elements.connectBtn.disabled =
-            !state.wasmReady || !state.webUsbAvailable || Boolean(state.device);
+    }
+    updateControls();
+}
+
+/**
+ * Derives the enabled/disabled state of every control from `state`.
+ *
+ * While a device call is in flight (`state.busy`), every control that would call
+ * into the device is disabled, because wasm-bindgen rejects any call on a
+ * `YubiKeyDevice` while another one is pending on it.
+ */
+function updateControls() {
+    const connected = Boolean(state.device);
+    const busy = state.busy;
+    const isBridge = elements.transportMode.value === 'bridge';
+    const canConnect =
+        state.wasmReady && !connected && (isBridge || state.webUsbAvailable);
+
+    // Connection
+    elements.transportMode.disabled = connected || busy;
+    elements.bridgeUrl.disabled = connected || busy;
+    elements.bridgeToken.disabled = connected || busy;
+    elements.connectBtn.disabled = !canConnect || busy;
+    elements.disconnectBtn.disabled = !connected || busy;
+
+    // PIN
+    elements.pinSection.classList.toggle('disabled-section', !connected);
+    elements.pinInput.disabled = !connected || busy;
+    elements.verifyPinBtn.disabled = !connected || busy;
+
+    // Slot & key management
+    elements.keySection.classList.toggle('disabled-section', !connected);
+    elements.slotSelect.disabled = !connected || busy;
+    elements.getAddressBtn.disabled = !connected || busy;
+    elements.mgmtAlgSelect.disabled = !connected;
+    elements.mgmtKeyInput.disabled = !connected || busy;
+    elements.authMgmtBtn.disabled = !connected || busy;
+    elements.generateKeyBtn.disabled = !connected || !state.mgmtAuthenticated || busy;
+
+    // Signing sections (enabled once the PIN is verified)
+    const signing = connected && state.pinVerified;
+    const signingSections = [
+        [elements.txSection, elements.signTxBtn, [
+            elements.txChainId,
+            elements.txNonce,
+            elements.txTo,
+            elements.txValue,
+            elements.txGasLimit,
+            elements.txMaxPriorityFee,
+            elements.txMaxFee,
+            elements.txInput
+        ]],
+        [elements.typedDataSection, elements.signTypedDataBtn, [elements.typedDataInput]],
+        [elements.messageSection, elements.signMessageBtn, [elements.messageInput]],
+        [elements.hashSection, elements.signHashBtn, [elements.hashInput]]
+    ];
+    for (const [section, button, inputs] of signingSections) {
+        section.classList.toggle('disabled-section', !signing);
+        for (const input of inputs) {
+            input.disabled = !signing;
+        }
+        button.disabled = !signing || busy;
     }
 }
 
@@ -143,23 +205,8 @@ function updateConnectionUI(connected) {
     elements.connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
     elements.connectionStatus.className = `status ${connected ? 'connected' : 'disconnected'}`;
 
-    elements.transportMode.disabled = connected;
-    elements.bridgeUrl.disabled = connected;
-    elements.bridgeToken.disabled = connected;
-    elements.disconnectBtn.disabled = !connected;
-    updateTransportUI();
-
-    // Enable/disable PIN and Key Management sections based on connection
-    elements.pinSection.classList.toggle('disabled-section', !connected);
-    elements.pinInput.disabled = !connected;
-    elements.verifyPinBtn.disabled = !connected;
-
-    updateKeyManagementUI(connected);
-
     if (!connected) {
         // Clear sensitive inputs and all cached outputs on disconnect
-        state.pinVerified = false;
-        state.mgmtAuthenticated = false;
         state.address = null;
 
         elements.pinInput.value = '';
@@ -172,62 +219,29 @@ function updateConnectionUI(connected) {
 
         updatePinUI(false);
         updateMgmtUI(false);
-        updateSigningSectionsUI(false);
     }
+    updateControls();
 }
 
 function updatePinUI(verified) {
     state.pinVerified = verified;
     elements.pinStatus.textContent = verified ? 'Verified' : 'Not verified';
     elements.pinStatus.className = `status ${verified ? 'verified' : ''}`;
-    // Enable signing once PIN is verified (and reset signing sections on failure!)
-    updateSigningSectionsUI(Boolean(state.device) && verified);
+    // Enables signing once the PIN is verified (and disables it again on failure)
+    updateControls();
 }
 
 function updateMgmtUI(authenticated) {
     state.mgmtAuthenticated = authenticated;
     elements.mgmtStatus.textContent = authenticated ? 'Authenticated' : 'Not authenticated';
     elements.mgmtStatus.className = `status ${authenticated ? 'verified' : ''}`;
-    elements.generateKeyBtn.disabled = !state.device || !authenticated;
+    updateControls();
 }
 
-function updateKeyManagementUI(enabled) {
-    elements.keySection.classList.toggle('disabled-section', !enabled);
-    elements.slotSelect.disabled = !enabled;
-    elements.getAddressBtn.disabled = !enabled;
-    elements.mgmtAlgSelect.disabled = !enabled;
-    elements.mgmtKeyInput.disabled = !enabled;
-    elements.authMgmtBtn.disabled = !enabled;
-    elements.generateKeyBtn.disabled = !enabled || !state.mgmtAuthenticated;
-}
-
-function updateSigningSectionsUI(enabled) {
-    // Transaction section
-    elements.txSection.classList.toggle('disabled-section', !enabled);
-    elements.txChainId.disabled = !enabled;
-    elements.txNonce.disabled = !enabled;
-    elements.txTo.disabled = !enabled;
-    elements.txValue.disabled = !enabled;
-    elements.txGasLimit.disabled = !enabled;
-    elements.txMaxPriorityFee.disabled = !enabled;
-    elements.txMaxFee.disabled = !enabled;
-    elements.txInput.disabled = !enabled;
-    elements.signTxBtn.disabled = !enabled;
-
-    // Typed data section
-    elements.typedDataSection.classList.toggle('disabled-section', !enabled);
-    elements.typedDataInput.disabled = !enabled;
-    elements.signTypedDataBtn.disabled = !enabled;
-
-    // Message section
-    elements.messageSection.classList.toggle('disabled-section', !enabled);
-    elements.messageInput.disabled = !enabled;
-    elements.signMessageBtn.disabled = !enabled;
-
-    // Hash section
-    elements.hashSection.classList.toggle('disabled-section', !enabled);
-    elements.hashInput.disabled = !enabled;
-    elements.signHashBtn.disabled = !enabled;
+/** Shows `slot` (as reported by the device) in the slot dropdown. */
+function showDeviceSlot(slot) {
+    state.slot = slot;
+    elements.slotSelect.value = slot;
 }
 
 // ============================================
@@ -265,6 +279,18 @@ function validateOptionalAddress(raw) {
     return trimmed;
 }
 
+function validateBridgeUrl(raw) {
+    const trimmed = String(raw).trim();
+    const match = /^http:\/\/127\.0\.0\.1:(\d{1,5})\/?$/.exec(trimmed);
+    const port = match ? Number.parseInt(match[1], 10) : 0;
+    if (port < 1 || port > 65535) {
+        throw new Error(
+            'Bridge URL must be http://127.0.0.1:<port> (localhost and [::1] are not accepted)'
+        );
+    }
+    return trimmed;
+}
+
 function validateCalldataHex(raw) {
     const trimmed = String(raw).trim();
     if (!trimmed || trimmed === '0x' || trimmed === '0X') {
@@ -277,6 +303,58 @@ function validateCalldataHex(raw) {
 }
 
 // ============================================
+// Device Call Serialization
+// ============================================
+
+function errorMessage(error) {
+    return (error && error.message) || String(error);
+}
+
+/**
+ * Runs `task(state.device)` while holding the single global in-flight lock.
+ *
+ * Every async `YubiKeyDevice` method takes `&mut self`, so wasm-bindgen throws
+ * "recursive use of an object detected" for ANY call (sync or async) on the
+ * device while another call on it is pending (e.g. a signature waiting for a
+ * touch). Every device call therefore goes through this function: it refuses to
+ * start while another task is pending and disables all device controls until
+ * the task settles.
+ *
+ * Inside `task`, only call methods on the `device` argument and await each async
+ * call before making the next one.
+ *
+ * Resolves to `{ current, ok, value, error }`. `current` is false when the task
+ * did not run (another one was pending) or when `state.device` changed while it
+ * was pending; callers must not write a non-current result into the UI.
+ */
+async function runDeviceTask(task) {
+    if (state.busy) {
+        log('Another YubiKey operation is still in progress; wait for it to finish', 'warn');
+        return { current: false, ok: false };
+    }
+
+    const device = state.device;
+    state.busy = true;
+    updateControls();
+
+    let outcome;
+    try {
+        outcome = { ok: true, value: await task(device) };
+    } catch (error) {
+        outcome = { ok: false, error };
+    } finally {
+        state.busy = false;
+    }
+
+    const current = state.device === device;
+    if (!current) {
+        log('Discarding the result of an operation started on a previous connection', 'warn');
+    }
+    updateControls();
+    return { current, ...outcome };
+}
+
+// ============================================
 // Device Operations
 // ============================================
 
@@ -285,70 +363,147 @@ async function connectDevice() {
         log('WASM module is not loaded yet', 'error');
         return;
     }
+    if (state.device) return;
 
     const mode = elements.transportMode.value;
-    try {
+    let url;
+    let token;
+    if (mode === 'bridge') {
+        try {
+            url = validateBridgeUrl(elements.bridgeUrl.value);
+        } catch (validationError) {
+            log(validationError.message, 'error');
+            return;
+        }
+        token = elements.bridgeToken.value.trim();
+        if (!token) {
+            log('Please paste the session bearer token printed by `yubikey-cli bridge`', 'error');
+            return;
+        }
+    } else if (!state.webUsbAvailable) {
+        log('WebUSB is not supported in this browser; switch to Local PC/SC Bridge', 'error');
+        return;
+    }
+
+    const requestedSlot = elements.slotSelect.value;
+    const result = await runDeviceTask(async () => {
+        let device;
         if (mode === 'bridge') {
-            const url = elements.bridgeUrl.value.trim();
-            const token = elements.bridgeToken.value.trim();
-            if (!url) {
-                log('Please enter the local PC/SC bridge URL (e.g. http://127.0.0.1:8765)', 'error');
-                return;
-            }
-            if (!token) {
-                log('Please paste the session bearer token printed by `yubikey-cli bridge`', 'error');
-                return;
-            }
             log(`Connecting via local PC/SC bridge at ${url}...`);
-            state.device = await YubiKeyDevice.connectBridge(url, token);
+            device = await YubiKeyDevice.connectBridge(url, token);
             log('Connected to YubiKey via local PC/SC bridge', 'success');
         } else {
-            if (!state.webUsbAvailable) {
-                log('WebUSB is not supported in this browser; switch to Local PC/SC Bridge', 'error');
-                return;
-            }
             log('Requesting YubiKey WebUSB connection...');
-            state.device = await YubiKeyDevice.connect();
+            device = await YubiKeyDevice.connect();
             log('Successfully connected to YubiKey via WebUSB', 'success');
         }
 
-        // Sync selected PIV slot with the device
-        state.device.setSlot(elements.slotSelect.value);
-        updateConnectionUI(true);
-    } catch (error) {
-        log(`Connection failed: ${error.message || error}`, 'error');
-        state.device = null;
-        updateConnectionUI(false);
+        try {
+            // Sync the selected PIV slot with the device
+            try {
+                device.setSlot(requestedSlot);
+            } catch (error) {
+                log(`Failed to set PIV slot ${requestedSlot}: ${errorMessage(error)}`, 'error');
+            }
+            return { device, slot: device.getSlot() };
+        } catch (error) {
+            // Do not leak an open bridge session / claimed USB interface
+            await device.disconnect().catch(() => {});
+            throw error;
+        }
+    });
+
+    if (!result.ok) {
+        if (result.current) {
+            log(`Connection failed: ${errorMessage(result.error)}`, 'error');
+            updateConnectionUI(false);
+        }
+        return;
     }
+    if (!result.current) {
+        // Another connection appeared meanwhile; close the one we just opened.
+        await result.value.device.disconnect().catch(() => {});
+        return;
+    }
+
+    state.device = result.value.device;
+    showDeviceSlot(result.value.slot);
+    log(`Active PIV slot: ${result.value.slot}`, 'info');
+    updateConnectionUI(true);
 }
 
 async function disconnectDevice() {
     if (!state.device) return;
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log('Disconnecting from YubiKey...');
-        await state.device.disconnect();
-        log('Disconnected', 'success');
-    } catch (error) {
-        log(`Disconnect error: ${error.message || error}`, 'warn');
-    } finally {
-        state.device = null;
-        updateConnectionUI(false);
+        try {
+            await device.disconnect();
+            return { closed: true };
+        } catch (error) {
+            // disconnect() ran but reported an error: trust the transport state.
+            return { closed: !device.isConnected(), error };
+        }
+    });
+    if (!result.current) return;
+
+    if (!result.ok || !result.value.closed) {
+        const error = result.ok ? result.value.error : result.error;
+        log(`Disconnect failed; the YubiKey session is still open: ${errorMessage(error)}`, 'error');
+        return;
     }
+    if (result.value.error) {
+        log(`Disconnect warning: ${errorMessage(result.value.error)}`, 'warn');
+    }
+
+    state.device = null;
+    state.slot = null;
+    log('Disconnected', 'success');
+    updateConnectionUI(false);
 }
 
-function changeSlot() {
+async function changeSlot() {
     if (!state.device) return;
 
-    const slot = elements.slotSelect.value;
-    try {
-        state.device.setSlot(slot);
+    const requested = elements.slotSelect.value;
+    const result = await runDeviceTask((device) => {
+        try {
+            device.setSlot(requested);
+            return { slot: device.getSlot() };
+        } catch (error) {
+            return { slot: device.getSlot(), error };
+        }
+    });
+
+    if (!result.current) {
+        // The device's slot is unchanged (or unknown); show the last slot it reported.
+        if (state.slot) {
+            elements.slotSelect.value = state.slot;
+        }
+        return;
+    }
+    if (!result.ok) {
+        if (state.slot) {
+            elements.slotSelect.value = state.slot;
+        }
+        log(`Failed to set PIV slot: ${errorMessage(result.error)}`, 'error');
+        return;
+    }
+
+    const previousSlot = state.slot;
+    showDeviceSlot(result.value.slot);
+    if (result.value.error) {
+        log(
+            `Failed to set PIV slot ${requested}: ${errorMessage(result.value.error)}; still on slot ${result.value.slot}`,
+            'error'
+        );
+        return;
+    }
+    if (result.value.slot !== previousSlot) {
         state.address = null;
         elements.addressDisplay.textContent = '-';
-        log(`Active PIV slot set to ${slot}`, 'info');
-    } catch (error) {
-        log(`Failed to set PIV slot: ${error.message || error}`, 'error');
     }
+    log(`Active PIV slot set to ${result.value.slot}`, 'info');
 }
 
 async function verifyPin() {
@@ -361,13 +516,17 @@ async function verifyPin() {
         return;
     }
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log('Verifying PIN...');
-        await state.device.verifyPin(pin);
+        await device.verifyPin(pin);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
         log('PIN verified successfully', 'success');
         updatePinUI(true);
-    } catch (error) {
-        log(`PIN verification failed: ${error.message || error}`, 'error');
+    } else {
+        log(`PIN verification failed: ${errorMessage(result.error)}`, 'error');
         updatePinUI(false);
     }
 }
@@ -383,13 +542,17 @@ async function authenticateManagementKey() {
         return;
     }
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log(`Authenticating management key (${alg})...`);
-        await state.device.authenticateManagementKey(keyHex, alg);
+        await device.authenticateManagementKey(keyHex, alg);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
         log('Management key authenticated successfully', 'success');
         updateMgmtUI(true);
-    } catch (error) {
-        log(`Management key authentication failed: ${error.message || error}`, 'error');
+    } else {
+        log(`Management key authentication failed: ${errorMessage(result.error)}`, 'error');
         updateMgmtUI(false);
     }
 }
@@ -400,40 +563,65 @@ async function generateKey() {
         return;
     }
 
-    const slot = elements.slotSelect.value;
-    const confirmed = window.confirm(
-        `WARNING: Generating a new P-256 key in PIV slot ${slot} will permanently overwrite any existing key in that slot. Continue?`
-    );
-    if (!confirmed) {
-        log('Key generation cancelled by user', 'info');
-        return;
-    }
-
     const pin = elements.pinInput.value;
     const optionalPin = pin ? pin : undefined;
 
-    try {
+    // The slot is read from the device (not the dropdown) and the confirmation,
+    // log lines and key generation all happen under the same in-flight lock.
+    const result = await runDeviceTask(async (device) => {
+        const slot = device.getSlot();
+        const confirmed = window.confirm(
+            `WARNING: Generating a new P-256 key in PIV slot ${slot} will permanently overwrite any existing key in that slot. Continue?`
+        );
+        if (!confirmed) {
+            return { slot, cancelled: true };
+        }
         log(`Generating new P-256 key in slot ${slot}...`);
-        const address = await state.device.generateKey(optionalPin);
-        state.address = address;
-        elements.addressDisplay.textContent = address;
-        log(`Key generated in slot ${slot}. Address: ${address}`, 'success');
-    } catch (error) {
-        log(`Key generation failed: ${error.message || error}`, 'error');
+        try {
+            return { slot, address: await device.generateKey(optionalPin) };
+        } catch (error) {
+            return { slot, error };
+        }
+    });
+    if (!result.current) return;
+
+    if (!result.ok) {
+        log(`Key generation failed: ${errorMessage(result.error)}`, 'error');
+        return;
     }
+    if (result.value.cancelled) {
+        log('Key generation cancelled by user', 'info');
+        return;
+    }
+    if (result.value.error) {
+        log(
+            `Key generation in slot ${result.value.slot} failed: ${errorMessage(result.value.error)}`,
+            'error'
+        );
+        return;
+    }
+
+    const { slot, address } = result.value;
+    state.address = address;
+    elements.addressDisplay.textContent = address;
+    log(`Key generated in slot ${slot}. Address: ${address}`, 'success');
 }
 
 async function getAddress() {
     if (!state.device) return;
 
-    try {
-        log(`Retrieving address from slot ${elements.slotSelect.value}...`);
-        const address = await state.device.getAddress();
-        state.address = address;
-        elements.addressDisplay.textContent = address;
-        log(`Address: ${address}`, 'success');
-    } catch (error) {
-        log(`Get address failed: ${error.message || error}`, 'error');
+    const result = await runDeviceTask(async (device) => {
+        log(`Retrieving address from slot ${device.getSlot()}...`);
+        return device.getAddress();
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
+        state.address = result.value;
+        elements.addressDisplay.textContent = result.value;
+        log(`Address: ${result.value}`, 'success');
+    } else {
+        log(`Get address failed: ${errorMessage(result.error)}`, 'error');
     }
 }
 
@@ -445,7 +633,7 @@ async function signTransaction() {
     if (!state.device || !state.pinVerified) return;
 
     const pin = elements.pinInput.value;
-    let tx;
+    let txJson;
     try {
         const chainId = parseStrictNonNegativeSafeInt(elements.txChainId.value, 'Chain ID', 1);
         const nonce = parseStrictNonNegativeSafeInt(elements.txNonce.value, 'Nonce', 0);
@@ -459,7 +647,9 @@ async function signTransaction() {
         const to = validateOptionalAddress(elements.txTo.value);
         const input = validateCalldataHex(elements.txInput.value);
 
-        tx = {
+        // The transaction JSON schema rejects unknown keys and requires `to`
+        // (explicit `null` for contract creation), so always send exactly these keys.
+        txJson = JSON.stringify({
             type: 'eip1559',
             chain_id: chainId,
             nonce,
@@ -470,21 +660,24 @@ async function signTransaction() {
             value,
             input,
             access_list: []
-        };
+        });
     } catch (validationError) {
         log(`Invalid transaction field: ${validationError.message}`, 'error');
         elements.txSignature.value = '';
         return;
     }
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log('Signing EIP-1559 transaction...');
-        const txJson = JSON.stringify(tx);
-        const signature = await state.device.signTransaction(pin, txJson);
-        elements.txSignature.value = signature;
-        log(`Transaction signed: ${signature.substring(0, 20)}...`, 'success');
-    } catch (error) {
-        log(`Transaction signing failed: ${error.message || error}`, 'error');
+        return device.signTransaction(pin, txJson);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
+        elements.txSignature.value = result.value;
+        log(`Transaction signed: ${result.value.substring(0, 20)}...`, 'success');
+    } else {
+        log(`Transaction signing failed: ${errorMessage(result.error)}`, 'error');
         elements.txSignature.value = '';
     }
 }
@@ -502,16 +695,23 @@ async function signTypedData() {
 
     try {
         JSON.parse(typedDataJson);
+    } catch {
+        log('Invalid JSON format', 'error');
+        elements.typedDataSignature.value = '';
+        return;
+    }
+
+    const result = await runDeviceTask(async (device) => {
         log('Signing typed data (EIP-712)...');
-        const signature = await state.device.signTypedData(pin, typedDataJson);
-        elements.typedDataSignature.value = signature;
-        log(`Typed data signed: ${signature.substring(0, 20)}...`, 'success');
-    } catch (error) {
-        if (error instanceof SyntaxError) {
-            log('Invalid JSON format', 'error');
-        } else {
-            log(`Typed data signing failed: ${error.message || error}`, 'error');
-        }
+        return device.signTypedData(pin, typedDataJson);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
+        elements.typedDataSignature.value = result.value;
+        log(`Typed data signed: ${result.value.substring(0, 20)}...`, 'success');
+    } else {
+        log(`Typed data signing failed: ${errorMessage(result.error)}`, 'error');
         elements.typedDataSignature.value = '';
     }
 }
@@ -527,13 +727,17 @@ async function signMessage() {
         return;
     }
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log('Signing message (EIP-191)...');
-        const signature = await state.device.signMessage(pin, message);
-        elements.messageSignature.value = signature;
-        log(`Message signed: ${signature.substring(0, 20)}...`, 'success');
-    } catch (error) {
-        log(`Message signing failed: ${error.message || error}`, 'error');
+        return device.signMessage(pin, message);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
+        elements.messageSignature.value = result.value;
+        log(`Message signed: ${result.value.substring(0, 20)}...`, 'success');
+    } else {
+        log(`Message signing failed: ${errorMessage(result.error)}`, 'error');
         elements.messageSignature.value = '';
     }
 }
@@ -555,13 +759,17 @@ async function signHash() {
         return;
     }
 
-    try {
+    const result = await runDeviceTask(async (device) => {
         log('Signing hash...');
-        const signature = await state.device.signHash(pin, cleanHash);
-        elements.hashSignature.value = signature;
-        log(`Hash signed: ${signature.substring(0, 20)}...`, 'success');
-    } catch (error) {
-        log(`Hash signing failed: ${error.message || error}`, 'error');
+        return device.signHash(pin, cleanHash);
+    });
+    if (!result.current) return;
+
+    if (result.ok) {
+        elements.hashSignature.value = result.value;
+        log(`Hash signed: ${result.value.substring(0, 20)}...`, 'success');
+    } else {
+        log(`Hash signing failed: ${errorMessage(result.error)}`, 'error');
         elements.hashSignature.value = '';
     }
 }
@@ -645,10 +853,24 @@ function setupEventListeners() {
         log('Log cleared', 'info');
     });
 
-    // Cleanly disconnect without unhandled promise rejections on page unload
+    // Best-effort disconnect on page unload. This handler must never throw: while
+    // another call is pending on the device, wasm-bindgen rejects every new call
+    // (including isConnected()) synchronously, so each step is guarded separately
+    // and disconnect() is still attempted.
     window.addEventListener('beforeunload', () => {
-        if (state.device && state.device.isConnected()) {
-            void state.device.disconnect().catch(() => {});
+        const device = state.device;
+        if (!device) return;
+        let connected = true;
+        try {
+            connected = device.isConnected();
+        } catch {
+            // Busy with a pending call; still try to disconnect below.
+        }
+        if (!connected) return;
+        try {
+            void Promise.resolve(device.disconnect()).catch(() => {});
+        } catch {
+            // Rejected synchronously because a call is still pending; nothing else to do.
         }
     });
 }

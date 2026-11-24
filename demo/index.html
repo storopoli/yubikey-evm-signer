@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <!--
+        GitHub Pages cannot set response headers, so the policy is delivered via <meta>.
+        It must stay before any other resource. No inline scripts, styles or event handlers.
+        'wasm-unsafe-eval' is required to compile the WASM module; connect-src 'self' covers
+        the .wasm fetch and http://127.0.0.1:* the local PC/SC bridge.
+        (frame-ancestors is ignored in <meta> policies, so it is not listed.)
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self' http://127.0.0.1:*; base-uri 'none'; form-action 'none'; object-src 'none'">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>YubiKey EVM Signer Demo</title>
     <link rel="stylesheet" href="styles.css">
@@ -53,7 +61,7 @@
             <div id="bridge-config" class="bridge-config">
                 <div class="form-grid">
                     <div class="form-group">
-                        <label for="bridge-url">Bridge URL (loopback only):</label>
+                        <label for="bridge-url">Bridge URL (http://127.0.0.1 only):</label>
                         <input type="text" id="bridge-url" value="http://127.0.0.1:8765" placeholder="http://127.0.0.1:8765">
                     </div>
                     <div class="form-group">
@@ -61,7 +69,7 @@
                         <input type="password" id="bridge-token" placeholder="Paste token from yubikey-cli bridge">
                     </div>
                 </div>
-                <p class="hint">Run <code>just cli-bridge</code> locally and paste the printed session bearer token. Only loopback URLs (<code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code>) are accepted.</p>
+                <p class="hint">Run <code>just cli-bridge</code> locally and paste the printed session bearer token. Only <code>http://127.0.0.1:&lt;port&gt;</code> is accepted (<code>localhost</code> and <code>[::1]</code> are rejected).</p>
             </div>
 
             <div class="button-row">

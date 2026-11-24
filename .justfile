@@ -80,6 +80,7 @@ publish:
 # Publish NPM package (requires npm login)
 [group('publish')]
 npm-publish: wasm-build-release
+  node scripts/verify-demo.mjs --check-wasm
   cd packages/npm && npm publish --access public
 
 # =============================================================================
@@ -100,22 +101,27 @@ check-github-actions-security:
 # WASM Build
 # =============================================================================
 
+# Copy the repository license files into the npm package (git-ignored there)
+[group('wasm')]
+npm-licenses:
+  cp LICENSE-MIT LICENSE-APACHE packages/npm/
+
 # Build WASM package
 [group('wasm')]
-wasm-build:
+wasm-build: npm-licenses
   wasm-pack build crates/signer-wasm --target web --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
   rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Build WASM package in release mode
 [group('wasm')]
-wasm-build-release:
+wasm-build-release: npm-licenses
   wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
   rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Clean WASM build artifacts
 [group('wasm')]
 wasm-clean:
-  rm -rf packages/npm/dist
+  rm -rf packages/npm/dist packages/npm/LICENSE-MIT packages/npm/LICENSE-APACHE
 
 # Rebuild WASM package from scratch
 [group('wasm')]
@@ -129,6 +135,7 @@ wasm-rebuild: wasm-clean wasm-build
 [group('demo')]
 demo-build:
   wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../demo/wasm --out-name yubikey_evm_signer_wasm
+  node scripts/verify-demo.mjs --check-wasm --wasm-dir demo/wasm
 
 # Clean demo WASM artifacts
 [group('demo')]
