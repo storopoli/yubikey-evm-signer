@@ -30,10 +30,8 @@ use std::cmp::Ordering;
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
-#[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
-use p256::elliptic_curve::generic_array::GenericArray;
-use p256::elliptic_curve::sec1::FromEncodedPoint;
-use p256::{AffinePoint, EncodedPoint, FieldBytes};
+use p256::elliptic_curve::sec1::FromSec1Point;
+use p256::{AffinePoint, FieldBytes, Sec1Point};
 
 use crate::error::{Error, Result};
 use crate::signature::Signature;
@@ -258,8 +256,8 @@ pub fn calculate_recovery_parameter(
     for recovery_id in 0u8..2u8 {
         if let Ok(recovered) = try_recover_public_key(hash, r, s, recovery_id) {
             // Compare public keys
-            let expected_point = public_key.to_encoded_point(false);
-            let recovered_point = recovered.to_encoded_point(false);
+            let expected_point = public_key.to_sec1_point(false);
+            let recovered_point = recovered.to_sec1_point(false);
 
             if expected_point == recovered_point {
                 return Ok(recovery_id);
@@ -409,33 +407,27 @@ pub fn p256_verify(input: &[u8]) -> bool {
     let y = &input[128..160];
 
     // 3. Construct public key from (x, y) coordinates
-    #[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
-    // generic_array 0.x API used by p256 crate
-    let encoded_point = EncodedPoint::from_affine_coordinates(
-        GenericArray::from_slice(x),
-        GenericArray::from_slice(y),
-        false, // not compressed
+    let (Ok(x_bytes), Ok(y_bytes)) = (FieldBytes::try_from(x), FieldBytes::try_from(y)) else {
+        return false;
+    };
+    let encoded_point = Sec1Point::from_affine_coordinates(
+        &x_bytes, &y_bytes, false, // not compressed
     );
 
-    let affine_point = match AffinePoint::from_encoded_point(&encoded_point).into() {
-        Some(point) => point,
-        None => return false, // Invalid point (not on curve or at infinity)
+    let Some(affine_point) = AffinePoint::from_sec1_point(&encoded_point).into_option() else {
+        return false; // Invalid point (not on curve or at infinity)
     };
 
-    let verifying_key = match VerifyingKey::from_affine(affine_point) {
-        Ok(vk) => vk,
-        Err(_) => return false,
+    let Ok(verifying_key) = VerifyingKey::from_affine(affine_point) else {
+        return false;
     };
 
     // 4. Construct signature from r and s
-    #[expect(deprecated, reason = "generic_array 0.x API used by p256 crate")]
-    // generic_array 0.x API used by p256 crate
-    let signature = match P256Signature::from_scalars(
-        FieldBytes::clone_from_slice(r),
-        FieldBytes::clone_from_slice(s),
-    ) {
-        Ok(sig) => sig,
-        Err(_) => return false, // Invalid r or s (not in range)
+    let (Ok(r_bytes), Ok(s_bytes)) = (FieldBytes::try_from(r), FieldBytes::try_from(s)) else {
+        return false;
+    };
+    let Ok(signature) = P256Signature::from_scalars(r_bytes, s_bytes) else {
+        return false; // Invalid r or s (not in range)
     };
 
     // 5. Verify signature using prehash (hash already provided)

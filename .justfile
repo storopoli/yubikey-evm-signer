@@ -71,10 +71,11 @@ test: unit-test doctest
 # Publishing
 # =============================================================================
 
-# Publish crate to crates.io
+# Publish crates to crates.io
 [group('publish')]
 publish:
-  cargo publish --token $CARGO_REGISTRY_TOKEN
+  cargo publish -p yubikey-evm-signer-core
+  cargo publish -p yubikey-evm-signer-wasm
 
 # Publish NPM package (requires npm login)
 [group('publish')]
@@ -85,7 +86,7 @@ npm-publish: wasm-build-release
 # Security
 # =============================================================================
 
-# Check supply chain security analsis with `cargo-audit`
+# Check supply chain security analysis with `cargo-audit`
 [group('security')]
 audit:
   cargo audit
@@ -103,11 +104,13 @@ check-github-actions-security:
 [group('wasm')]
 wasm-build:
   wasm-pack build crates/signer-wasm --target web --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+  rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Build WASM package in release mode
 [group('wasm')]
 wasm-build-release:
   wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
+  rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Clean WASM build artifacts
 [group('wasm')]

@@ -119,10 +119,7 @@ impl WebUsbTransport {
         let filter = web_sys::UsbDeviceFilter::new();
         filter.set_vendor_id(YUBIKEY_VENDOR_ID);
 
-        let filters = js_sys::Array::new();
-        filters.push(&filter);
-
-        let options = web_sys::UsbDeviceRequestOptions::new(&filters);
+        let options = web_sys::UsbDeviceRequestOptions::new(&[filter]);
 
         // Request device access (shows browser picker)
         let device_promise = usb.request_device(&options);
@@ -209,10 +206,9 @@ impl WebUsbTransport {
 
     /// Sends raw data to the device.
     async fn send_raw(&self, data: &[u8]) -> WasmResult<()> {
-        let mut data_copy = data.to_vec();
         let promise = self
             .device
-            .transfer_out_with_u8_slice(self.endpoint_out, &mut data_copy)
+            .transfer_out_with_u8_slice(self.endpoint_out, data)
             .map_err(|e| WasmError::UsbError(format!("transfer_out: {e:?}")))?;
 
         let result = JsFuture::from(promise)

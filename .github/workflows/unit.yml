@@ -31,7 +31,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
@@ -46,9 +48,11 @@ jobs:
         with:
           cache-on-failure: true
 
-      - name: Run tests
-        run: |
-          cargo --locked nextest run --all-features --workspace
+      - name: Run tests (default features)
+        run: cargo --locked nextest run --workspace
+
+      - name: Run tests (all features)
+        run: cargo --locked nextest run --all-features --workspace
 
   doc:
     name: Run doc tests
@@ -65,7 +69,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fcf085fcb4b4b8f63f96906cd713eb52181b5ea4 # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
@@ -76,7 +82,7 @@ jobs:
           cache-on-failure: true
 
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test --doc --all-features --locked
 
   unit-success:
     name: Check that unit tests pass

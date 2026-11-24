@@ -6,8 +6,10 @@
 // Silence unused crate dependency warnings for test binary
 use alloy_primitives as _;
 use alloy_rlp as _;
+#[cfg(feature = "pcsc")]
 use des as _;
 use p256 as _;
+#[cfg(feature = "pcsc")]
 use pcsc as _;
 use thiserror as _;
 
