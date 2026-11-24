@@ -160,6 +160,11 @@ pub fn normalize_s(s: [u8; 32]) -> Result<([u8; 32], bool)> {
 /// Computes `Q = r^-1 * (s * R - z * G)` on NIST P-256 where `R` is the curve point
 /// with x-coordinate `r` and y-parity `recovery_id & 1`.
 ///
+/// Only `R.x = r` is tried. If the signer's nonce point had `R.x` in `[n, p)` (so that
+/// `r = R.x - n`), recovery fails closed with [`Error::RecoveryParameterFailed`]
+/// instead of trying `R.x = r + n`. For honestly generated nonces this happens with
+/// probability about `2^-130`.
+///
 /// # Arguments
 ///
 /// * `hash` - The 32-byte prehashed message digest

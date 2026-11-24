@@ -9,6 +9,17 @@
 //! 3. Compute the Keccak-256 hash of the 64 bytes
 //! 4. Take the last 20 bytes of the hash as the address
 //!
+//! # Not a secp256k1 account
+//!
+//! An address derived from a P-256 key identifies that key; it is **not** an
+//! externally owned account. Ethereum mainnet and standard EVM chains validate
+//! transaction signatures with secp256k1 `ecrecover`, so P-256 signatures never
+//! recover to this address there, and anything sent to it on such chains cannot
+//! be spent with the YubiKey key. Verifiers using the [EIP-7951] `P256VERIFY`
+//! precompile need the public key `(qx, qy)` itself, not this address.
+//!
+//! [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
+//!
 //! # Example
 //!
 //! ```
@@ -93,10 +104,15 @@ impl Address {
         self.0.is_zero()
     }
 
-    /// Derives an Ethereum address from a secp256r1 public key.
+    /// Derives an Ethereum-style address from a secp256r1 public key.
+    ///
+    /// The result is `keccak256(X‖Y)[12..]`, a stable identifier of the P-256
+    /// key. It is not a secp256k1 externally owned account: standard EVM chains
+    /// will not accept P-256 transaction signatures from it, and funds sent to it
+    /// there cannot be spent with this key (see the [module docs](crate::address)).
     ///
     /// This function takes a P-256 verifying key (public key) and derives
-    /// the corresponding Ethereum address by:
+    /// the address by:
     ///
     /// 1. Encoding the public key as an uncompressed SEC1 point (65 bytes)
     /// 2. Removing the `0x04` prefix to get the raw x and y coordinates (64 bytes)
@@ -140,10 +156,12 @@ impl Address {
         Self::new(address_bytes)
     }
 
-    /// Derives an Ethereum address from encoded P-256 public key bytes.
+    /// Derives an Ethereum-style address from encoded P-256 public key bytes.
     ///
     /// Validates that the bytes encode a valid non-identity point on the NIST P-256
-    /// curve before deriving the address from its uncompressed coordinates.
+    /// curve before deriving the address from its uncompressed coordinates. Like
+    /// [`Self::from_public_key`], the result identifies the P-256 key and is not a
+    /// secp256k1 account.
     ///
     /// # Arguments
     ///
@@ -498,7 +516,7 @@ mod tests {
         let addr = Address::new(bytes);
         let checksum = addr.to_checksum_hex();
 
-        // EIP-55 checksum should preserve mixed case
-        assert!(checksum.contains(|c: char| c.is_ascii_uppercase()));
+        // Exact EIP-55 test vector
+        assert_eq!(checksum, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
     }
 }

@@ -80,6 +80,7 @@ publish:
 # Publish NPM package (requires npm login)
 [group('publish')]
 npm-publish: wasm-build-release
+  node scripts/verify-demo.mjs --check-wasm
   cd packages/npm && npm publish --access public
 
 # =============================================================================
@@ -100,22 +101,27 @@ check-github-actions-security:
 # WASM Build
 # =============================================================================
 
+# Copy the repository license files into the npm package (git-ignored there)
+[group('wasm')]
+npm-licenses:
+  cp LICENSE-MIT LICENSE-APACHE packages/npm/
+
 # Build WASM package
 [group('wasm')]
-wasm-build:
+wasm-build: npm-licenses
   wasm-pack build crates/signer-wasm --target web --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
   rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Build WASM package in release mode
 [group('wasm')]
-wasm-build-release:
+wasm-build-release: npm-licenses
   wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../packages/npm/dist --out-name yubikey_evm_signer_wasm
   rm -f packages/npm/dist/.gitignore packages/npm/dist/package.json
 
 # Clean WASM build artifacts
 [group('wasm')]
 wasm-clean:
-  rm -rf packages/npm/dist
+  rm -rf packages/npm/dist packages/npm/LICENSE-MIT packages/npm/LICENSE-APACHE
 
 # Rebuild WASM package from scratch
 [group('wasm')]
@@ -129,6 +135,7 @@ wasm-rebuild: wasm-clean wasm-build
 [group('demo')]
 demo-build:
   wasm-pack build crates/signer-wasm --target web --release --no-opt --out-dir ../../demo/wasm --out-name yubikey_evm_signer_wasm
+  node scripts/verify-demo.mjs --check-wasm --wasm-dir demo/wasm
 
 # Clean demo WASM artifacts
 [group('demo')]
@@ -165,17 +172,18 @@ cli-list:
 cli-info:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- info
 
-# Get Ethereum address from slot 9a
+# Show the P-256 public key and derived address (not a secp256k1 account) of slot 9a
 [group('cli')]
 cli-address:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- address
 
-# Generate a new P-256 key in slot 9a (requires PIN, overwrites existing key!)
+# Generate a new P-256 key in slot 9a (requires management key and typed confirmation; destroys existing key!) (options: --force, --pubkey-out <path>)
 [group('cli')]
-cli-generate:
-  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate
+[positional-arguments]
+cli-generate *args:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate "$@"
 
-# Sign a sample EIP-1559 transaction (requires PIN)
+# Sign a sample EIP-1559 transaction hash with the slot 9a P-256 key (requires PIN)
 [group('cli')]
 cli-sign-tx:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign-tx
@@ -185,10 +193,11 @@ cli-sign-tx:
 cli-sign hash:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign {{hash}}
 
-# Start hardened local PC/SC loopback bridge for browser apps
+# Start hardened local PC/SC loopback bridge for browser apps (options: --port, --allow-origin, --idle-timeout <seconds>, --allow-generate)
 [group('cli')]
+[positional-arguments]
 cli-bridge *args:
-  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge {{args}}
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge "$@"
 
 # Show CLI help
 [group('cli')]

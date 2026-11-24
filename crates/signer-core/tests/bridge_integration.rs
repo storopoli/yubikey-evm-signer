@@ -5,11 +5,16 @@
 //! across multi-chunk `61 XX` responses, PIN verification, AES-192 management
 //! key mutual auth, and real P-256 prehash signing) and exercises both security
 //! boundaries and the full Ethereum signing flow over real loopback TCP HTTP.
+//!
+//! Tests never use fixed ports or sleeps for synchronization: events that happen
+//! on a background thread (idle expiry) are awaited on a channel with a generous
+//! upper bound, and timeouts under test are configured to be short.
 
 // Silence unused crate dependency warnings for this integration test binary
 use aes as _;
 use alloy_primitives as _;
 use alloy_rlp as _;
+use ctrlc as _;
 use des as _;
 use flate2 as _;
 use getrandom as _;
@@ -21,25 +26,33 @@ use thiserror as _;
 use zeroize as _;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use p256::FieldBytes;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature as P256Signature, SigningKey, VerifyingKey};
 use serde_json::Value;
 
-use yubikey_evm_signer_core::bridge::{BridgeConfig, BridgeServer, MAX_BODY_BYTES};
+use yubikey_evm_signer_core::bridge::{
+    BridgeConfig, BridgeHandle, BridgeServer, MAX_BODY_BYTES, MAX_CONCURRENT_CONNECTIONS,
+    MAX_HEADER_BYTES, MIN_TOKEN_LEN,
+};
 use yubikey_evm_signer_core::crypto::{
     create_ethereum_signature, try_recover_public_key, verify_signature,
 };
 use yubikey_evm_signer_core::yubikey::piv::{
-    ManagementKeyAlgorithm, PIV_AID, build_get_certificate_apdu, build_get_response_apdu,
-    build_mgmt_auth_request_witness_apdu, build_mgmt_auth_verify_apdu, build_sign_apdu,
-    build_verify_pin_apdu, decrypt_mgmt_witness, encrypt_mgmt_challenge,
-    parse_certificate_public_key, parse_challenge_response, parse_signature_response,
-    parse_witness_response, verify_mgmt_challenge_response,
+    ManagementKeyAlgorithm, PIV_AID, build_delete_certificate_apdu, build_generate_key_apdu,
+    build_get_certificate_apdu, build_get_metadata_apdu, build_get_response_apdu,
+    build_mgmt_auth_request_witness_apdu, build_mgmt_auth_verify_apdu, build_select_piv_apdu,
+    build_sign_apdu, build_verify_pin_apdu, decrypt_mgmt_witness, encrypt_mgmt_challenge,
+    parse_certificate_public_key, parse_challenge_response, parse_public_key_response,
+    parse_signature_response, parse_witness_response, verify_mgmt_challenge_response,
 };
 use yubikey_evm_signer_core::yubikey::{Apdu, ApduResponse, Slot, Transport};
 use yubikey_evm_signer_core::{Address, Eip1559Transaction, Error, Result, Transaction, U256};
@@ -47,6 +60,17 @@ use yubikey_evm_signer_core::{Address, Eip1559Transaction, Error, Result, Transa
 const ALLOWED_ORIGIN: &str = "http://localhost:8000";
 const TEST_PIN: &str = "123456";
 const TEST_MGMT_KEY: [u8; 24] = [0x22; 24];
+const TEST_KEY_HEX: &str = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721";
+const NO_SESSION: &str = "no active session or session_id mismatch";
+const SLOTS: [Slot; 4] = [
+    Slot::Authentication,
+    Slot::Signature,
+    Slot::KeyManagement,
+    Slot::CardAuthentication,
+];
+
+/// Upper bound when waiting for an event that must happen (never a fixed sleep).
+const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DER-encodes a TLV element with canonical length.
 fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
@@ -118,6 +142,48 @@ fn build_piv_certificate_object(verifying_key: &VerifyingKey) -> Vec<u8> {
     der_tlv(0x53, &piv_inner)
 }
 
+fn test_signing_key() -> SigningKey {
+    let key_bytes = hex::decode(TEST_KEY_HEX).unwrap();
+    SigningKey::from_bytes(&FieldBytes::try_from(key_bytes.as_slice()).unwrap()).unwrap()
+}
+
+/// Transport failure injected by a test for one `(INS, P2)` pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    CardReset,
+    Disconnected,
+    Other,
+}
+
+/// Observations shared between a test and every mock card the bridge opens.
+#[derive(Default)]
+struct Probe {
+    /// Every APDU a card received, and whether it arrived inside an exclusive scope.
+    transmitted: Mutex<Vec<(Vec<u8>, bool)>>,
+    /// Number of exclusive scopes opened.
+    scopes: AtomicUsize,
+    /// Injected transport failures keyed by `(INS, P2)`.
+    faults: Mutex<HashMap<(u8, u8), Fault>>,
+}
+
+impl Probe {
+    fn transmitted(&self) -> Vec<(Vec<u8>, bool)> {
+        self.transmitted.lock().unwrap().clone()
+    }
+
+    fn transmitted_count(&self) -> usize {
+        self.transmitted.lock().unwrap().len()
+    }
+
+    fn set_fault(&self, ins: u8, p2: u8, fault: Option<Fault>) {
+        let mut faults = self.faults.lock().unwrap();
+        match fault {
+            Some(fault) => faults.insert((ins, p2), fault),
+            None => faults.remove(&(ins, p2)),
+        };
+    }
+}
+
 /// Realistic mock PIV smart card implementing [`Transport`].
 struct MockPivCard {
     signing_key: SigningKey,
@@ -127,10 +193,14 @@ struct MockPivCard {
     pin_retries: u8,
     mgmt_witness: [u8; 16],
     mgmt_authenticated: bool,
+    in_scope: bool,
+    probe: Arc<Probe>,
+    /// Signalled when the card handle is dropped (the bridge released the card).
+    dropped: Sender<()>,
 }
 
 impl MockPivCard {
-    fn new(signing_key: SigningKey) -> Self {
+    fn new(signing_key: SigningKey, probe: Arc<Probe>, dropped: Sender<()>) -> Self {
         let piv_cert_obj = build_piv_certificate_object(signing_key.verifying_key());
         Self {
             signing_key,
@@ -140,6 +210,9 @@ impl MockPivCard {
             pin_retries: 3,
             mgmt_witness: [0xA5; 16],
             mgmt_authenticated: false,
+            in_scope: false,
+            probe,
+            dropped,
         }
     }
 
@@ -162,8 +235,41 @@ impl MockPivCard {
     }
 }
 
+impl Drop for MockPivCard {
+    fn drop(&mut self) {
+        let _ = self.dropped.send(());
+    }
+}
+
 impl Transport for MockPivCard {
     fn transmit(&mut self, apdu: &Apdu) -> Result<ApduResponse> {
+        self.probe
+            .transmitted
+            .lock()
+            .unwrap()
+            .push((apdu.to_bytes()?, self.in_scope));
+
+        let fault = self
+            .probe
+            .faults
+            .lock()
+            .unwrap()
+            .get(&(apdu.ins(), apdu.p2()))
+            .copied();
+        match fault {
+            Some(Fault::CardReset) => return Err(Error::CardReset),
+            Some(Fault::Disconnected) => return Err(Error::DeviceDisconnected),
+            Some(Fault::Other) => {
+                return Err(Error::ApduError("mock transport failure".to_string()));
+            }
+            None => {}
+        }
+
+        // A real card answers "class not supported" for chaining / logical channels.
+        if apdu.cla() != 0x00 {
+            return Ok(ApduResponse::new(vec![0x6E, 0x00]));
+        }
+
         match apdu.ins() {
             // SELECT PIV AID
             0xA4 => {
@@ -201,6 +307,26 @@ impl Transport for MockPivCard {
             }
             // GET RESPONSE
             0xC0 => Ok(self.next_chunk_response()),
+            // GENERATE ASYMMETRIC (returns the existing test key's public point)
+            0x47 => {
+                if !self.mgmt_authenticated {
+                    return Ok(ApduResponse::new(vec![0x69, 0x82]));
+                }
+                let point = self.signing_key.verifying_key().to_sec1_point(false);
+                let inner = der_tlv(0x86, point.as_bytes());
+                let mut resp = vec![0x7F, 0x49, inner.len() as u8];
+                resp.extend_from_slice(&inner);
+                resp.extend_from_slice(&[0x90, 0x00]);
+                Ok(ApduResponse::new(resp))
+            }
+            // PUT DATA (certificate deletion)
+            0xDB => {
+                if self.mgmt_authenticated {
+                    Ok(ApduResponse::new(vec![0x90, 0x00]))
+                } else {
+                    Ok(ApduResponse::new(vec![0x69, 0x82]))
+                }
+            }
             // GENERAL AUTHENTICATE
             0x87 => {
                 if apdu.p2() == 0x9B && apdu.p1() == ManagementKeyAlgorithm::Aes192.id() {
@@ -272,6 +398,14 @@ impl Transport for MockPivCard {
     fn is_connected(&self) -> bool {
         true
     }
+
+    fn exclusive(&mut self, f: &mut dyn FnMut(&mut dyn Transport) -> Result<()>) -> Result<()> {
+        self.probe.scopes.fetch_add(1, Ordering::SeqCst);
+        let outer = std::mem::replace(&mut self.in_scope, true);
+        let result = f(self);
+        self.in_scope = outer;
+        result
+    }
 }
 
 struct RawHttpResponse {
@@ -280,27 +414,34 @@ struct RawHttpResponse {
     body: String,
 }
 
-fn send_raw_http(addr: SocketAddr, request_bytes: &[u8]) -> RawHttpResponse {
-    let mut stream = TcpStream::connect(addr).expect("connect to bridge");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("set write timeout");
+impl RawHttpResponse {
+    fn has_cors(&self) -> bool {
+        self.headers.contains_key("access-control-allow-origin")
+    }
 
-    stream.write_all(request_bytes).expect("write HTTP request");
-    stream.flush().expect("flush HTTP request");
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.body))
+    }
 
-    let mut response_bytes = Vec::new();
-    stream
-        .read_to_end(&mut response_bytes)
-        .expect("read HTTP response");
+    fn error(&self) -> String {
+        self.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
 
+    fn apdu(&self) -> ApduResponse {
+        assert_eq!(self.status, 200, "unexpected HTTP status: {}", self.body);
+        let hex_resp = self.json()["response"].as_str().unwrap().to_string();
+        ApduResponse::try_from_bytes(hex::decode(hex_resp).unwrap()).unwrap()
+    }
+}
+
+fn parse_http_response(response_bytes: Vec<u8>) -> RawHttpResponse {
     let raw = String::from_utf8(response_bytes).expect("UTF-8 HTTP response");
     let (head, body) = raw
         .split_once("\r\n\r\n")
-        .expect("HTTP response header/body split");
+        .unwrap_or_else(|| panic!("HTTP response header/body split: {raw:?}"));
 
     let mut lines = head.split("\r\n");
     let status_line = lines.next().expect("status line");
@@ -325,31 +466,157 @@ fn send_raw_http(addr: SocketAddr, request_bytes: &[u8]) -> RawHttpResponse {
     }
 }
 
-fn post_transmit(
-    addr: SocketAddr,
-    token: &str,
-    session_id: &str,
-    apdu_bytes: &[u8],
-) -> RawHttpResponse {
-    let body = serde_json::json!({
-        "session_id": session_id,
-        "apdu": hex::encode(apdu_bytes),
-    })
-    .to_string();
+fn send_raw_http(addr: SocketAddr, request_bytes: &[u8]) -> RawHttpResponse {
+    let mut stream = TcpStream::connect(addr).expect("connect to bridge");
+    stream
+        .set_read_timeout(Some(EVENT_TIMEOUT))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(EVENT_TIMEOUT))
+        .expect("set write timeout");
 
-    let req = format!(
-        "POST /v1/transmit HTTP/1.1\r\n\
-         Host: 127.0.0.1:{}\r\n\
-         Origin: {ALLOWED_ORIGIN}\r\n\
-         Authorization: Bearer {token}\r\n\
-         Content-Type: application/json; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         \r\n\
-         {body}",
-        addr.port(),
-        body.len()
-    );
-    send_raw_http(addr, req.as_bytes())
+    stream.write_all(request_bytes).expect("write HTTP request");
+    stream.flush().expect("flush HTTP request");
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .expect("read HTTP response");
+    parse_http_response(response_bytes)
+}
+
+/// HTTP client for one bridge instance (cloneable across threads).
+#[derive(Clone)]
+struct Client {
+    addr: SocketAddr,
+    token: String,
+}
+
+/// A running bridge backed by mock cards, plus the test's view of those cards.
+struct Harness {
+    handle: BridgeHandle,
+    client: Client,
+    probe: Arc<Probe>,
+    drops: Receiver<()>,
+}
+
+impl std::ops::Deref for Harness {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+fn start_bridge(config: BridgeConfig) -> Harness {
+    let probe = Arc::new(Probe::default());
+    let (drop_tx, drops) = mpsc::channel();
+    let card_probe = Arc::clone(&probe);
+    let handle = BridgeServer::start(config.with_backend_name("mock"), move || {
+        let card: Box<dyn Transport + Send> = Box::new(MockPivCard::new(
+            test_signing_key(),
+            Arc::clone(&card_probe),
+            drop_tx.clone(),
+        ));
+        Ok(card)
+    })
+    .expect("start bridge server");
+    let addr = handle.local_addr();
+    let token = handle.token().to_string();
+    Harness {
+        handle,
+        client: Client { addr, token },
+        probe,
+        drops,
+    }
+}
+
+fn default_config() -> BridgeConfig {
+    BridgeConfig::loopback(0).unwrap()
+}
+
+impl Client {
+    const fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    fn send(&self, request: &str) -> RawHttpResponse {
+        send_raw_http(self.addr, request.as_bytes())
+    }
+
+    /// Sends a request with a valid Host, allowed Origin and bearer token.
+    fn request(&self, method: &str, path: &str, body: Option<&str>) -> RawHttpResponse {
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {}\r\n",
+            self.port(),
+            self.token
+        );
+        if let Some(body) = body {
+            req.push_str(&format!(
+                "Content-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ));
+        } else {
+            req.push_str("\r\n");
+        }
+        self.send(&req)
+    }
+
+    fn health(&self) -> RawHttpResponse {
+        self.request("GET", "/v1/health", None)
+    }
+
+    fn try_connect(&self) -> RawHttpResponse {
+        self.request("POST", "/v1/connect", Some("{}"))
+    }
+
+    fn connect(&self) -> String {
+        let resp = self.try_connect();
+        assert_eq!(resp.status, 200, "connect failed: {}", resp.body);
+        let session_id = resp.json()["session_id"].as_str().unwrap().to_string();
+        assert_eq!(session_id.len(), 32);
+        session_id
+    }
+
+    fn transmit(&self, session_id: &str, apdu_bytes: &[u8]) -> RawHttpResponse {
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "apdu": hex::encode(apdu_bytes),
+        })
+        .to_string();
+        self.request("POST", "/v1/transmit", Some(&body))
+    }
+
+    fn transmit_apdu(&self, session_id: &str, apdu: &Apdu) -> RawHttpResponse {
+        self.transmit(session_id, &apdu.to_bytes().unwrap())
+    }
+
+    fn disconnect(&self, session_id: &str) -> RawHttpResponse {
+        let body = serde_json::json!({ "session_id": session_id }).to_string();
+        self.request("POST", "/v1/disconnect", Some(&body))
+    }
+}
+
+impl Harness {
+    /// Asserts a card handle was released before the last response was sent.
+    fn assert_card_released(&self) {
+        self.drops
+            .try_recv()
+            .expect("the bridge must have released the card handle");
+    }
+
+    fn assert_card_held(&self) {
+        assert!(
+            self.drops.try_recv().is_err(),
+            "the bridge must still hold the card handle"
+        );
+    }
+}
+
+fn assert_no_session(resp: &RawHttpResponse) {
+    assert_eq!(resp.status, 409, "{}", resp.body);
+    assert_eq!(resp.error(), NO_SESSION);
+    assert!(resp.has_cors());
 }
 
 #[test]
@@ -360,143 +627,77 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
         BridgeConfig::new(non_loopback, vec![ALLOWED_ORIGIN.to_string()], None, "mock").is_err()
     );
 
-    // Deterministic P-256 test key
-    let key_bytes =
-        hex::decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721").unwrap();
-    let signing_key =
-        SigningKey::from_bytes(&FieldBytes::try_from(key_bytes.as_slice()).unwrap()).unwrap();
+    let signing_key = test_signing_key();
     let expected_vk = *signing_key.verifying_key();
     let expected_address = Address::from_public_key(&expected_vk);
 
-    let config = BridgeConfig::loopback(0).unwrap().with_backend_name("mock");
-
-    let card_key_bytes = key_bytes.clone();
-    let handle = BridgeServer::start(config, move || {
-        let sk = SigningKey::from_bytes(&FieldBytes::try_from(card_key_bytes.as_slice()).unwrap())
-            .unwrap();
-        let card: Box<dyn Transport + Send> = Box::new(MockPivCard::new(sk));
-        Ok(card)
-    })
-    .expect("start bridge server");
-
-    let addr = handle.local_addr();
-    let port = addr.port();
-    let token = handle.token().to_string();
+    let h = start_bridge(default_config());
+    let port = h.port();
+    let token = h.token.clone();
+    assert_eq!(h.handle.url(), format!("http://127.0.0.1:{port}"));
 
     // 1. Security: missing Origin -> 403 (both OPTIONS and GET)
-    let resp = send_raw_http(
-        addr,
-        format!("OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    ));
     assert_eq!(resp.status, 403);
-    assert!(!resp.headers.contains_key("access-control-allow-origin"));
+    assert!(!resp.has_cors());
 
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    ));
     assert_eq!(resp.status, 403);
+    assert!(!resp.has_cors());
 
     // 2. Security: disallowed Origin -> 403 (both OPTIONS and POST)
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\n\r\n"
+    ));
     assert_eq!(resp.status, 403);
-    assert!(!resp.headers.contains_key("access-control-allow-origin"));
+    assert!(!resp.has_cors());
 
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+    ));
     assert_eq!(resp.status, 403);
+    assert!(!resp.has_cors());
 
     // 3. Security: DNS rebinding Host header -> 403
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: attacker.example:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: attacker.example:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    ));
     assert_eq!(resp.status, 403);
-
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    assert_eq!(resp.status, 403);
+    assert!(!resp.has_cors());
 
     // 4. Security: missing or wrong Bearer token -> 401
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 401);
+    assert!(resp.has_cors());
+
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer wrongtoken\r\n\r\n"
+    ));
     assert_eq!(resp.status, 401);
 
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer wrongtoken\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    assert_eq!(resp.status, 401);
-
-    // 5. Security: Transfer-Encoding rejected -> 400
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    // 5. Security: Transfer-Encoding rejected -> 400 (readable by the allowed page)
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    ));
     assert_eq!(resp.status, 400);
+    assert!(resp.has_cors());
 
     // 6. Security: Non-JSON Content-Type on POST -> 415
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
-        )
-        .as_bytes(),
-    );
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
+    ));
     assert_eq!(resp.status, 415);
 
-    // 7. Security: Oversized body -> 413
-    let huge_len = MAX_BODY_BYTES + 1;
-    let resp = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {huge_len}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    assert_eq!(resp.status, 413);
-
-    // 8. Happy path: OPTIONS preflight
-    let preflight = send_raw_http(
-        addr,
-        format!(
-            "OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+    // 7. Happy path: OPTIONS preflight (no Private Network Access request header)
+    let preflight = h.send(&format!(
+        "OPTIONS /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"
+    ));
     assert_eq!(preflight.status, 204);
     assert_eq!(
         preflight
@@ -509,34 +710,24 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
         preflight.headers.get("vary").map(String::as_str),
         Some("Origin")
     );
-
-    // 9. Happy path: GET /v1/health
-    let health = send_raw_http(
-        addr,
-        format!(
-            "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        )
-        .as_bytes(),
+    assert!(
+        !preflight
+            .headers
+            .contains_key("access-control-allow-private-network")
     );
+
+    // 8. Happy path: GET /v1/health
+    let health = h.health();
     assert_eq!(health.status, 200);
-    let health_json: Value = serde_json::from_str(&health.body).unwrap();
+    let health_json = health.json();
     assert_eq!(health_json["status"], "ok");
     assert_eq!(health_json["transport"], "mock");
 
-    // 10. Happy path: POST /v1/connect
-    let connect = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
-        )
-        .as_bytes(),
-    );
-    assert_eq!(connect.status, 200);
-    let connect_json: Value = serde_json::from_str(&connect.body).unwrap();
-    let session_id = connect_json["session_id"].as_str().unwrap().to_string();
-    assert_eq!(session_id.len(), 32);
+    // 9. Happy path: POST /v1/connect (PIV SELECT inside one exclusive scope)
+    let session_id = h.connect();
+    assert_eq!(h.probe.scopes.load(Ordering::SeqCst), 1);
 
-    // 11. Security: Disallowed APDUs rejected with 403
+    // 10. Security: Disallowed APDUs rejected with 403
     let select_fido2 = Apdu::new(
         0x00,
         0xA4,
@@ -546,126 +737,48 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
     )
     .to_bytes()
     .unwrap();
-    assert_eq!(
-        post_transmit(addr, &token, &session_id, &select_fido2).status,
-        403
-    );
+    assert_eq!(h.transmit(&session_id, &select_fido2).status, 403);
 
     let put_data = Apdu::new(0x00, 0xDB, 0x3F, 0xFF, vec![0x5C, 0x03, 0x5F, 0xC1, 0x05])
         .to_bytes()
         .unwrap();
-    assert_eq!(
-        post_transmit(addr, &token, &session_id, &put_data).status,
-        403
-    );
+    assert_eq!(h.transmit(&session_id, &put_data).status, 403);
 
     let reset_piv = Apdu::new(0x00, 0xFB, 0x00, 0x00, vec![])
         .to_bytes()
         .unwrap();
-    assert_eq!(
-        post_transmit(addr, &token, &session_id, &reset_piv).status,
-        403
-    );
+    assert_eq!(h.transmit(&session_id, &reset_piv).status, 403);
 
-    // 12. Happy path: GET DATA + 61 XX GET RESPONSE -> parse cert -> derive Ethereum address
-    let get_cert_bytes = build_get_certificate_apdu(Slot::Authentication)
-        .to_bytes()
-        .unwrap();
-    let mut cert_data = Vec::new();
-    let mut resp_http = post_transmit(addr, &token, &session_id, &get_cert_bytes);
-    assert_eq!(resp_http.status, 200);
+    // 11. Happy path: GET DATA -> the bridge completes the 61 XX chain itself in
+    //     one exclusive scope and returns the whole certificate with 90 00.
+    let scopes_before = h.probe.scopes.load(Ordering::SeqCst);
+    let sent_before = h.probe.transmitted_count();
+    let cert_resp = h
+        .transmit_apdu(
+            &session_id,
+            &build_get_certificate_apdu(Slot::Authentication),
+        )
+        .apdu();
+    assert!(cert_resp.is_success());
+    assert_eq!(cert_resp.remaining_bytes(), None);
+    assert_eq!(h.probe.scopes.load(Ordering::SeqCst), scopes_before + 1);
+    let chain = h.probe.transmitted()[sent_before..].to_vec();
+    assert!(chain.len() > 2, "certificate must span several chunks");
+    assert!(chain.iter().all(|(_, in_scope)| *in_scope));
+    assert!(chain[1..].iter().all(|(apdu, _)| apdu[1] == 0xC0));
 
-    loop {
-        let json: Value = serde_json::from_str(&resp_http.body).unwrap();
-        let raw_resp = hex::decode(json["response"].as_str().unwrap()).unwrap();
-        let apdu_resp = ApduResponse::try_from_bytes(raw_resp).unwrap();
-        apdu_resp.check().unwrap();
-        cert_data.extend_from_slice(apdu_resp.data());
-        if let Some(rem) = apdu_resp.remaining_bytes() {
-            let get_resp_bytes = build_get_response_apdu(rem).to_bytes().unwrap();
-            resp_http = post_transmit(addr, &token, &session_id, &get_resp_bytes);
-            assert_eq!(resp_http.status, 200);
-        } else {
-            break;
-        }
-    }
-
-    let parsed_vk = parse_certificate_public_key(&cert_data).expect("valid P-256 cert");
+    let parsed_vk = parse_certificate_public_key(cert_resp.data()).expect("valid P-256 cert");
     assert_eq!(Address::from_public_key(&parsed_vk), expected_address);
 
-    // 13. Happy path: Management key mutual auth (AES-192) over bridge
-    let alg = ManagementKeyAlgorithm::Aes192;
-    let w_apdu = build_mgmt_auth_request_witness_apdu(alg)
-        .to_bytes()
-        .unwrap();
-    let w_http = post_transmit(addr, &token, &session_id, &w_apdu);
-    assert_eq!(w_http.status, 200);
-    let w_resp = ApduResponse::try_from_bytes(
-        hex::decode(
-            serde_json::from_str::<Value>(&w_http.body).unwrap()["response"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert!(w_resp.is_success());
-    let witness = parse_witness_response(w_resp.data(), alg.block_size()).unwrap();
-    let decrypted_witness = decrypt_mgmt_witness(alg, &TEST_MGMT_KEY, &witness).unwrap();
-    let host_challenge = [0x5Au8; 16];
-    let verify_mgmt_apdu = build_mgmt_auth_verify_apdu(alg, &decrypted_witness, &host_challenge)
-        .unwrap()
-        .to_bytes()
-        .unwrap();
-    let m_http = post_transmit(addr, &token, &session_id, &verify_mgmt_apdu);
-    assert_eq!(m_http.status, 200);
-    let m_resp = ApduResponse::try_from_bytes(
-        hex::decode(
-            serde_json::from_str::<Value>(&m_http.body).unwrap()["response"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert!(m_resp.is_success());
-    let card_resp = parse_challenge_response(m_resp.data(), alg.block_size()).unwrap();
-    let expected_card_resp = encrypt_mgmt_challenge(alg, &TEST_MGMT_KEY, &host_challenge).unwrap();
-    assert!(verify_mgmt_challenge_response(
-        &expected_card_resp,
-        &card_resp
-    ));
-
-    // 14. Happy path: VERIFY PIN (wrong -> 63 C2, then correct -> 90 00)
-    let bad_pin = build_verify_pin_apdu("000000").unwrap().to_bytes().unwrap();
-    let bad_http = post_transmit(addr, &token, &session_id, &bad_pin);
-    assert_eq!(bad_http.status, 200);
-    let bad_resp = ApduResponse::try_from_bytes(
-        hex::decode(
-            serde_json::from_str::<Value>(&bad_http.body).unwrap()["response"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    // 12. Happy path: VERIFY PIN (wrong -> 63 C2, then correct -> 90 00)
+    let bad_pin = build_verify_pin_apdu("000000").unwrap();
+    let bad_resp = h.transmit_apdu(&session_id, &bad_pin).apdu();
     assert_eq!(bad_resp.status_word(), 0x63C2);
 
-    let good_pin = build_verify_pin_apdu(TEST_PIN).unwrap().to_bytes().unwrap();
-    let good_http = post_transmit(addr, &token, &session_id, &good_pin);
-    assert_eq!(good_http.status, 200);
-    let good_resp = ApduResponse::try_from_bytes(
-        hex::decode(
-            serde_json::from_str::<Value>(&good_http.body).unwrap()["response"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert!(good_resp.is_success());
+    let good_pin = build_verify_pin_apdu(TEST_PIN).unwrap();
+    assert!(h.transmit_apdu(&session_id, &good_pin).apdu().is_success());
 
-    // 15. Happy path: GENERAL AUTHENTICATE sign EIP-1559 transaction hash & verify recovery
+    // 13. Happy path: GENERAL AUTHENTICATE sign EIP-1559 transaction hash & verify recovery
     let tx = Transaction::Eip1559(Eip1559Transaction {
         chain_id: 1,
         nonce: 7,
@@ -677,21 +790,9 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
         data: vec![],
         access_list: vec![],
     });
-    let tx_hash: [u8; 32] = tx.signing_hash().into();
-    let sign_apdu = build_sign_apdu(Slot::Authentication, &tx_hash)
-        .to_bytes()
-        .unwrap();
-    let sign_http = post_transmit(addr, &token, &session_id, &sign_apdu);
-    assert_eq!(sign_http.status, 200);
-    let sign_resp = ApduResponse::try_from_bytes(
-        hex::decode(
-            serde_json::from_str::<Value>(&sign_http.body).unwrap()["response"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let tx_hash: [u8; 32] = tx.signing_hash().unwrap().into();
+    let sign_apdu = build_sign_apdu(Slot::Authentication, &tx_hash);
+    let sign_resp = h.transmit_apdu(&session_id, &sign_apdu).apdu();
     assert!(sign_resp.is_success());
 
     let der_sig = parse_signature_response(sign_resp.data()).expect("valid DER sig TLV");
@@ -704,27 +805,20 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
         expected_vk.to_sec1_point(false)
     );
 
-    // 16. Happy path: POST /v1/disconnect -> subsequent transmit rejected with 409
-    let disc_body = serde_json::json!({ "session_id": session_id }).to_string();
-    let disc_http = send_raw_http(
-        addr,
-        format!(
-            "POST /v1/disconnect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{disc_body}",
-            disc_body.len()
-        )
-        .as_bytes(),
-    );
-    assert_eq!(disc_http.status, 200);
-    let disc_json: Value = serde_json::from_str(&disc_http.body).unwrap();
-    assert_eq!(disc_json["disconnected"], true);
+    // Every APDU reached the card inside an exclusive scope.
+    assert!(h.probe.transmitted().iter().all(|(_, in_scope)| *in_scope));
 
-    assert_eq!(
-        post_transmit(addr, &token, &session_id, &sign_apdu).status,
-        409
-    );
+    // 14. Happy path: POST /v1/disconnect releases the card; later transmit -> 409
+    h.assert_card_held();
+    let disc_http = h.disconnect(&session_id);
+    assert_eq!(disc_http.status, 200);
+    assert_eq!(disc_http.json()["disconnected"], true);
+    h.assert_card_released();
+
+    assert_no_session(&h.transmit_apdu(&session_id, &sign_apdu));
 
     // Clean deterministic shutdown
-    handle.shutdown();
+    h.handle.shutdown();
 }
 
 #[test]
@@ -794,4 +888,698 @@ fn bridge_connect_handles_select_wrong_le_and_get_response_chaining() {
     assert!(json["session_id"].as_str().is_some_and(|s| !s.is_empty()));
 
     handle.shutdown();
+}
+
+#[test]
+fn host_header_must_equal_bound_address() {
+    let h = start_bridge(default_config());
+    let port = h.port();
+    let token = &h.token;
+
+    let rejected = [
+        format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
+        format!("[::1]:{port}"),
+        format!("127.0.0.1.:{port}"),
+        format!("127.0.0.2:{port}"),
+        format!("127.000.000.001:{port}"),
+        format!("2130706433:{port}"),
+        format!("127.0.0.1:{}", port.wrapping_add(1)),
+        format!("127.0.0.1:0{port}"),
+        format!("127.0.0.1:{port}:"),
+        "127.0.0.1".to_string(),
+        String::new(),
+    ];
+    for host in rejected {
+        let resp = h.send(&format!(
+            "GET /v1/health HTTP/1.1\r\nHost: {host}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
+        ));
+        assert_eq!(resp.status, 403, "Host {host:?} must be rejected");
+        assert!(!resp.has_cors(), "no CORS headers for Host {host:?}");
+    }
+
+    // Missing Host -> 400 (RFC 9112 §3.2), no CORS
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 400);
+    assert!(!resp.has_cors());
+
+    // Optional whitespace around the value is not part of the field value.
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost:\t 127.0.0.1:{port} \r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 200);
+}
+
+#[test]
+fn strict_header_syntax_and_duplicates() {
+    let h = start_bridge(default_config());
+    let port = h.port();
+    let token = &h.token;
+    let base = format!(
+        "Host: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}"
+    );
+
+    // Structural errors: 400 without CORS headers.
+    let structural = [
+        // whitespace between field name and colon
+        format!(
+            "GET /v1/health HTTP/1.1\r\nHost : 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"
+        ),
+        // obs-fold continuation line
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nX-Folded: a\r\n  b\r\n\r\n"),
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nX-Folded: a\r\n\tb\r\n\r\n"),
+        // invalid field names
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nX Y: z\r\n\r\n"),
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\n: z\r\n\r\n"),
+        // bare LF line endings and bare CR
+        format!("GET /v1/health HTTP/1.1\nHost: 127.0.0.1:{port}\n\n"),
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nX-A: b\rc\r\n\r\n"),
+        // control character in a value
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nX-A: b\x01c\r\n\r\n"),
+        // duplicate Host / Origin / Authorization / Content-Type
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nOrigin: {ALLOWED_ORIGIN}\r\n\r\n"),
+        format!("GET /v1/health HTTP/1.1\r\n{base}\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        format!(
+            "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+        // malformed request line
+        format!("GET  /v1/health HTTP/1.1\r\n{base}\r\n\r\n"),
+        format!("GET /v1/health HTTP/2.0\r\n{base}\r\n\r\n"),
+    ];
+    for req in &structural {
+        let resp = h.send(req);
+        assert_eq!(resp.status, 400, "{req:?} -> {}", resp.body);
+        assert!(!resp.has_cors(), "{req:?} must not get CORS headers");
+    }
+
+    // Oversized header block -> 431 without CORS headers.
+    let padding = "a".repeat(MAX_HEADER_BYTES);
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\n{base}\r\nX-Pad: {padding}\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 431);
+    assert!(!resp.has_cors());
+
+    // Framing errors after a valid Host and allowed Origin: CORS headers present.
+    let framing = [
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+            400,
+        ),
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: two\r\n\r\n{{}}"
+            ),
+            400,
+        ),
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: +2\r\n\r\n{{}}"
+            ),
+            400,
+        ),
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: 2, 2\r\n\r\n{{}}"
+            ),
+            400,
+        ),
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: 99999999999999999999999999\r\n\r\n{{}}"
+            ),
+            413,
+        ),
+        // A body longer than Content-Length (pipelined bytes in the same segment)
+        (
+            format!(
+                "POST /v1/connect HTTP/1.1\r\n{base}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}GET /v1/health HTTP/1.1\r\n\r\n"
+            ),
+            400,
+        ),
+    ];
+    for (req, status) in &framing {
+        let resp = h.send(req);
+        assert_eq!(resp.status, *status, "{req:?} -> {}", resp.body);
+        assert!(resp.has_cors(), "{req:?} must get CORS headers");
+    }
+
+    // The card was never touched.
+    assert_eq!(h.probe.transmitted_count(), 0);
+}
+
+#[test]
+fn oversized_body_is_rejected_and_response_is_readable() {
+    let h = start_bridge(default_config());
+    let port = h.port();
+    let token = &h.token;
+    let body = "a".repeat(MAX_BODY_BYTES + 1);
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    assert_eq!(resp.status, 413);
+    assert!(resp.has_cors());
+    assert_eq!(h.probe.transmitted_count(), 0);
+
+    // A disallowed Origin with an oversized body: 403 without CORS, still readable.
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    assert_eq!(resp.status, 403);
+    assert!(!resp.has_cors());
+}
+
+#[test]
+fn preflight_private_network_access() {
+    let h = start_bridge(default_config());
+    let port = h.port();
+
+    let resp = h.send(&format!(
+        "OPTIONS /v1/transmit HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization,content-type\r\nAccess-Control-Request-Private-Network: true\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 204);
+    assert_eq!(
+        resp.headers
+            .get("access-control-allow-private-network")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        resp.headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some(ALLOWED_ORIGIN)
+    );
+
+    // Disallowed origin: 403 and neither CORS nor PNA headers.
+    let resp = h.send(&format!(
+        "OPTIONS /v1/transmit HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Private-Network: true\r\n\r\n"
+    ));
+    assert_eq!(resp.status, 403);
+    assert!(!resp.has_cors());
+    assert!(
+        !resp
+            .headers
+            .contains_key("access-control-allow-private-network")
+    );
+
+    // PNA header only on preflight, never on normal responses.
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {}\r\nAccess-Control-Request-Private-Network: true\r\n\r\n",
+        h.token
+    ));
+    assert_eq!(resp.status, 200);
+    assert!(
+        !resp
+            .headers
+            .contains_key("access-control-allow-private-network")
+    );
+}
+
+#[test]
+fn slow_clients_hit_the_total_request_deadline() {
+    let h = start_bridge(
+        default_config()
+            .with_request_timeout(Duration::from_millis(300))
+            .unwrap(),
+    );
+    let port = h.port();
+    let token = &h.token;
+
+    // Incomplete header block, then silence -> 408 without CORS.
+    let resp = h.send(&format!(
+        "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+    ));
+    assert_eq!(resp.status, 408);
+    assert!(!resp.has_cors());
+
+    // Complete headers, incomplete body -> 408 with CORS (Host/Origin already valid).
+    let resp = h.send(&format!(
+        "POST /v1/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{{}}"
+    ));
+    assert_eq!(resp.status, 408);
+    assert!(resp.has_cors());
+
+    // A client trickling one byte at a time still hits the total deadline: the
+    // per-read wait is paced by a short client read timeout, not a sleep.
+    let mut stream = TcpStream::connect(h.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Pad: ").as_bytes(),
+        )
+        .unwrap();
+    let started = Instant::now();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        assert!(
+            started.elapsed() < EVENT_TIMEOUT,
+            "server never enforced the request deadline"
+        );
+        if response.is_empty() {
+            let _ = stream.write_all(b"a");
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+    let resp = parse_http_response(response);
+    assert_eq!(resp.status, 408);
+
+    // A client that connects and sends nothing is closed without a response.
+    let mut idle = TcpStream::connect(h.addr).unwrap();
+    idle.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+    let mut out = Vec::new();
+    idle.read_to_end(&mut out).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn connection_limit_answers_503() {
+    let h = start_bridge(default_config());
+    let port = h.port();
+
+    // Hold every connection slot with an incomplete request.
+    let mut holders: Vec<TcpStream> = (0..MAX_CONCURRENT_CONNECTIONS)
+        .map(|_| {
+            let mut stream = TcpStream::connect(h.addr).unwrap();
+            stream
+                .write_all(
+                    format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n").as_bytes(),
+                )
+                .unwrap();
+            stream
+        })
+        .collect();
+
+    // Connections are accepted in order, so the next one finds every slot taken.
+    let mut extra = TcpStream::connect(h.addr).unwrap();
+    extra.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+    let mut out = Vec::new();
+    extra.read_to_end(&mut out).unwrap();
+    let resp = parse_http_response(out);
+    assert_eq!(resp.status, 503);
+    assert!(!resp.has_cors());
+
+    // The held connections are still served once they finish their request.
+    let mut first = holders.remove(0);
+    first
+        .write_all(
+            format!(
+                "Origin: {ALLOWED_ORIGIN}\r\nAuthorization: Bearer {}\r\n\r\n",
+                h.token
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    first.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+    let mut out = Vec::new();
+    first.read_to_end(&mut out).unwrap();
+    assert_eq!(parse_http_response(out).status, 200);
+    drop(holders);
+}
+
+#[test]
+fn concurrent_clients_are_served_and_exchanges_stay_atomic() {
+    let h = start_bridge(default_config());
+    let session_id = h.connect();
+    let expected_cert = h
+        .transmit_apdu(
+            &session_id,
+            &build_get_certificate_apdu(Slot::Authentication),
+        )
+        .apdu()
+        .data()
+        .to_vec();
+
+    let workers: Vec<_> = (0..8)
+        .map(|i| {
+            let h = h.client.clone();
+            let session_id = session_id.clone();
+            let expected_cert = expected_cert.clone();
+            thread::spawn(move || {
+                for _ in 0..5 {
+                    if i % 2 == 0 {
+                        assert_eq!(h.health().status, 200);
+                    } else {
+                        let resp = h
+                            .transmit_apdu(
+                                &session_id,
+                                &build_get_certificate_apdu(Slot::Authentication),
+                            )
+                            .apdu();
+                        assert!(resp.is_success());
+                        assert_eq!(resp.data(), expected_cert.as_slice());
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(h.probe.transmitted().iter().all(|(_, in_scope)| *in_scope));
+}
+
+#[test]
+fn session_ids_are_checked_and_replaced() {
+    let h = start_bridge(default_config());
+    let get_cert = build_get_certificate_apdu(Slot::Authentication);
+
+    let first = h.connect();
+    h.assert_card_held();
+
+    // Wrong session_id while a session is active: rejected, session unaffected.
+    assert_no_session(&h.transmit_apdu(&"0".repeat(32), &get_cert));
+    assert_no_session(&h.transmit_apdu(&first[..31], &get_cert));
+    assert_no_session(&h.disconnect("not-the-session"));
+    assert!(h.transmit_apdu(&first, &get_cert).apdu().is_success());
+    h.assert_card_held();
+
+    // A second connect replaces the first: the old card handle is released.
+    let second = h.connect();
+    assert_ne!(first, second);
+    h.assert_card_released();
+    assert_no_session(&h.transmit_apdu(&first, &get_cert));
+    assert_no_session(&h.disconnect(&first));
+    assert!(h.transmit_apdu(&second, &get_cert).apdu().is_success());
+
+    assert_eq!(h.disconnect(&second).status, 200);
+    h.assert_card_released();
+    assert_no_session(&h.transmit_apdu(&second, &get_cert));
+}
+
+#[test]
+fn idle_session_expires_and_releases_the_card() {
+    let h = start_bridge(
+        default_config()
+            .with_idle_timeout(Duration::from_millis(200))
+            .unwrap(),
+    );
+    let session_id = h.connect();
+
+    // No further request: the watchdog alone must release the card.
+    h.drops
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("idle watchdog must release the card handle");
+
+    // The expired id gets exactly the same answer as an unknown one.
+    let expired = h.transmit_apdu(
+        &session_id,
+        &build_get_certificate_apdu(Slot::Authentication),
+    );
+    let unknown = h.transmit_apdu(
+        &"f".repeat(32),
+        &build_get_certificate_apdu(Slot::Authentication),
+    );
+    assert_no_session(&expired);
+    assert_no_session(&unknown);
+    assert_eq!(expired.body, unknown.body);
+
+    // The bridge keeps working: a new session can be opened and expires again.
+    assert_eq!(h.health().status, 200);
+    let _again = h.connect();
+    h.drops
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("idle watchdog must release the second card handle");
+}
+
+#[test]
+fn shutdown_and_drop_release_the_card() {
+    let h = start_bridge(default_config());
+    let _session = h.connect();
+    h.assert_card_held();
+    let Harness { handle, drops, .. } = h;
+    handle.shutdown();
+    drops
+        .try_recv()
+        .expect("shutdown must release the card handle before returning");
+
+    let h = start_bridge(default_config());
+    let _session = h.connect();
+    let Harness { handle, drops, .. } = h;
+    drop(handle);
+    drops
+        .try_recv()
+        .expect("dropping the handle must release the card handle");
+}
+
+#[test]
+fn card_reset_and_device_loss_end_the_session() {
+    let h = start_bridge(default_config());
+    let sign = build_sign_apdu(Slot::Authentication, &[0x11; 32]);
+    let get_cert = build_get_certificate_apdu(Slot::Authentication);
+
+    // Card reset by another PC/SC client -> 409, session dropped.
+    let session = h.connect();
+    assert!(
+        h.transmit_apdu(&session, &build_verify_pin_apdu(TEST_PIN).unwrap())
+            .apdu()
+            .is_success()
+    );
+    h.probe.set_fault(0x87, 0x9A, Some(Fault::CardReset));
+    let resp = h.transmit_apdu(&session, &sign);
+    assert_eq!(resp.status, 409, "{}", resp.body);
+    assert!(resp.has_cors());
+    assert!(resp.error().contains("reset by another PC/SC client"));
+    h.assert_card_released();
+    assert_no_session(&h.transmit_apdu(&session, &get_cert));
+    h.probe.set_fault(0x87, 0x9A, None);
+
+    // Device or reader lost -> 503, session dropped.
+    let session = h.connect();
+    h.probe.set_fault(0xCB, 0xFF, Some(Fault::Disconnected));
+    let resp = h.transmit_apdu(&session, &get_cert);
+    assert_eq!(resp.status, 503, "{}", resp.body);
+    assert!(resp.has_cors());
+    h.assert_card_released();
+    assert_no_session(&h.transmit_apdu(&session, &get_cert));
+    h.probe.set_fault(0xCB, 0xFF, None);
+
+    // Any other transport error -> 502, session kept.
+    let session = h.connect();
+    h.probe.set_fault(0x20, 0x80, Some(Fault::Other));
+    let resp = h.transmit_apdu(&session, &build_verify_pin_apdu(TEST_PIN).unwrap());
+    assert_eq!(resp.status, 502, "{}", resp.body);
+    assert!(resp.has_cors());
+    h.assert_card_held();
+    assert!(h.transmit_apdu(&session, &get_cert).apdu().is_success());
+    h.probe.set_fault(0x20, 0x80, None);
+
+    // Card reset / device loss during the connect-time PIV SELECT.
+    h.probe.set_fault(0xA4, 0x00, Some(Fault::CardReset));
+    let resp = h.try_connect();
+    assert_eq!(resp.status, 409, "{}", resp.body);
+    h.probe.set_fault(0xA4, 0x00, Some(Fault::Disconnected));
+    assert_eq!(h.try_connect().status, 503);
+    h.probe.set_fault(0xA4, 0x00, None);
+    assert_no_session(&h.transmit_apdu(&session, &get_cert));
+}
+
+#[test]
+fn apdu_policy_over_http_without_key_generation() {
+    let h = start_bridge(default_config());
+    let session = h.connect();
+
+    // Rejected before reaching the card.
+    let mut select_chained = build_select_piv_apdu().to_bytes().unwrap();
+    select_chained[0] = 0x10;
+    let mut get_cert_channel = build_get_certificate_apdu(Slot::Authentication)
+        .to_bytes()
+        .unwrap();
+    get_cert_channel[0] = 0x01;
+    let rejected: Vec<Vec<u8>> = vec![
+        select_chained,
+        get_cert_channel,
+        build_get_response_apdu(0x20).to_bytes().unwrap(),
+        Apdu::new(0x00, 0xCB, 0x3F, 0xFF, vec![0x5C, 0x03, 0x5F, 0xC1, 0x02])
+            .to_bytes()
+            .unwrap(),
+        vec![0x00, 0xF7, 0x00, 0x9B, 0x00],
+        Apdu::new(0x00, 0x87, 0x07, 0x9A, vec![0x7C, 0x00])
+            .to_bytes()
+            .unwrap(),
+        Apdu::new(0x00, 0xFB, 0x00, 0x00, vec![])
+            .to_bytes()
+            .unwrap(),
+    ];
+    let gated: Vec<Vec<u8>> = vec![
+        build_generate_key_apdu(Slot::Authentication)
+            .to_bytes()
+            .unwrap(),
+        build_mgmt_auth_request_witness_apdu(ManagementKeyAlgorithm::Aes192)
+            .to_bytes()
+            .unwrap(),
+        build_delete_certificate_apdu(Slot::Authentication)
+            .to_bytes()
+            .unwrap(),
+    ];
+
+    let before = h.probe.transmitted_count();
+    for raw in &rejected {
+        let resp = h.transmit(&session, raw);
+        assert_eq!(resp.status, 403, "{} -> {}", hex::encode(raw), resp.body);
+        assert!(resp.has_cors());
+    }
+    for raw in &gated {
+        let resp = h.transmit(&session, raw);
+        assert_eq!(resp.status, 403, "{} -> {}", hex::encode(raw), resp.body);
+        assert!(resp.error().contains("--allow-generate"), "{}", resp.body);
+    }
+    assert_eq!(h.probe.transmitted_count(), before);
+
+    // Allowed for every bridge slot; the parsed APDU is forwarded byte-for-byte.
+    let mut allowed = vec![
+        build_select_piv_apdu(),
+        build_verify_pin_apdu(TEST_PIN).unwrap(),
+        Apdu::new(0x00, 0x20, 0x00, 0x80, vec![]),
+    ];
+    for slot in SLOTS {
+        allowed.push(build_get_metadata_apdu(slot));
+        allowed.push(build_get_certificate_apdu(slot));
+        allowed.push(build_sign_apdu(slot, &[0x42; 32]));
+    }
+    for apdu in &allowed {
+        let raw = apdu.to_bytes().unwrap();
+        let sent_before = h.probe.transmitted_count();
+        let resp = h.transmit(&session, &raw);
+        assert_eq!(resp.status, 200, "{} -> {}", hex::encode(&raw), resp.body);
+        assert_eq!(h.probe.transmitted()[sent_before].0, raw);
+    }
+}
+
+#[test]
+fn apdu_policy_over_http_with_key_generation() {
+    let h = start_bridge(default_config().with_allow_key_generation(true));
+    assert!(h.handle.allow_key_generation());
+    let session = h.connect();
+
+    // Management key mutual auth (AES-192)
+    let alg = ManagementKeyAlgorithm::Aes192;
+    let w_resp = h
+        .transmit_apdu(&session, &build_mgmt_auth_request_witness_apdu(alg))
+        .apdu();
+    assert!(w_resp.is_success());
+    let witness = parse_witness_response(w_resp.data(), alg.block_size()).unwrap();
+    let decrypted_witness = decrypt_mgmt_witness(alg, &TEST_MGMT_KEY, &witness).unwrap();
+    let host_challenge = [0x5Au8; 16];
+    let verify_mgmt =
+        build_mgmt_auth_verify_apdu(alg, &decrypted_witness, &host_challenge).unwrap();
+    let m_resp = h.transmit_apdu(&session, &verify_mgmt).apdu();
+    assert!(m_resp.is_success());
+    let card_resp = parse_challenge_response(m_resp.data(), alg.block_size()).unwrap();
+    let expected_card_resp = encrypt_mgmt_challenge(alg, &TEST_MGMT_KEY, &host_challenge).unwrap();
+    assert!(verify_mgmt_challenge_response(
+        &expected_card_resp,
+        &card_resp
+    ));
+
+    // GENERATE then delete the stale certificate
+    let gen_resp = h
+        .transmit_apdu(&session, &build_generate_key_apdu(Slot::Authentication))
+        .apdu();
+    assert!(gen_resp.is_success());
+    let public_key = parse_public_key_response(gen_resp.data()).expect("generated public key");
+    assert_eq!(public_key, *test_signing_key().verifying_key());
+    assert!(
+        h.transmit_apdu(
+            &session,
+            &build_delete_certificate_apdu(Slot::Authentication)
+        )
+        .apdu()
+        .is_success()
+    );
+
+    for slot in SLOTS {
+        for apdu in [
+            build_generate_key_apdu(slot),
+            build_delete_certificate_apdu(slot),
+        ] {
+            assert_eq!(h.transmit_apdu(&session, &apdu).status, 200);
+        }
+    }
+    for alg in [
+        ManagementKeyAlgorithm::Tdes,
+        ManagementKeyAlgorithm::Aes128,
+        ManagementKeyAlgorithm::Aes256,
+    ] {
+        assert_eq!(
+            h.transmit_apdu(&session, &build_mgmt_auth_request_witness_apdu(alg))
+                .status,
+            200
+        );
+    }
+
+    // Still rejected with key generation enabled.
+    let still_rejected: Vec<Vec<u8>> = vec![
+        Apdu::new(0x00, 0x47, 0x00, 0x9B, vec![0xAC, 0x03, 0x80, 0x01, 0x11])
+            .to_bytes()
+            .unwrap(),
+        Apdu::new(0x00, 0x47, 0x00, 0x9A, vec![0xAC, 0x03, 0x80, 0x01, 0x07])
+            .to_bytes()
+            .unwrap(),
+        Apdu::new(
+            0x00,
+            0xDB,
+            0x3F,
+            0xFF,
+            vec![0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x53, 0x01, 0x00],
+        )
+        .to_bytes()
+        .unwrap(),
+        Apdu::new(0x00, 0x24, 0x00, 0x80, vec![0xFF; 16])
+            .to_bytes()
+            .unwrap(),
+        {
+            let mut generate = build_generate_key_apdu(Slot::Authentication)
+                .to_bytes()
+                .unwrap();
+            generate[0] = 0x10;
+            generate
+        },
+    ];
+    let before = h.probe.transmitted_count();
+    for raw in &still_rejected {
+        assert_eq!(
+            h.transmit(&session, raw).status,
+            403,
+            "{} must be rejected",
+            hex::encode(raw)
+        );
+    }
+    assert_eq!(h.probe.transmitted_count(), before);
+}
+
+#[test]
+fn weak_explicit_tokens_are_rejected() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let origins = vec![ALLOWED_ORIGIN.to_string()];
+    for token in [
+        "wrongtoken".to_string(),
+        "x".repeat(MIN_TOKEN_LEN - 1),
+        format!("{} {}", "x".repeat(16), "y".repeat(16)),
+    ] {
+        assert!(BridgeConfig::new(addr, origins.clone(), Some(token), "mock").is_err());
+    }
+    let ipv6 = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+    assert!(BridgeConfig::new(ipv6, origins.clone(), None, "mock").is_err());
+
+    let token = "x".repeat(MIN_TOKEN_LEN);
+    let config = BridgeConfig::new(addr, origins, Some(token.clone()), "mock").unwrap();
+    let h = start_bridge(config);
+    assert_eq!(h.token, token);
+    assert_eq!(h.health().status, 200);
 }

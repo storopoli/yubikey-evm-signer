@@ -1,13 +1,26 @@
 //! YubiKey EVM Signer Core Library
 //!
-//! This crate provides the core functionality for signing Ethereum transactions
-//! using a YubiKey's PIV applet with secp256r1 (P-256) ECDSA.
+//! This crate provides the core functionality for signing Ethereum transaction
+//! hashes, EIP-712 typed data, and EIP-191 messages using a YubiKey's PIV applet
+//! with secp256r1 (P-256) ECDSA.
 //!
 //! # Overview
 //!
-//! With [EIP-7951], Ethereum supports native verification of secp256r1
-//! signatures, enabling hardware security modules like YubiKey to be used
-//! directly for transaction signing without curve conversion.
+//! With [EIP-7951], the EVM gains a `P256VERIFY` precompile that contracts can
+//! call to verify secp256r1 signatures, so a hardware key such as a YubiKey can
+//! sign for P-256-aware verifiers without curve conversion.
+//!
+//! # Addresses and accounts
+//!
+//! The [`Address`] derived from a P-256 key ([`Address::from_public_key`]) is
+//! `keccak256(X‖Y)[12..]`: an identifier of the key, **not** a secp256k1
+//! externally owned account. Ethereum mainnet and standard EVM chains validate
+//! transaction signatures with secp256k1 `ecrecover`, so a transaction signed
+//! here ([`Transaction::signed_rlp`]) is not accepted from that address, and
+//! nothing sent to that address on such chains can be spent with this key. The
+//! signatures are for verifiers that call `P256VERIFY` with a known public key
+//! `(qx, qy)`, such as smart accounts; give them the public key, which neither
+//! the signature nor the transaction carries.
 //!
 //! This library provides:
 //!
@@ -15,7 +28,7 @@
 //! - **EIP-712**: Typed structured data hashing for human-readable signing
 //! - **EIP-191**: Personal message hashing
 //! - **YubiKey Integration**: PIV applet communication for key management and signing
-//! - **Address Derivation**: Ethereum address computation from P-256 public keys
+//! - **Address Derivation**: Keccak-derived address identifiers of P-256 public keys
 //!
 //! # Architecture
 //!
@@ -57,8 +70,8 @@
 //!     access_list: vec![],
 //! });
 //!
-//! // Get the hash to sign
-//! let hash = tx.signing_hash();
+//! // Get the hash to sign (fails closed on chain ID 0)
+//! let hash = tx.signing_hash().unwrap();
 //! ```
 //!
 //! ## Signing with EIP-712 Typed Data
@@ -112,7 +125,7 @@
 //! Implement the [`yubikey::Transport`] trait for your platform:
 //!
 //! - **Native**: Enable the optional `pcsc` feature to use CCID/PC/SC for desktop applications
-//! - **Browser**: Use WebUSB for web applications (see `yubikey-evm-signer-wasm`)
+//! - **Browser**: Use the local PC/SC bridge or WebUSB (see `yubikey-evm-signer-wasm`)
 //!
 //! ```ignore
 //! use yubikey_evm_signer_core::yubikey::{ManagementKeyAlgorithm, PivSession, Slot, Transport};
@@ -122,16 +135,29 @@
 //!
 //! // Create a PIV session
 //! let mut session = PivSession::new(transport);
-//! session.select()?;
 //!
-//! // Authenticate management key before generating a key
-//! session.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
-//! let public_key = session.generate_key(Slot::Authentication)?;
+//! // Select, authenticate the management key, and generate a key (which also
+//! // deletes the slot's old certificate) in one PC/SC transaction
+//! let generated = session.exclusive(|piv| {
+//!     piv.select()?;
+//!     piv.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
+//!     piv.generate_key(Slot::Authentication)
+//! })?;
+//! let public_key = generated.public_key;
+//! if let Some(e) = &generated.certificate_delete_error {
+//!     eprintln!("old certificate still in the slot: {e}");
+//! }
 //!
-//! // Verify PIN and sign a 32-byte digest
-//! session.verify_pin("123456")?;
-//! let signature = session.sign(Slot::Authentication, &hash)?;
+//! // Select, verify the PIN, and sign a 32-byte digest in one PC/SC transaction
+//! // (returns the DER signature; see `crypto::create_ethereum_signature`)
+//! let der_signature = session.exclusive(|piv| {
+//!     piv.select()?;
+//!     piv.verify_pin_and_sign("123456", Slot::Authentication, &hash)
+//! })?;
 //! ```
+//!
+//! After [`Error::CardReset`] (another PC/SC client reset the card), select the
+//! applet and verify the PIN again.
 //!
 //! # Feature Flags
 //!
@@ -149,7 +175,9 @@
 //!
 //! [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
 
-// Silence unused dev-dependency warning in unit test target (rpassword is used by yubikey-cli)
+// Silence unused dev-dependency warnings in unit test target (ctrlc and rpassword are used by yubikey-cli)
+#[cfg(test)]
+use ctrlc as _;
 #[cfg(test)]
 use rpassword as _;
 

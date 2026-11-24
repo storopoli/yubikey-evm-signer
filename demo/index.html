@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <!--
+        GitHub Pages cannot set response headers, so the policy is delivered via <meta>.
+        It must stay before any other resource. No inline scripts, styles or event handlers.
+        'wasm-unsafe-eval' is required to compile the WASM module; connect-src 'self' covers
+        the .wasm fetch and http://127.0.0.1:* the local PC/SC bridge.
+        (frame-ancestors is ignored in <meta> policies, so it is not listed.)
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self' http://127.0.0.1:*; base-uri 'none'; form-action 'none'; object-src 'none'">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>YubiKey EVM Signer Demo</title>
     <link rel="stylesheet" href="styles.css">
@@ -29,7 +37,7 @@
             </ul>
             <p>Choose one of the following transports:</p>
             <ul class="platform-list">
-                <li><strong>Local PC/SC Bridge:</strong> <span class="status-badge supported">Recommended</span> &mdash; Works across macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave. Start it locally with <code>just cli-bridge</code> (or <code>cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge</code>), then paste the loopback URL and per-session bearer token below.</li>
+                <li><strong>Local PC/SC Bridge:</strong> <span class="status-badge supported">Recommended</span> &mdash; Works across macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave. Start it locally with <code>just cli-bridge</code> (or <code>cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge</code>), then paste the printed <code>http://127.0.0.1:&lt;port&gt;</code> URL and bearer token below.</li>
                 <li><strong>WebUSB:</strong> <span class="status-badge experimental">Experimental</span> &mdash; Only works for non-blocklisted CCID tokens or Chromium Isolated Web Apps with unrestricted USB permissions. On Linux, non-root USB access may also require <a href="https://developers.yubico.com/yubikey-manager/Device_Permissions.html" target="_blank" rel="noopener noreferrer">udev rules</a>.</li>
             </ul>
         </section>
@@ -53,7 +61,7 @@
             <div id="bridge-config" class="bridge-config">
                 <div class="form-grid">
                     <div class="form-group">
-                        <label for="bridge-url">Bridge URL (loopback only):</label>
+                        <label for="bridge-url">Bridge URL (http://127.0.0.1 only):</label>
                         <input type="text" id="bridge-url" value="http://127.0.0.1:8765" placeholder="http://127.0.0.1:8765">
                     </div>
                     <div class="form-group">
@@ -61,7 +69,7 @@
                         <input type="password" id="bridge-token" placeholder="Paste token from yubikey-cli bridge">
                     </div>
                 </div>
-                <p class="hint">Run <code>just cli-bridge</code> locally and paste the printed session bearer token. Only loopback URLs (<code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code>) are accepted.</p>
+                <p class="hint">Run <code>just cli-bridge</code> locally and paste the printed session bearer token. Only <code>http://127.0.0.1:&lt;port&gt;</code> is accepted, with any port except 80 (<code>localhost</code> and <code>[::1]</code> are rejected).</p>
             </div>
 
             <div class="button-row">
@@ -105,9 +113,14 @@
                 <button id="get-address-btn" class="secondary" disabled>Get Address</button>
             </div>
             <div class="result-group">
-                <label>Ethereum Address:</label>
+                <label>P-256 Public Key (0x04 &#8214; X &#8214; Y, for EIP-7951 P256VERIFY):</label>
+                <div id="public-key-display" class="address-display">-</div>
+            </div>
+            <div class="result-group">
+                <label>Derived Address (keccak256 of the P-256 key &mdash; not a standard EOA):</label>
                 <div id="address-display" class="address-display">-</div>
             </div>
+            <p class="hint">The derived address is <code>keccak256(X &#8214; Y)[12..]</code> of the slot's P-256 key. It is not a secp256k1 account: on standard EVM chains nothing can be sent from it and these signatures do not <code>ecrecover</code> to it. Contracts that verify them with <code>P256VERIFY</code> (EIP-7951), such as smart accounts, need the public key above.</p>
 
             <hr class="section-divider">
 
@@ -135,7 +148,8 @@
                 <button id="auth-mgmt-btn" class="secondary" disabled>Authenticate Management Key</button>
                 <button id="generate-key-btn" class="danger" disabled>Generate New Key</button>
             </div>
-            <p class="hint">Warning: Generate New Key permanently overwrites any existing key in the selected PIV slot. Authenticate the management key first.</p>
+            <p class="hint">Warning: Generate New Key permanently overwrites any existing key in the selected PIV slot and deletes the slot's old certificate. Authenticate the management key first.</p>
+            <p class="hint">Over the Local PC/SC Bridge, management key authentication and key generation require starting the bridge with <code>yubikey-cli bridge --allow-generate</code> (<code>just cli-bridge --allow-generate</code>); otherwise the bridge refuses them (403).</p>
         </section>
 
         <!-- Sign Transaction Section (EIP-1559) -->

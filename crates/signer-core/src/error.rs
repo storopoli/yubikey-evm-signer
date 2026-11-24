@@ -7,7 +7,7 @@
 //!
 //! - **YubiKey errors**: Device communication, PIN verification, and slot access
 //! - **Cryptographic errors**: Key generation, signing, and address derivation
-//! - **Transaction errors**: RLP encoding, EIP-712 hashing, and signature formatting
+//! - **Transaction errors**: Transaction validation, EIP-712 hashing, and signature formatting
 //!
 //! # Example
 //!
@@ -29,7 +29,6 @@
 //! }
 //! ```
 
-use alloy_rlp::Error as AlloyRlpError;
 use core::result::Result as CoreResult;
 use hex::FromHexError;
 use serde_json::Error as SerdeJsonError;
@@ -58,6 +57,19 @@ pub enum Error {
     #[error("YubiKey device disconnected")]
     DeviceDisconnected,
 
+    /// The card was reset by another application (or a power event) while connected.
+    ///
+    /// The transport handle has been re-established where possible, but the PIV
+    /// applet selection, PIN verification, and management key authentication are
+    /// gone: callers must select the PIV applet again and re-verify credentials
+    /// before retrying the failed operation.
+    #[error("YubiKey was reset by another application; select the PIV applet and verify again")]
+    CardReset,
+
+    /// The operation needs a verified PIN, but the PIN has not been verified in this session.
+    #[error("PIN verification required before this operation")]
+    PinRequired,
+
     /// The provided PIN is invalid.
     #[error(
         "invalid PIN{}",
@@ -81,10 +93,6 @@ pub enum Error {
     /// Management key mutual authentication failed.
     #[error("management key authentication failed")]
     AuthenticationFailed,
-
-    /// Touch confirmation was not received within the timeout period.
-    #[error("touch confirmation timeout")]
-    TouchTimeout,
 
     // =========================================================================
     // PIV Slot Errors
@@ -142,10 +150,6 @@ pub enum Error {
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
 
-    /// Failed to RLP encode the transaction.
-    #[error("RLP encoding failed: {0}")]
-    RlpEncodingFailed(String),
-
     /// The chain ID is invalid or unsupported.
     #[error("invalid chain ID: {0}")]
     InvalidChainId(u64),
@@ -189,12 +193,6 @@ impl From<SerdeJsonError> for Error {
     }
 }
 
-impl From<AlloyRlpError> for Error {
-    fn from(err: AlloyRlpError) -> Self {
-        Error::RlpEncodingFailed(err.to_string())
-    }
-}
-
 /// A specialized [`Result`] type for YubiKey EVM signer operations.
 ///
 /// This type alias is used throughout the library to avoid having to
@@ -220,6 +218,12 @@ mod tests {
             err.to_string(),
             "unexpected status word: SW1=0x69, SW2=0x82"
         );
+
+        assert_eq!(
+            Error::PinRequired.to_string(),
+            "PIN verification required before this operation"
+        );
+        assert!(Error::CardReset.to_string().contains("reset"));
     }
 
     #[test]

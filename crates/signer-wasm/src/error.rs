@@ -37,6 +37,20 @@ pub enum WasmError {
     /// The PIV applet could not be selected.
     PivSelectFailed(String),
 
+    /// The YubiKey was reset by another application; re-select and re-verify the PIN.
+    CardReset,
+
+    /// The session or the device is gone (bridge session expired, replaced or
+    /// closed by a card reset; bridge stopped answering, restarted with a new
+    /// token, or failed internally; reader lost, YubiKey unplugged, or the
+    /// WebUSB transport was closed after an unrecoverable error).
+    ///
+    /// The device must be reconnected; the message says why.
+    Disconnected(String),
+
+    /// The operation needs a verified PIN, but the PIN has not been verified yet.
+    PinRequired,
+
     /// PIN verification failed.
     InvalidPin {
         /// Remaining attempts reported by the card, if known.
@@ -110,6 +124,18 @@ impl fmt::Display for WasmError {
             Self::PivSelectFailed(msg) => {
                 write!(f, "Failed to select PIV applet: {msg}")
             }
+            Self::CardReset => {
+                write!(
+                    f,
+                    "YubiKey was reset by another application; reconnect and verify the PIN again"
+                )
+            }
+            Self::Disconnected(msg) => {
+                write!(f, "Disconnected: {msg}")
+            }
+            Self::PinRequired => {
+                write!(f, "PIN verification required before this operation")
+            }
             Self::InvalidPin {
                 remaining_attempts: Some(n),
             } => {
@@ -169,6 +195,16 @@ impl fmt::Display for WasmError {
 
 impl error::Error for WasmError {}
 
+impl WasmError {
+    /// Returns `true` if this error means the session or the device is gone, so
+    /// all PIN, management key and cached key state must be discarded and the
+    /// caller has to reconnect.
+    #[must_use]
+    pub const fn ends_session(&self) -> bool {
+        matches!(self, Self::Disconnected(_) | Self::CardReset)
+    }
+}
+
 impl From<WasmError> for JsValue {
     fn from(error: WasmError) -> Self {
         JsError::new(&error.to_string()).into()
@@ -179,11 +215,15 @@ impl From<CoreError> for WasmError {
     fn from(error: CoreError) -> Self {
         match error {
             CoreError::DeviceNotFound => Self::DeviceNotFound,
+            CoreError::CardReset => Self::CardReset,
+            CoreError::DeviceDisconnected => {
+                Self::Disconnected("YubiKey device disconnected; reconnect to continue".to_string())
+            }
+            CoreError::PinRequired => Self::PinRequired,
             CoreError::InvalidPin { remaining_attempts } => Self::InvalidPin { remaining_attempts },
             CoreError::PinLocked => Self::PinLocked,
             CoreError::SecurityStatusNotSatisfied => Self::SecurityStatusNotSatisfied,
             CoreError::AuthenticationFailed => Self::AuthenticationFailed,
-            CoreError::TouchTimeout => Self::Timeout,
             CoreError::InvalidTransaction(msg) => Self::InvalidTransaction(msg),
             CoreError::InvalidTypedData(msg) => Self::InvalidTypedData(msg),
             other => Self::CoreError(other.to_string()),
@@ -234,5 +274,22 @@ mod tests {
 
         let auth_err: WasmError = CoreError::AuthenticationFailed.into();
         assert_eq!(auth_err, WasmError::AuthenticationFailed);
+
+        let reset_err: WasmError = CoreError::CardReset.into();
+        assert_eq!(reset_err, WasmError::CardReset);
+        assert!(reset_err.to_string().contains("reset"));
+
+        let pin_required: WasmError = CoreError::PinRequired.into();
+        assert_eq!(pin_required, WasmError::PinRequired);
+        assert!(!pin_required.ends_session());
+
+        // Session-ending errors
+        assert!(reset_err.ends_session());
+        let gone: WasmError = CoreError::DeviceDisconnected.into();
+        assert!(gone.ends_session());
+        assert!(gone.to_string().starts_with("Disconnected: "));
+        assert!(gone.to_string().contains("reconnect"));
+        assert!(!WasmError::Timeout.ends_session());
+        assert!(!WasmError::BridgeError("x".to_string()).ends_session());
     }
 }
