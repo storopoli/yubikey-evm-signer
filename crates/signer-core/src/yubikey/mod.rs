@@ -12,7 +12,7 @@
 //! The module is organized into several submodules:
 //!
 //! - [`apdu`]: APDU command/response types and encoding
-//! - [`piv`]: PIV-specific commands and operations
+//! - [`piv`]: PIV-specific commands, sans-IO helpers, and session management
 //! - [`slot`]: PIV slot definitions and management
 //!
 //! # Transport Abstraction
@@ -27,19 +27,20 @@
 //! # Example
 //!
 //! ```ignore
-//! use yubikey_evm_signer_core::yubikey::{Transport, PivSession, Slot};
+//! use yubikey_evm_signer_core::yubikey::{ManagementKeyAlgorithm, PivSession, Slot, Transport};
 //!
 //! // Assuming you have a transport implementation
 //! let transport: Box<dyn Transport> = /* ... */;
 //! let mut session = PivSession::new(transport);
 //!
-//! // Authenticate with PIN
-//! session.verify_pin("123456")?;
+//! session.select()?;
 //!
-//! // Generate a key in slot 9a
+//! // Authenticate management key to generate a key in slot 9a
+//! session.authenticate_management_key_with(&mgmt_key, ManagementKeyAlgorithm::Aes192)?;
 //! let public_key = session.generate_key(Slot::Authentication)?;
 //!
-//! // Sign data
+//! // Verify PIN and sign a 32-byte digest
+//! session.verify_pin("123456")?;
 //! let signature = session.sign(Slot::Authentication, &data_to_sign)?;
 //! ```
 
@@ -51,7 +52,7 @@ pub mod slot;
 pub mod pcsc_transport;
 
 pub use apdu::{Apdu, ApduResponse};
-pub use piv::PivSession;
+pub use piv::{ManagementKeyAlgorithm, PivSession};
 pub use slot::Slot;
 
 #[cfg(feature = "pcsc")]
@@ -119,7 +120,7 @@ mod tests {
 
     #[test]
     fn mock_transport() {
-        let response = ApduResponse::new(vec![0x90, 0x00]);
+        let response = ApduResponse::try_from_bytes(vec![0x90, 0x00]).unwrap();
         let mut transport = MockTransport::new(vec![response]);
 
         let apdu = Apdu::new(0x00, 0xA4, 0x04, 0x00, vec![]);

@@ -16,8 +16,15 @@
 //!
 //! fn example() -> Result<(), Error> {
 //!     // Errors can be created from their specific variants
-//!     let err = Error::InvalidPin;
-//!     assert!(matches!(err, Error::InvalidPin));
+//!     let err = Error::InvalidPin {
+//!         remaining_attempts: Some(2),
+//!     };
+//!     assert!(matches!(
+//!         err,
+//!         Error::InvalidPin {
+//!             remaining_attempts: Some(2)
+//!         }
+//!     ));
 //!     Ok(())
 //! }
 //! ```
@@ -52,12 +59,28 @@ pub enum Error {
     DeviceDisconnected,
 
     /// The provided PIN is invalid.
-    #[error("invalid PIN")]
-    InvalidPin,
+    #[error(
+        "invalid PIN{}",
+        remaining_attempts
+            .map(|n| format!(" ({n} {} remaining)", if n == 1 { "attempt" } else { "attempts" }))
+            .unwrap_or_default()
+    )]
+    InvalidPin {
+        /// Number of remaining PIN attempts reported by the card, if known.
+        remaining_attempts: Option<u8>,
+    },
 
     /// The PIN has been locked after too many failed attempts.
     #[error("PIN is locked after too many failed attempts")]
     PinLocked,
+
+    /// Security status is not satisfied (PIN, management key, or touch confirmation required).
+    #[error("security status not satisfied (PIN, management key, or touch confirmation required)")]
+    SecurityStatusNotSatisfied,
+
+    /// Management key mutual authentication failed.
+    #[error("management key authentication failed")]
+    AuthenticationFailed,
 
     /// Touch confirmation was not received within the timeout period.
     #[error("touch confirmation timeout")]
@@ -203,11 +226,26 @@ mod tests {
     fn error_is_non_exhaustive() {
         // This test ensures the #[non_exhaustive] attribute is present
         // by checking that we can still match known variants
-        let err = Error::InvalidPin;
+        let err = Error::InvalidPin {
+            remaining_attempts: Some(2),
+        };
+        assert_eq!(err.to_string(), "invalid PIN (2 attempts remaining)");
         match err {
-            Error::InvalidPin => {}
+            Error::InvalidPin {
+                remaining_attempts: Some(2),
+            } => {}
             _ => panic!("unexpected variant"),
         }
+
+        let single = Error::InvalidPin {
+            remaining_attempts: Some(1),
+        };
+        assert_eq!(single.to_string(), "invalid PIN (1 attempt remaining)");
+
+        let unknown = Error::InvalidPin {
+            remaining_attempts: None,
+        };
+        assert_eq!(unknown.to_string(), "invalid PIN");
     }
 
     #[test]

@@ -1,20 +1,22 @@
-//! Cryptographic utilities for secp256r1 (P-256) ECDSA.
+//! Cryptographic utilities for secp256r1 (P-256) ECDSA and EIP-191 hashing.
 //!
 //! This module provides utilities for working with P-256 ECDSA signatures
 //! in the Ethereum context, including:
 //!
 //! - Signature normalization (low-S)
 //! - DER to raw signature conversion
-//! - Recovery parameter calculation
+//! - Public key recovery and recovery parameter calculation
+//! - Prehash signature verification (EIP-7951 compatible)
+//! - EIP-191 personal message hashing
 //!
 //! # Signature Format
 //!
-//! YubiKey returns signatures in DER format:
+//! YubiKey returns signatures in ASN.1 DER format:
 //! ```text
 //! 30 len 02 r_len r_bytes 02 s_len s_bytes
 //! ```
 //!
-//! Ethereum uses raw format: `r || s` (64 bytes total).
+//! Ethereum uses raw format: `r || s` (64 bytes total), plus recovery ID `v`.
 //!
 //! # Example
 //!
@@ -24,33 +26,58 @@
 //! // Parse a DER-encoded signature
 //! let der = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
 //! let (r, s) = parse_der_signature(&der).unwrap();
+//! assert_eq!(r[31], 1);
+//! assert_eq!(s[31], 2);
 //! ```
 
-use std::cmp::Ordering;
-
+use alloy_primitives::{B256, keccak256};
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+use p256::elliptic_curve::PrimeField;
+use p256::elliptic_curve::ops::Reduce;
+use p256::elliptic_curve::scalar::IsHigh;
 use p256::elliptic_curve::sec1::FromSec1Point;
-use p256::{AffinePoint, FieldBytes, Sec1Point};
+use p256::{AffinePoint, FieldBytes, NonZeroScalar, ProjectivePoint, Scalar, Sec1Point};
 
 use crate::error::{Error, Result};
 use crate::signature::Signature;
 
-/// The order of the secp256r1 (P-256) curve divided by 2.
+/// Computes the [EIP-191] personal message hash (`personal_sign`).
 ///
-/// Used for signature normalization (low-S form).
-const HALF_N: [u8; 32] = [
-    0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xDE, 0x73, 0x7D, 0x56, 0xD3, 0x8B, 0xCF, 0x42, 0x79, 0xDC, 0xE5, 0x61, 0x7E, 0x31, 0x92, 0xA8,
-];
+/// Formats the message as `"\x19Ethereum Signed Message:\n" || byte_len || message`
+/// and returns its Keccak-256 digest.
+///
+/// # Arguments
+///
+/// * `message` - The raw message bytes to hash
+///
+/// # Returns
+///
+/// The 32-byte Keccak-256 hash ready for signing.
+///
+/// # Example
+///
+/// ```
+/// use yubikey_evm_signer_core::crypto::eip191_hash;
+///
+/// let hash = eip191_hash(b"Hello, Ethereum!");
+/// assert!(!hash.is_zero());
+/// ```
+///
+/// [EIP-191]: https://eips.ethereum.org/EIPS/eip-191
+#[must_use]
+pub fn eip191_hash(message: &[u8]) -> B256 {
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut data = Vec::with_capacity(prefix.len() + message.len());
+    data.extend_from_slice(prefix.as_bytes());
+    data.extend_from_slice(message);
+    keccak256(&data)
+}
 
-/// The order of the secp256r1 (P-256) curve.
-const N: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
-];
-
-/// Parses a DER-encoded ECDSA signature into raw `(r, s)` components.
+/// Parses a canonical ASN.1 DER-encoded ECDSA signature into raw `(r, s)` components.
+///
+/// Strictly validates canonical DER structure, rejects trailing bytes, and ensures
+/// both scalars satisfy `1 <= r < N` and `1 <= s < N` for NIST P-256.
 ///
 /// # Arguments
 ///
@@ -58,11 +85,12 @@ const N: [u8; 32] = [
 ///
 /// # Returns
 ///
-/// A [`Result`] containing `(r, s)` as 32-byte arrays.
+/// A [`Result`] containing `(r, s)` as 32-byte big-endian arrays.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidSignature`] if the DER encoding is malformed.
+/// Returns [`Error::InvalidSignature`] if the DER encoding is malformed,
+/// non-canonical, contains trailing bytes, or has out-of-range scalars.
 ///
 /// # Example
 ///
@@ -76,167 +104,127 @@ const N: [u8; 32] = [
 /// assert_eq!(s[31], 2);
 /// ```
 pub fn parse_der_signature(der: &[u8]) -> Result<([u8; 32], [u8; 32])> {
-    if der.len() < 8 {
-        return Err(Error::InvalidSignature("DER too short".to_string()));
-    }
+    let sig = P256Signature::from_der(der)
+        .map_err(|_| Error::InvalidSignature("invalid ASN.1 DER signature".to_string()))?;
 
-    // Check sequence tag
-    if der[0] != 0x30 {
-        return Err(Error::InvalidSignature(
-            "invalid DER sequence tag".to_string(),
-        ));
-    }
-
-    let mut i = 2; // Skip tag and length
-
-    // Parse r
-    if der[i] != 0x02 {
-        return Err(Error::InvalidSignature("invalid r tag".to_string()));
-    }
-    i += 1;
-
-    let r_len = der[i] as usize;
-    i += 1;
-
-    if i + r_len > der.len() {
-        return Err(Error::InvalidSignature("r length overflow".to_string()));
-    }
-
-    let r_bytes = &der[i..i + r_len];
-    i += r_len;
-
-    // Parse s
-    if i >= der.len() || der[i] != 0x02 {
-        return Err(Error::InvalidSignature("invalid s tag".to_string()));
-    }
-    i += 1;
-
-    if i >= der.len() {
-        return Err(Error::InvalidSignature("missing s length".to_string()));
-    }
-
-    let s_len = der[i] as usize;
-    i += 1;
-
-    if i + s_len > der.len() {
-        return Err(Error::InvalidSignature("s length overflow".to_string()));
-    }
-
-    let s_bytes = &der[i..i + s_len];
-
-    // Convert to fixed 32-byte arrays (handle leading zeros and padding)
-    let r = to_fixed_bytes(r_bytes)?;
-    let s = to_fixed_bytes(s_bytes)?;
-
-    Ok((r, s))
+    let (r, s) = sig.split_bytes();
+    Ok((r.into(), s.into()))
 }
 
-/// Converts variable-length integer bytes to a fixed 32-byte array.
-fn to_fixed_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
-    let mut result = [0u8; 32];
-
-    // Skip leading zeros
-    let bytes = if !bytes.is_empty() && bytes[0] == 0x00 {
-        &bytes[1..]
-    } else {
-        bytes
-    };
-
-    if bytes.len() > 32 {
-        return Err(Error::InvalidSignature("integer too large".to_string()));
-    }
-
-    // Right-align in the 32-byte buffer
-    let offset = 32 - bytes.len();
-    result[offset..].copy_from_slice(bytes);
-
-    Ok(result)
-}
-
-/// Normalizes a signature to low-S form.
+/// Normalizes a P-256 signature scalar `s` to low-S form.
 ///
-/// Per BIP-62 and EIP-2, the S value should be in the lower half of the curve
-/// order to prevent signature malleability.
+/// Per BIP-62 and EIP-2, the `s` value must be in the lower half of the curve
+/// order (`1 <= s <= N / 2`) to prevent signature malleability.
 ///
 /// # Arguments
 ///
-/// * `r` - The R component (32 bytes)
-/// * `s` - The S component (32 bytes)
+/// * `s` - The 32-byte big-endian S component
 ///
 /// # Returns
 ///
-/// A tuple `(r, s, flipped)` where:
+/// A [`Result`] containing `(normalized_s, flipped)` where `flipped` is `true`
+/// if `s` was replaced by `N - s`.
 ///
-/// - `r` is unchanged
-/// - `s` is normalized to low-S form
-/// - `flipped` indicates if S was negated
+/// # Errors
+///
+/// Returns [`Error::InvalidSignature`] if `s == 0` or `s >= N`.
 ///
 /// # Example
 ///
 /// ```
 /// use yubikey_evm_signer_core::crypto::normalize_s;
 ///
-/// let r = [0u8; 32];
-/// // A value larger than HALF_N but less than N (high S)
-/// let mut s = [0x80u8; 32]; // Starts with 0x80, which is > HALF_N[0] = 0x7F
-/// let (_, normalized_s, flipped) = normalize_s(r, s);
-/// assert!(flipped); // S was in the upper half
+/// // A value larger than N/2 but less than N (high S)
+/// let s = [0x80u8; 32];
+/// let (normalized_s, flipped) = normalize_s(s).unwrap();
+/// assert!(flipped);
+/// assert_ne!(normalized_s, s);
 /// ```
-#[must_use]
-pub fn normalize_s(r: [u8; 32], s: [u8; 32]) -> ([u8; 32], [u8; 32], bool) {
-    // Check if S > N/2
-    let s_high = compare_bytes(&s, &HALF_N) == std::cmp::Ordering::Greater;
+pub fn normalize_s(s: [u8; 32]) -> Result<([u8; 32], bool)> {
+    let scalar = NonZeroScalar::from_repr(FieldBytes::from(s))
+        .into_option()
+        .ok_or_else(|| {
+            Error::InvalidSignature("signature scalar s must be in range 1..N".to_string())
+        })?;
 
-    if s_high {
-        // Compute N - S
-        let s_negated = subtract_mod_n(&N, &s);
-        (r, s_negated, true)
+    if bool::from(scalar.is_high()) {
+        let negated = -scalar;
+        Ok((negated.to_repr().into(), true))
     } else {
-        (r, s, false)
+        Ok((s, false))
     }
 }
 
-/// Compares two 32-byte arrays as big-endian integers.
-fn compare_bytes(a: &[u8; 32], b: &[u8; 32]) -> Ordering {
-    for i in 0..32 {
-        match a[i].cmp(&b[i]) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Computes a - b mod N for 32-byte big-endian integers.
-fn subtract_mod_n(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    let mut borrow: u16 = 0;
-
-    for i in (0..32).rev() {
-        let diff = (a[i] as i32) - (b[i] as i32) - (borrow as i32);
-        if diff < 0 {
-            result[i] = (diff + 256) as u8;
-            borrow = 1;
-        } else {
-            result[i] = diff as u8;
-            borrow = 0;
-        }
-    }
-
-    result
-}
-
-/// Calculates the recovery parameter (V) for a signature.
+/// Recovers a P-256 verifying key from a prehashed digest, signature scalars, and recovery ID.
 ///
-/// The recovery parameter allows recovering the public key from a signature,
-/// which is essential for Ethereum transaction verification.
+/// Computes `Q = r^-1 * (s * R - z * G)` on NIST P-256 where `R` is the curve point
+/// with x-coordinate `r` and y-parity `recovery_id & 1`.
+///
+/// # Arguments
+///
+/// * `hash` - The 32-byte prehashed message digest
+/// * `r` - The 32-byte big-endian R scalar
+/// * `s` - The 32-byte big-endian S scalar
+/// * `recovery_id` - The recovery parameter (`0` for even Y, `1` for odd Y)
+///
+/// # Returns
+///
+/// A [`Result`] containing the recovered [`VerifyingKey`].
+///
+/// # Errors
+///
+/// - [`Error::RecoveryParameterFailed`] if `recovery_id >= 2`, `R` cannot be decompressed,
+///   or the recovered point is at infinity
+/// - [`Error::InvalidSignature`] if `r` or `s` is zero or `>= N`
+pub fn try_recover_public_key(
+    hash: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    recovery_id: u8,
+) -> Result<VerifyingKey> {
+    if recovery_id >= 2 {
+        return Err(Error::RecoveryParameterFailed);
+    }
+
+    let sig = P256Signature::from_scalars(FieldBytes::from(*r), FieldBytes::from(*s))
+        .map_err(|_| Error::InvalidSignature("signature scalars must be in range 1..N".into()))?;
+
+    // Decompress R from x = r and y-parity = recovery_id & 1
+    let mut compressed_r = [0u8; 33];
+    compressed_r[0] = 0x02 | (recovery_id & 1);
+    compressed_r[1..].copy_from_slice(r);
+
+    let sec1_r =
+        Sec1Point::from_bytes(&compressed_r).map_err(|_| Error::RecoveryParameterFailed)?;
+    let r_affine = AffinePoint::from_sec1_point(&sec1_r)
+        .into_option()
+        .ok_or(Error::RecoveryParameterFailed)?;
+    let r_point = ProjectivePoint::from(r_affine);
+
+    // Compute Q = r^-1 * (s * R - z * G)
+    let (r_scalar, s_scalar) = sig.split_scalars();
+    let z = <Scalar as Reduce<p256::U256>>::reduce(&p256::U256::from_be_slice(hash));
+    let r_inv = r_scalar
+        .invert()
+        .into_option()
+        .ok_or(Error::RecoveryParameterFailed)?;
+    let u1 = -(r_inv * z);
+    let u2 = r_inv * *s_scalar;
+
+    let q_point = (ProjectivePoint::GENERATOR * u1) + (r_point * u2);
+    VerifyingKey::from_affine(q_point.to_affine()).map_err(|_| Error::RecoveryParameterFailed)
+}
+
+/// Calculates the recovery parameter (`v`) for a signature and expected public key.
+///
+/// Tests recovery IDs `0` and `1` and returns the one that recovers `public_key`.
 ///
 /// # Arguments
 ///
 /// * `hash` - The message hash that was signed (32 bytes)
 /// * `r` - The R component of the signature (32 bytes)
 /// * `s` - The S component of the signature (32 bytes)
-/// * `public_key` - The expected public key
+/// * `public_key` - The expected signing public key
 ///
 /// # Returns
 ///
@@ -244,54 +232,28 @@ fn subtract_mod_n(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 ///
 /// # Errors
 ///
-/// Returns [`Error::RecoveryParameterFailed`] if the recovery parameter cannot
-/// be determined.
+/// - [`Error::InvalidSignature`] if `r` or `s` is zero or `>= N`
+/// - [`Error::RecoveryParameterFailed`] if neither recovery ID recovers `public_key`
 pub fn calculate_recovery_parameter(
     hash: &[u8; 32],
     r: &[u8; 32],
     s: &[u8; 32],
     public_key: &VerifyingKey,
 ) -> Result<u8> {
-    // Try both possible recovery IDs
-    for recovery_id in 0u8..2u8 {
-        if let Ok(recovered) = try_recover_public_key(hash, r, s, recovery_id) {
-            // Compare public keys
-            let expected_point = public_key.to_sec1_point(false);
-            let recovered_point = recovered.to_sec1_point(false);
+    // Validate scalars upfront so callers receive InvalidSignature for bad scalars
+    let _ = P256Signature::from_scalars(FieldBytes::from(*r), FieldBytes::from(*s))
+        .map_err(|_| Error::InvalidSignature("signature scalars must be in range 1..N".into()))?;
 
-            if expected_point == recovered_point {
-                return Ok(recovery_id);
-            }
+    let expected_point = public_key.to_sec1_point(false);
+
+    for recovery_id in 0u8..2u8 {
+        if let Ok(recovered) = try_recover_public_key(hash, r, s, recovery_id)
+            && recovered.to_sec1_point(false) == expected_point
+        {
+            return Ok(recovery_id);
         }
     }
 
-    Err(Error::RecoveryParameterFailed)
-}
-
-/// Attempts to recover a public key from a signature.
-fn try_recover_public_key(
-    hash: &[u8; 32],
-    r: &[u8; 32],
-    s: &[u8; 32],
-    recovery_id: u8,
-) -> Result<VerifyingKey> {
-    // Construct the P-256 signature
-    let r_field = FieldBytes::from(*r);
-    let s_field = FieldBytes::from(*s);
-
-    // For P-256 recovery, we need to:
-    // 1. Compute the curve point R from r and recovery_id
-    // 2. Compute the public key as: Q = r^-1 * (s*R - e*G)
-    //
-    // This is complex to implement from scratch, so we use a verification approach:
-    // Try both possible points and verify the signature.
-
-    let sig = P256Signature::from_scalars(r_field, s_field)
-        .map_err(|_| Error::InvalidSignature("invalid signature scalars".to_string()))?;
-
-    // For now, return an error - full recovery requires more complex implementation
-    // In practice, we would use the ecdsa crate's recovery functionality
-    let _ = (hash, sig, recovery_id);
     Err(Error::RecoveryParameterFailed)
 }
 
@@ -299,14 +261,14 @@ fn try_recover_public_key(
 ///
 /// This function:
 ///
-/// 1. Parses the DER signature
-/// 2. Normalizes S to low-S form
-/// 3. Calculates the recovery parameter
+/// 1. Parses and validates the canonical DER signature
+/// 2. Normalizes `s` to low-S form
+/// 3. Calculates and verifies the recovery parameter (`0` or `1`)
 ///
 /// # Arguments
 ///
 /// * `der_signature` - The DER-encoded signature from YubiKey
-/// * `hash` - The message hash that was signed
+/// * `hash` - The 32-byte message hash that was signed
 /// * `public_key` - The signing public key
 ///
 /// # Returns
@@ -315,48 +277,43 @@ fn try_recover_public_key(
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidSignature`] if parsing, normalization, or recovery parameter calculation fails.
+/// - [`Error::InvalidSignature`] if DER parsing or scalar validation fails
+/// - [`Error::RecoveryParameterFailed`] if the signature does not match `public_key`
 pub fn create_ethereum_signature(
     der_signature: &[u8],
     hash: &[u8; 32],
     public_key: &VerifyingKey,
 ) -> Result<Signature> {
-    // Parse DER
     let (r, s) = parse_der_signature(der_signature)?;
+    let (s, _) = normalize_s(s)?;
+    let v = calculate_recovery_parameter(hash, &r, &s, public_key)?;
 
-    // Normalize S
-    let (r, s, s_flipped) = normalize_s(r, s);
-
-    // Calculate recovery parameter
-    // Note: If S was flipped, we need to adjust the recovery parameter
-    let v = calculate_recovery_parameter(hash, &r, &s, public_key).unwrap_or({
-        // Fallback: try the opposite parity if flipped
-        if s_flipped { 1 } else { 0 }
-    });
-
-    Ok(Signature::new(r, s, v))
+    Signature::new(r, s, v)
 }
 
-/// Verifies a signature against a public key.
+/// Verifies a P-256 signature against a prehashed 32-byte digest and public key.
+///
+/// Uses raw prehash verification (matching [EIP-7951] and YubiKey PIV signing)
+/// without applying an additional SHA-256 hash.
 ///
 /// # Arguments
 ///
-/// * `hash` - The message hash that was signed
+/// * `hash` - The 32-byte prehashed message digest
 /// * `signature` - The signature to verify
 /// * `public_key` - The public key to verify against
 ///
 /// # Returns
 ///
 /// [`true`](bool) if the signature is valid, [`false`](bool) otherwise.
+///
+/// [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
 #[must_use]
 pub fn verify_signature(hash: &[u8; 32], signature: &Signature, public_key: &VerifyingKey) -> bool {
-    use p256::ecdsa::signature::Verifier;
-
     let r_field = FieldBytes::from(*signature.r());
     let s_field = FieldBytes::from(*signature.s());
 
     if let Ok(sig) = P256Signature::from_scalars(r_field, s_field) {
-        public_key.verify(hash, &sig).is_ok()
+        public_key.verify_prehash(hash, &sig).is_ok()
     } else {
         false
     }
@@ -392,6 +349,8 @@ pub fn verify_signature(hash: &[u8; 32], signature: &Signature, public_key: &Ver
 /// // Invalid input (all zeros - invalid public key)
 /// assert!(!p256_verify(&[0u8; 160]));
 /// ```
+///
+/// [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
 #[must_use]
 pub fn p256_verify(input: &[u8]) -> bool {
     // 1. Check input length is exactly 160 bytes
@@ -436,11 +395,27 @@ pub fn p256_verify(input: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use p256::ecdsa::SigningKey;
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+
     use super::*;
+
+    /// The order N of NIST P-256.
+    const P256_N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    /// Half the order N/2 of NIST P-256.
+    const P256_HALF_N: [u8; 32] = [
+        0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xDE, 0x73, 0x7D, 0x56, 0xD3, 0x8B, 0xCF, 0x42, 0x79, 0xDC, 0xE5, 0x61, 0x7E, 0x31,
+        0x92, 0xA8,
+    ];
 
     #[test]
     fn parse_der_signature_simple() {
-        // Simple DER: r=1, s=2 (minimal encoding)
         let der = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
         let (r, s) = parse_der_signature(&der).unwrap();
 
@@ -451,7 +426,6 @@ mod tests {
 
     #[test]
     fn parse_der_signature_with_leading_zero() {
-        // DER with leading zero for high bit
         let der = vec![0x30, 0x08, 0x02, 0x02, 0x00, 0x80, 0x02, 0x02, 0x00, 0x90];
         let (r, s) = parse_der_signature(&der).unwrap();
 
@@ -460,95 +434,215 @@ mod tests {
     }
 
     #[test]
-    fn parse_der_signature_invalid_tag() {
-        let der = vec![0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
-        assert!(parse_der_signature(&der).is_err());
-    }
-
-    #[test]
-    fn parse_der_signature_too_short() {
-        let der = vec![0x30, 0x04];
-        assert!(parse_der_signature(&der).is_err());
+    fn parse_der_signature_rejects_malformed() {
+        // Invalid tag
+        assert!(parse_der_signature(&[0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]).is_err());
+        // Too short
+        assert!(parse_der_signature(&[0x30, 0x04]).is_err());
+        // Trailing bytes
+        assert!(
+            parse_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x00]).is_err()
+        );
+        // Non-canonical leading zero when high bit is not set
+        assert!(
+            parse_der_signature(&[0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x02]).is_err()
+        );
+        // Zero scalar r = 0
+        assert!(parse_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x02]).is_err());
+        // Zero scalar s = 0
+        assert!(parse_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00]).is_err());
+        // Negative integer (high bit set without 0x00 prefix)
+        assert!(parse_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x02]).is_err());
+        // Scalar >= N (r = N)
+        let mut der_n = vec![0x30, 0x28, 0x02, 0x21, 0x00];
+        der_n.extend_from_slice(&P256_N);
+        der_n.extend_from_slice(&[0x02, 0x01, 0x01]);
+        assert!(parse_der_signature(&der_n).is_err());
     }
 
     #[test]
     fn normalize_s_low() {
-        // S already in lower half
-        let r = [0u8; 32];
         let mut s = [0u8; 32];
         s[31] = 1;
 
-        let (r_out, s_out, flipped) = normalize_s(r, s);
-
-        assert_eq!(r_out, r);
+        let (s_out, flipped) = normalize_s(s).unwrap();
         assert_eq!(s_out, s);
         assert!(!flipped);
+
+        // HALF_N itself is still low-S
+        let (half_out, half_flipped) = normalize_s(P256_HALF_N).unwrap();
+        assert_eq!(half_out, P256_HALF_N);
+        assert!(!half_flipped);
     }
 
     #[test]
     fn normalize_s_high() {
-        // S in upper half (larger than HALF_N but less than N)
-        // Use HALF_N + 1 as our test value
-        let r = [0u8; 32];
-        let mut s = HALF_N;
-        // Add 1 to HALF_N to get a value in the upper half
+        // HALF_N + 1 is the smallest high-S value
+        let mut s = P256_HALF_N;
         let mut carry = 1u16;
-        for i in (0..32).rev() {
-            let sum = s[i] as u16 + carry;
-            s[i] = sum as u8;
+        for byte in s.iter_mut().rev() {
+            let sum = u16::from(*byte) + carry;
+            *byte = sum as u8;
             carry = sum >> 8;
         }
 
-        let (r_out, s_out, flipped) = normalize_s(r, s);
-
-        assert_eq!(r_out, r);
+        let (s_out, flipped) = normalize_s(s).unwrap();
         assert!(flipped);
-        // s_out should be smaller than or equal to HALF_N
-        assert!(compare_bytes(&s_out, &HALF_N) <= std::cmp::Ordering::Equal);
+        // N - (HALF_N + 1) == HALF_N because N is odd
+        assert_eq!(s_out, P256_HALF_N);
     }
 
     #[test]
-    fn compare_bytes_works() {
-        let a = [0u8; 32];
-        let b = [0u8; 32];
-        assert_eq!(compare_bytes(&a, &b), Ordering::Equal);
-
-        let mut c = [0u8; 32];
-        c[0] = 1;
-        assert_eq!(compare_bytes(&c, &a), Ordering::Greater);
-        assert_eq!(compare_bytes(&a, &c), Ordering::Less);
+    fn normalize_s_rejects_zero_and_out_of_range() {
+        assert!(matches!(
+            normalize_s([0u8; 32]),
+            Err(Error::InvalidSignature(_))
+        ));
+        assert!(matches!(
+            normalize_s(P256_N),
+            Err(Error::InvalidSignature(_))
+        ));
+        assert!(matches!(
+            normalize_s([0xFF; 32]),
+            Err(Error::InvalidSignature(_))
+        ));
     }
 
     #[test]
-    fn subtract_mod_n_works() {
-        let a = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x05,
-        ];
-        let b = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x03,
-        ];
-        let result = subtract_mod_n(&a, &b);
+    fn end_to_end_sign_recover_verify_and_eip7951() {
+        let key_bytes =
+            hex::decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+                .unwrap();
+        let signing_key =
+            SigningKey::from_bytes(&FieldBytes::try_from(key_bytes.as_slice()).unwrap()).unwrap();
+        let verifying_key = *signing_key.verifying_key();
 
-        let mut expected = [0u8; 32];
-        expected[31] = 2;
-        assert_eq!(result, expected);
+        let other_key_bytes =
+            hex::decode("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        let other_verifying_key =
+            *SigningKey::from_bytes(&FieldBytes::try_from(other_key_bytes.as_slice()).unwrap())
+                .unwrap()
+                .verifying_key();
+
+        let mut saw_v0 = false;
+        let mut saw_v1 = false;
+        let mut saw_high_s = false;
+
+        // Sign multiple messages to cover both v=0 and v=1 and high-S normalization
+        for i in 0u32..32 {
+            let hash: [u8; 32] = keccak256(format!("message-{i}")).into();
+            let raw_sig: P256Signature = signing_key.sign_prehash(&hash).unwrap();
+            let (_, raw_s) = raw_sig.split_bytes();
+            let raw_s_arr: [u8; 32] = raw_s.into();
+            if normalize_s(raw_s_arr).unwrap().1 {
+                saw_high_s = true;
+            }
+
+            let der_sig = raw_sig.to_der();
+            let eth_sig =
+                create_ethereum_signature(der_sig.as_bytes(), &hash, &verifying_key).unwrap();
+
+            match eth_sig.v() {
+                0 => saw_v0 = true,
+                1 => saw_v1 = true,
+                other => panic!("unexpected v={other}"),
+            }
+
+            // Low-S check
+            assert!(!normalize_s(*eth_sig.s()).unwrap().1);
+
+            // Direct prehash verification must succeed for the real key and fail for wrong key
+            assert!(verify_signature(&hash, &eth_sig, &verifying_key));
+            assert!(!verify_signature(&hash, &eth_sig, &other_verifying_key));
+
+            // Public key recovery must reproduce exact verifying key
+            let recovered =
+                try_recover_public_key(&hash, eth_sig.r(), eth_sig.s(), eth_sig.v()).unwrap();
+            assert_eq!(
+                recovered.to_sec1_point(false),
+                verifying_key.to_sec1_point(false)
+            );
+
+            // EIP-7951 precompile verification must also succeed
+            let pubkey_sec1 = verifying_key.to_sec1_point(false);
+            let mut input = Vec::with_capacity(160);
+            input.extend_from_slice(&hash);
+            input.extend_from_slice(eth_sig.r());
+            input.extend_from_slice(eth_sig.s());
+            input.extend_from_slice(&pubkey_sec1.as_bytes()[1..65]);
+            assert!(p256_verify(&input));
+
+            // Wrong public key must return RecoveryParameterFailed (no fallback!)
+            let wrong = create_ethereum_signature(der_sig.as_bytes(), &hash, &other_verifying_key);
+            assert!(matches!(wrong, Err(Error::RecoveryParameterFailed)));
+        }
+
+        assert!(saw_v0, "expected to observe v=0 across test messages");
+        assert!(saw_v1, "expected to observe v=1 across test messages");
+        assert!(saw_high_s, "expected to observe high-S normalization");
     }
 
     #[test]
-    fn to_fixed_bytes_works() {
-        // Small number
-        let bytes = vec![0x01, 0x02];
-        let result = to_fixed_bytes(&bytes).unwrap();
-        assert_eq!(result[30], 0x01);
-        assert_eq!(result[31], 0x02);
+    fn try_recover_public_key_rejects_invalid_inputs() {
+        let hash = [0x11u8; 32];
+        let one = {
+            let mut b = [0u8; 32];
+            b[31] = 1;
+            b
+        };
 
-        // With leading zero
-        let bytes = vec![0x00, 0x80];
-        let result = to_fixed_bytes(&bytes).unwrap();
-        assert_eq!(result[31], 0x80);
+        // recovery_id >= 2
+        assert!(matches!(
+            try_recover_public_key(&hash, &one, &one, 2),
+            Err(Error::RecoveryParameterFailed)
+        ));
+        assert!(matches!(
+            try_recover_public_key(&hash, &one, &one, 27),
+            Err(Error::RecoveryParameterFailed)
+        ));
+
+        // Zero r or s
+        assert!(matches!(
+            try_recover_public_key(&hash, &[0u8; 32], &one, 0),
+            Err(Error::InvalidSignature(_))
+        ));
+        assert!(matches!(
+            try_recover_public_key(&hash, &one, &[0u8; 32], 0),
+            Err(Error::InvalidSignature(_))
+        ));
+
+        // Out-of-range r or s (>= N)
+        assert!(matches!(
+            try_recover_public_key(&hash, &P256_N, &one, 0),
+            Err(Error::InvalidSignature(_))
+        ));
+        assert!(matches!(
+            try_recover_public_key(&hash, &one, &P256_N, 0),
+            Err(Error::InvalidSignature(_))
+        ));
+    }
+
+    #[test]
+    fn eip191_known_answer_vectors() {
+        // Known-answer vector: keccak256("\x19Ethereum Signed Message:\n11hello world")
+        let hash = eip191_hash(b"hello world");
+        assert_eq!(
+            hex::encode(hash),
+            "d9eba16ed0ecae432b71fe008c98cc872bb4cc214d3220a36f365326cf807d68"
+        );
+
+        // Empty message: keccak256("\x19Ethereum Signed Message:\n0")
+        let empty = eip191_hash(b"");
+        assert_eq!(
+            hex::encode(empty),
+            "5f35dce98ba4fba25530a026ed80b2cecdaa31091ba4958b99b52ea1d068adad"
+        );
+
+        // Multi-byte UTF-8 message uses byte length (not char count)
+        let utf8_msg = "🔥"; // 4 UTF-8 bytes
+        let utf8_hash = eip191_hash(utf8_msg.as_bytes());
+        let expected = keccak256(b"\x19Ethereum Signed Message:\n4\xF0\x9F\x94\xA5");
+        assert_eq!(utf8_hash, expected);
     }
 }

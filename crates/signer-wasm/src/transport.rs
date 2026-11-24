@@ -315,7 +315,9 @@ impl WebUsbTransport {
 
     /// Transmits an APDU and receives the response (async version).
     pub async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
-        let apdu_bytes = apdu.to_bytes();
+        let apdu_bytes = apdu
+            .to_bytes()
+            .map_err(|e| WasmError::CoreError(e.to_string()))?;
         let ccid_command = self.wrap_ccid(&apdu_bytes);
 
         // Send command
@@ -325,11 +327,7 @@ impl WebUsbTransport {
         let ccid_response = self.receive_raw(MAX_PACKET_SIZE * 4).await?;
         let apdu_response = self.unwrap_ccid(&ccid_response)?;
 
-        if apdu_response.len() < 2 {
-            return Err(WasmError::UsbError("APDU response too short".to_string()));
-        }
-
-        Ok(ApduResponse::new(apdu_response))
+        ApduResponse::try_from_bytes(apdu_response).map_err(|e| WasmError::UsbError(e.to_string()))
     }
 
     /// Closes the USB connection.

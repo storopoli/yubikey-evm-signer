@@ -11,7 +11,7 @@
 //! 1. Create a transaction with the appropriate type
 //! 2. Call [`Transaction::signing_hash`] to get the hash to sign
 //! 3. Sign the hash with the YubiKey
-//! 4. Create the signed transaction with the signature
+//! 4. Create the signed transaction with [`Transaction::signed_rlp`]
 //!
 //! # Example
 //!
@@ -40,8 +40,76 @@ use alloy_rlp::{Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
 use crate::address::Address;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::signature::Signature;
+
+/// Serde helper for transaction calldata (`Vec<u8>`).
+///
+/// Serializes as a `0x`-prefixed hex string (e.g., `"0x"` for empty data) and
+/// deserializes both hex strings (`"0x..."`, `"0X..."`, or `""`) and JSON
+/// arrays of byte values (`[0xde, 0xad]`) for backwards compatibility.
+mod hex_or_bytes {
+    use core::fmt;
+
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("0x{}", hex::encode(bytes)))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct HexOrBytesVisitor;
+
+        impl<'de> Visitor<'de> for HexOrBytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a hex string (e.g. \"0x...\") or an array of bytes")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let stripped = v
+                    .strip_prefix("0x")
+                    .or_else(|| v.strip_prefix("0X"))
+                    .unwrap_or(v);
+                if stripped.is_empty() {
+                    return Ok(Vec::new());
+                }
+                hex::decode(stripped).map_err(de::Error::custom)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v.to_vec())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(HexOrBytesVisitor)
+    }
+}
 
 /// An access list entry for EIP-2930/EIP-1559 transactions.
 ///
@@ -77,12 +145,14 @@ pub struct LegacyTransaction {
     pub gas_limit: u64,
 
     /// The recipient address, or `None` for contract creation.
+    #[serde(default)]
     pub to: Option<Address>,
 
     /// The value to transfer in wei.
     pub value: U256,
 
     /// The transaction input data.
+    #[serde(default, alias = "input", with = "hex_or_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -123,13 +193,28 @@ impl LegacyTransaction {
     ///
     /// # Returns
     ///
-    /// The RLP-encoded signed transaction bytes.
-    #[must_use]
-    pub fn signed_rlp(&self, signature: &Signature) -> Vec<u8> {
+    /// A [`Result`] containing the RLP-encoded signed transaction bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
+    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
+        if self.chain_id == 0 {
+            return Err(Error::InvalidChainId(0));
+        }
+        if signature.v() > 1 {
+            return Err(Error::InvalidSignature(format!(
+                "invalid recovery parameter v: {}",
+                signature.v()
+            )));
+        }
+
         let mut buf = Vec::new();
 
-        // Calculate v with EIP-155: v = chain_id * 2 + 35 + recovery_id
-        let v = self.chain_id * 2 + 35 + u64::from(signature.v());
+        // Calculate v with EIP-155 in u128 so large chain IDs cannot overflow:
+        // v = chain_id * 2 + 35 + recovery_id
+        let v = u128::from(self.chain_id) * 2 + 35 + u128::from(signature.v());
 
         // Encode: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
         encode_rlp_list(&mut buf, |buf| {
@@ -144,7 +229,7 @@ impl LegacyTransaction {
             encode_bytes32(signature.s(), buf);
         });
 
-        buf
+        Ok(buf)
     }
 }
 
@@ -177,15 +262,18 @@ pub struct Eip1559Transaction {
     pub gas_limit: u64,
 
     /// The recipient address, or `None` for contract creation.
+    #[serde(default)]
     pub to: Option<Address>,
 
     /// The value to transfer in wei.
     pub value: U256,
 
     /// The transaction input data.
+    #[serde(default, alias = "input", with = "hex_or_bytes")]
     pub data: Vec<u8>,
 
     /// The access list.
+    #[serde(default)]
     pub access_list: Vec<AccessListEntry>,
 }
 
@@ -219,7 +307,7 @@ impl Eip1559Transaction {
             encode_optional_address(&self.to, buf);
             encode_u256(&self.value, buf);
             self.data.as_slice().encode(buf);
-            encode_access_list(&self.access_list, buf);
+            self.access_list.encode(buf);
         });
 
         keccak256(&buf)
@@ -233,15 +321,29 @@ impl Eip1559Transaction {
     ///
     /// # Returns
     ///
-    /// The RLP-encoded signed transaction bytes (with type prefix).
-    #[must_use]
-    pub fn signed_rlp(&self, signature: &Signature) -> Vec<u8> {
+    /// A [`Result`] containing the RLP-encoded signed transaction bytes (with type prefix).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
+    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
+        if self.chain_id == 0 {
+            return Err(Error::InvalidChainId(0));
+        }
+        if signature.v() > 1 {
+            return Err(Error::InvalidSignature(format!(
+                "invalid recovery parameter v: {}",
+                signature.v()
+            )));
+        }
+
         let mut buf = Vec::with_capacity(256);
 
         // Type prefix
         buf.push(Self::TX_TYPE);
 
-        // For EIP-1559, v is just 0 or 1
+        // For EIP-1559, y_parity is 0 or 1
         let v = signature.v();
 
         encode_rlp_list(&mut buf, |buf| {
@@ -253,13 +355,13 @@ impl Eip1559Transaction {
             encode_optional_address(&self.to, buf);
             encode_u256(&self.value, buf);
             self.data.as_slice().encode(buf);
-            encode_access_list(&self.access_list, buf);
+            self.access_list.encode(buf);
             v.encode(buf);
             encode_bytes32(signature.r(), buf);
             encode_bytes32(signature.s(), buf);
         });
 
-        buf
+        Ok(buf)
     }
 }
 
@@ -286,7 +388,7 @@ fn encode_u256(value: &U256, out: &mut Vec<u8>) {
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(31);
     let trimmed = &bytes[start..];
     if trimmed.is_empty() || (trimmed.len() == 1 && trimmed[0] == 0) {
-        // Encode as empty byte (0x80)
+        // Encode as empty byte string (0x80)
         out.push(0x80);
     } else {
         trimmed.encode(out);
@@ -313,22 +415,6 @@ fn encode_bytes32(bytes: &[u8; 32], out: &mut Vec<u8>) {
     } else {
         trimmed.encode(out);
     }
-}
-
-/// Encodes an access list to RLP.
-fn encode_access_list(access_list: &[AccessListEntry], out: &mut Vec<u8>) {
-    encode_rlp_list(out, |out| {
-        for entry in access_list {
-            encode_rlp_list(out, |out| {
-                entry.address.encode(out);
-                encode_rlp_list(out, |out| {
-                    for key in &entry.storage_keys {
-                        key.encode(out);
-                    }
-                });
-            });
-        }
-    });
 }
 
 /// A unified transaction type supporting multiple formats.
@@ -378,9 +464,13 @@ impl Transaction {
     ///
     /// # Returns
     ///
-    /// The RLP-encoded signed transaction bytes.
-    #[must_use]
-    pub fn signed_rlp(&self, signature: &Signature) -> Vec<u8> {
+    /// A [`Result`] containing the RLP-encoded signed transaction bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
+    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
         match self {
             Self::Legacy(tx) => tx.signed_rlp(signature),
             Self::Eip1559(tx) => tx.signed_rlp(signature),
@@ -423,37 +513,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_transaction_signing_hash() {
+    fn legacy_eip155_official_vector() {
+        // Official EIP-155 specification example:
+        // nonce=9, gasPrice=20e9, gasLimit=21000, to=0x3535...3535, value=1e18, data="", chainId=1
         let tx = LegacyTransaction {
             chain_id: 1,
-            nonce: 0,
+            nonce: 9,
             gas_price: U256::from(20_000_000_000u64),
-            gas_limit: 21000,
-            to: Some(Address::zero()),
+            gas_limit: 21_000,
+            to: Some(Address::new([0x35; 20])),
             value: U256::from(1_000_000_000_000_000_000u128),
             data: vec![],
         };
 
-        let hash = tx.signing_hash();
-        assert!(!hash.is_zero());
+        assert_eq!(
+            hex::encode(tx.signing_hash()),
+            "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53"
+        );
     }
 
     #[test]
-    fn eip1559_transaction_signing_hash() {
+    fn eip1559_known_answer_vector() {
+        // EIP-1559 tx: chainId=1, nonce=0, maxPriorityFee=1, maxFee=2, gasLimit=21000,
+        // to=0x0000...0001, value=0, data=0x, accessList=[]
+        let mut to_bytes = [0u8; 20];
+        to_bytes[19] = 1;
         let tx = Eip1559Transaction {
             chain_id: 1,
             nonce: 0,
-            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
-            max_fee_per_gas: U256::from(100_000_000_000u64),
-            gas_limit: 21000,
-            to: Some(Address::zero()),
-            value: U256::from(1_000_000_000_000_000_000u128),
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 21_000,
+            to: Some(Address::new(to_bytes)),
+            value: U256::ZERO,
             data: vec![],
             access_list: vec![],
         };
 
-        let hash = tx.signing_hash();
-        assert!(!hash.is_zero());
+        // Payload: 0x02 || rlp([1, 0, 1, 2, 21000, 0x00..01, 0, "", []])
+        // rlp items: 01, 80, 01, 02, 825208, 940000...0001, 80, 80, c0
+        // total payload length = 1 + 1 + 1 + 1 + 3 + 21 + 1 + 1 + 1 = 31 (0x1f) -> list header 0xdf
+        let expected_payload = hex::decode(concat!(
+            "02df",
+            "01",
+            "80",
+            "01",
+            "02",
+            "825208",
+            "940000000000000000000000000000000000000001",
+            "80",
+            "80",
+            "c0"
+        ))
+        .unwrap();
+        assert_eq!(tx.signing_hash(), keccak256(&expected_payload));
+
+        // Signed RLP with r=1, s=2, v=1
+        let mut r = [0u8; 32];
+        r[31] = 1;
+        let mut s = [0u8; 32];
+        s[31] = 2;
+        let sig = Signature::new(r, s, 1).unwrap();
+        let signed = tx.signed_rlp(&sig).unwrap();
+
+        // Added items: v=01, r=01, s=02 => +3 bytes => payload len 34 (0x22) -> list header 0xe2
+        let expected_signed = hex::decode(concat!(
+            "02e2",
+            "01",
+            "80",
+            "01",
+            "02",
+            "825208",
+            "940000000000000000000000000000000000000001",
+            "80",
+            "80",
+            "c0",
+            "01",
+            "01",
+            "02"
+        ))
+        .unwrap();
+        assert_eq!(signed, expected_signed);
     }
 
     #[test]
@@ -480,11 +620,8 @@ mod tests {
             access_list: vec![],
         });
 
-        // Both should produce non-zero hashes
         assert!(!legacy.signing_hash().is_zero());
         assert!(!eip1559.signing_hash().is_zero());
-
-        // And they should be different
         assert_ne!(legacy.signing_hash(), eip1559.signing_hash());
     }
 
@@ -517,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_json_roundtrip() {
+    fn transaction_json_roundtrip_and_compat_formats() {
         let original = Transaction::Eip1559(Eip1559Transaction {
             chain_id: 1,
             nonce: 42,
@@ -531,53 +668,147 @@ mod tests {
         });
 
         let json = original.to_json().unwrap();
+        assert!(json.contains("\"0xdeadbeef\""));
         let recovered = Transaction::from_json(&json).unwrap();
-
         assert_eq!(original, recovered);
+
+        // README.md / demo/app.js JSON format: "input": "0x", omitted access_list, decimal strings
+        let readme_json = r#"{
+            "type": "eip1559",
+            "chain_id": 1,
+            "nonce": 0,
+            "max_priority_fee_per_gas": "1000000000",
+            "max_fee_per_gas": "20000000000",
+            "gas_limit": 21000,
+            "to": "0x0000000000000000000000000000000000000001",
+            "value": "1000000000000000000",
+            "input": "0x"
+        }"#;
+        let parsed = Transaction::from_json(readme_json).unwrap();
+        match parsed {
+            Transaction::Eip1559(tx) => {
+                assert_eq!(tx.chain_id, 1);
+                assert!(tx.data.is_empty());
+                assert!(tx.access_list.is_empty());
+                assert!(tx.to.is_some());
+            }
+            Transaction::Legacy(_) => panic!("expected eip1559"),
+        }
+
+        // Contract deployment (to: null / omitted), uppercase 0X prefix, and byte array data
+        let deploy_json = r#"{
+            "type": "eip1559",
+            "chain_id": 1,
+            "nonce": 1,
+            "max_priority_fee_per_gas": "1000",
+            "max_fee_per_gas": "2000",
+            "gas_limit": 100000,
+            "to": null,
+            "value": "0",
+            "input": "0X60806040"
+        }"#;
+        let deploy_tx = Transaction::from_json(deploy_json).unwrap();
+        match deploy_tx {
+            Transaction::Eip1559(tx) => {
+                assert!(tx.to.is_none());
+                assert_eq!(tx.data, vec![0x60, 0x80, 0x60, 0x40]);
+            }
+            Transaction::Legacy(_) => panic!("expected eip1559"),
+        }
+
+        // Backwards-compatible byte array format for data on LegacyTransaction
+        let legacy_byte_array = r#"{
+            "type": "legacy",
+            "chain_id": 1,
+            "nonce": 5,
+            "gas_price": "20000000000",
+            "gas_limit": 21000,
+            "value": "0",
+            "data": [222, 173, 190, 239]
+        }"#;
+        let legacy_tx = Transaction::from_json(legacy_byte_array).unwrap();
+        match legacy_tx {
+            Transaction::Legacy(tx) => {
+                assert!(tx.to.is_none());
+                assert_eq!(tx.data, vec![0xde, 0xad, 0xbe, 0xef]);
+            }
+            Transaction::Eip1559(_) => panic!("expected legacy"),
+        }
     }
 
     #[test]
-    fn legacy_signed_rlp() {
-        let tx = LegacyTransaction {
-            chain_id: 1,
+    fn signed_rlp_validation_and_large_chain_id_no_overflow() {
+        let sig = Signature::new([1u8; 32], [2u8; 32], 1).unwrap();
+
+        // chain_id == 0 must be rejected
+        let zero_legacy = LegacyTransaction {
+            chain_id: 0,
             nonce: 0,
-            gas_price: U256::from(20_000_000_000u64),
+            gas_price: U256::from(1u64),
             gas_limit: 21000,
             to: Some(Address::zero()),
-            value: U256::from(1_000_000_000_000_000_000u128),
+            value: U256::ZERO,
             data: vec![],
         };
+        assert!(matches!(
+            zero_legacy.signed_rlp(&sig),
+            Err(Error::InvalidChainId(0))
+        ));
 
-        let sig = Signature::new([1u8; 32], [2u8; 32], 0);
-        let rlp = tx.signed_rlp(&sig);
+        let zero_1559 = Eip1559Transaction {
+            chain_id: 0,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 21000,
+            to: Some(Address::zero()),
+            value: U256::ZERO,
+            data: vec![],
+            access_list: vec![],
+        };
+        assert!(matches!(
+            zero_1559.signed_rlp(&sig),
+            Err(Error::InvalidChainId(0))
+        ));
 
-        // Should produce non-empty RLP
+        // u64::MAX chain_id must NOT overflow EIP-155 v calculation
+        let max_chain_legacy = LegacyTransaction {
+            chain_id: u64::MAX,
+            nonce: 0,
+            gas_price: U256::from(1u64),
+            gas_limit: 21000,
+            to: Some(Address::zero()),
+            value: U256::ZERO,
+            data: vec![],
+        };
+        let rlp = max_chain_legacy.signed_rlp(&sig).unwrap();
         assert!(!rlp.is_empty());
     }
 
     #[test]
-    fn eip1559_signed_rlp() {
-        let tx = Eip1559Transaction {
-            chain_id: 1,
-            nonce: 0,
-            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
-            max_fee_per_gas: U256::from(100_000_000_000u64),
-            gas_limit: 21000,
-            to: Some(Address::zero()),
-            value: U256::from(1_000_000_000_000_000_000u128),
-            data: vec![],
-            access_list: vec![],
+    fn access_list_encoding_matches_manual_rlp() {
+        let entry = AccessListEntry {
+            address: alloy_primitives::Address::ZERO,
+            storage_keys: vec![B256::ZERO],
         };
 
-        let sig = Signature::new([1u8; 32], [2u8; 32], 1);
-        let rlp = tx.signed_rlp(&sig);
+        let mut derived_buf = Vec::new();
+        vec![entry.clone()].encode(&mut derived_buf);
 
-        // Should start with type prefix
-        assert_eq!(rlp[0], 0x02);
-    }
+        let mut manual_buf = Vec::new();
+        encode_rlp_list(&mut manual_buf, |out| {
+            encode_rlp_list(out, |out| {
+                entry.address.encode(out);
+                encode_rlp_list(out, |out| {
+                    for key in &entry.storage_keys {
+                        key.encode(out);
+                    }
+                });
+            });
+        });
 
-    #[test]
-    fn access_list_encoding() {
+        assert_eq!(derived_buf, manual_buf);
+
         let tx = Eip1559Transaction {
             chain_id: 1,
             nonce: 0,
@@ -587,13 +818,9 @@ mod tests {
             to: Some(Address::zero()),
             value: U256::ZERO,
             data: vec![],
-            access_list: vec![AccessListEntry {
-                address: alloy_primitives::Address::ZERO,
-                storage_keys: vec![B256::ZERO],
-            }],
+            access_list: vec![entry],
         };
 
-        let hash = tx.signing_hash();
-        assert!(!hash.is_zero());
+        assert!(!tx.signing_hash().is_zero());
     }
 }

@@ -22,6 +22,7 @@
 use std::fmt;
 
 use alloy_primitives::{Address as AlloyAddress, keccak256};
+use p256::Sec1Point;
 use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
@@ -139,57 +140,86 @@ impl Address {
         Self::new(address_bytes)
     }
 
-    /// Derives an Ethereum address from raw uncompressed public key bytes.
+    /// Derives an Ethereum address from encoded P-256 public key bytes.
+    ///
+    /// Validates that the bytes encode a valid non-identity point on the NIST P-256
+    /// curve before deriving the address from its uncompressed coordinates.
     ///
     /// # Arguments
     ///
-    /// * `bytes` - Either 65 bytes (`0x04 || x || y`) or 64 bytes (`x || y`)
+    /// * `bytes` - One of:
+    ///   - 64 bytes: raw uncompressed coordinates (`x || y`)
+    ///   - 65 bytes: SEC1 uncompressed point (`0x04 || x || y`)
+    ///   - 33 bytes: SEC1 compressed point (`0x02 || x` or `0x03 || x`)
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the derived [`Address`], or an error if the bytes are invalid.
+    /// A [`Result`] containing the derived [`Address`], or an error if the bytes
+    /// do not represent a valid P-256 public key.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidPublicKey`] if:
-    /// - The byte length is not 64 or 65
-    /// - For 65-byte input, the first byte is not `0x04`
+    /// - The byte length is not 33, 64, or 65
+    /// - The SEC1 tag prefix does not match the length
+    /// - The point is not on the NIST P-256 curve or is the point at infinity
     ///
     /// # Example
     ///
     /// ```
     /// use yubikey_evm_signer_core::Address;
     ///
-    /// // 64-byte public key (x || y coordinates)
-    /// let pubkey_bytes = [0u8; 64];
+    /// // NIST P-256 generator point G (64-byte raw x || y)
+    /// let pubkey_bytes = hex::decode(concat!(
+    ///     "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+    ///     "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    /// ))
+    /// .unwrap();
     /// let addr = Address::from_public_key_bytes(&pubkey_bytes).unwrap();
+    /// assert!(!addr.is_zero());
     /// ```
     pub fn from_public_key_bytes(bytes: &[u8]) -> Result<Self> {
-        let pubkey_bytes = match bytes.len() {
-            64 => bytes,
+        let point = match bytes.len() {
+            64 => {
+                let mut uncompressed = [0u8; 65];
+                uncompressed[0] = 0x04;
+                uncompressed[1..].copy_from_slice(bytes);
+                Sec1Point::from_bytes(&uncompressed).map_err(|_| {
+                    Error::InvalidPublicKey("invalid 64-byte P-256 public key".to_string())
+                })?
+            }
             65 => {
                 if bytes[0] != 0x04 {
                     return Err(Error::InvalidPublicKey(
                         "65-byte public key must start with 0x04".to_string(),
                     ));
                 }
-                &bytes[1..]
+                Sec1Point::from_bytes(bytes).map_err(|_| {
+                    Error::InvalidPublicKey("invalid 65-byte P-256 public key".to_string())
+                })?
+            }
+            33 => {
+                if bytes[0] != 0x02 && bytes[0] != 0x03 {
+                    return Err(Error::InvalidPublicKey(
+                        "33-byte compressed public key must start with 0x02 or 0x03".to_string(),
+                    ));
+                }
+                Sec1Point::from_bytes(bytes).map_err(|_| {
+                    Error::InvalidPublicKey("invalid 33-byte compressed P-256 public key".into())
+                })?
             }
             len => {
                 return Err(Error::InvalidPublicKey(format!(
-                    "expected 64 or 65 bytes, got {len}"
+                    "expected 33, 64, or 65 bytes, got {len}"
                 )));
             }
         };
 
-        // Compute Keccak-256 hash
-        let hash = keccak256(pubkey_bytes);
+        let verifying_key = VerifyingKey::from_sec1_point(&point).map_err(|_| {
+            Error::InvalidPublicKey("public key is not a valid NIST P-256 curve point".to_string())
+        })?;
 
-        // Take the last 20 bytes
-        let mut address_bytes = [0u8; Self::BYTE_LEN];
-        address_bytes.copy_from_slice(&hash[12..]);
-
-        Ok(Self::new(address_bytes))
+        Ok(Self::from_public_key(&verifying_key))
     }
 
     /// Returns the [`Address`] as a byte slice.
@@ -248,7 +278,7 @@ impl Address {
     ///
     /// # Arguments
     ///
-    /// * `hex_str` - A hex string, optionally prefixed with `0x`
+    /// * `hex_str` - A hex string, optionally prefixed with `0x` or `0X`
     ///
     /// # Returns
     ///
@@ -257,7 +287,7 @@ impl Address {
     /// # Errors
     ///
     /// Returns [`Error::HexDecodeFailed`] if the hex string is invalid, or
-    /// [`Error::InvalidPublicKey`] if the decoded bytes are not 20 bytes.
+    /// [`Error::AddressDerivationFailed`] if the decoded bytes are not 20 bytes.
     ///
     /// # Example
     ///
@@ -268,7 +298,10 @@ impl Address {
     /// assert!(addr.is_zero());
     /// ```
     pub fn from_hex(hex_str: &str) -> Result<Self> {
-        let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        let hex_str = hex_str
+            .strip_prefix("0x")
+            .or_else(|| hex_str.strip_prefix("0X"))
+            .unwrap_or(hex_str);
         let bytes = hex::decode(hex_str)?;
 
         if bytes.len() != Self::BYTE_LEN {
@@ -323,6 +356,16 @@ impl From<[u8; 20]> for Address {
 mod tests {
     use super::*;
 
+    /// NIST P-256 generator point G (64-byte raw x || y).
+    const P256_G_RAW_HEX: &str = concat!(
+        "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+        "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+    );
+
+    /// NIST P-256 generator point G compressed (Gy is odd -> prefix 0x03).
+    const P256_G_COMPRESSED_HEX: &str =
+        "036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+
     #[test]
     fn address_new() {
         let bytes = [1u8; 20];
@@ -338,61 +381,89 @@ mod tests {
     }
 
     #[test]
-    fn address_from_public_key_bytes_64() {
-        // 64-byte public key (x || y)
-        let pubkey_bytes = [0u8; 64];
-        let addr = Address::from_public_key_bytes(&pubkey_bytes).unwrap();
+    fn address_from_public_key_bytes_all_valid_encodings() {
+        let raw_64 = hex::decode(P256_G_RAW_HEX).unwrap();
+        let mut uncompressed_65 = vec![0x04];
+        uncompressed_65.extend_from_slice(&raw_64);
+        let compressed_33 = hex::decode(P256_G_COMPRESSED_HEX).unwrap();
 
-        // Verify the hash is computed correctly
-        let expected_hash = keccak256(pubkey_bytes);
+        let addr_64 = Address::from_public_key_bytes(&raw_64).unwrap();
+        let addr_65 = Address::from_public_key_bytes(&uncompressed_65).unwrap();
+        let addr_33 = Address::from_public_key_bytes(&compressed_33).unwrap();
+
+        assert_eq!(addr_64, addr_65);
+        assert_eq!(addr_64, addr_33);
+
+        // Verify the address matches keccak256(x || y)[12..]
+        let expected_hash = keccak256(&raw_64);
         let expected_addr: [u8; 20] = expected_hash[12..].try_into().unwrap();
-        assert_eq!(addr.to_bytes(), expected_addr);
+        assert_eq!(addr_64.to_bytes(), expected_addr);
     }
 
     #[test]
-    fn address_from_public_key_bytes_65() {
-        // 65-byte public key (0x04 || x || y)
-        let mut pubkey_bytes = [0u8; 65];
-        pubkey_bytes[0] = 0x04;
+    fn address_from_public_key_bytes_rejects_invalid_points() {
+        // All-zero point (not on P-256 curve)
+        assert!(matches!(
+            Address::from_public_key_bytes(&[0u8; 64]),
+            Err(Error::InvalidPublicKey(_))
+        ));
 
-        let addr = Address::from_public_key_bytes(&pubkey_bytes).unwrap();
+        // 65-byte all-zero with 0x04 prefix (not on curve)
+        let mut zero_65 = [0u8; 65];
+        zero_65[0] = 0x04;
+        assert!(matches!(
+            Address::from_public_key_bytes(&zero_65),
+            Err(Error::InvalidPublicKey(_))
+        ));
 
-        // Should be the same as deriving from 64 bytes
-        let addr_64 = Address::from_public_key_bytes(&[0u8; 64]).unwrap();
-        assert_eq!(addr, addr_64);
+        // Mutated y-coordinate (off curve)
+        let mut off_curve = hex::decode(P256_G_RAW_HEX).unwrap();
+        off_curve[63] ^= 0x01;
+        assert!(matches!(
+            Address::from_public_key_bytes(&off_curve),
+            Err(Error::InvalidPublicKey(_))
+        ));
+
+        // Wrong 65-byte prefix
+        let mut bad_prefix = vec![0x02];
+        bad_prefix.extend_from_slice(&hex::decode(P256_G_RAW_HEX).unwrap());
+        assert!(matches!(
+            Address::from_public_key_bytes(&bad_prefix),
+            Err(Error::InvalidPublicKey(_))
+        ));
+
+        // Wrong 33-byte prefix
+        let mut bad_compressed = hex::decode(P256_G_COMPRESSED_HEX).unwrap();
+        bad_compressed[0] = 0x04;
+        assert!(matches!(
+            Address::from_public_key_bytes(&bad_compressed),
+            Err(Error::InvalidPublicKey(_))
+        ));
+
+        // Wrong length
+        assert!(matches!(
+            Address::from_public_key_bytes(&[0u8; 63]),
+            Err(Error::InvalidPublicKey(_))
+        ));
     }
 
     #[test]
-    fn address_from_public_key_bytes_invalid_prefix() {
-        let mut pubkey_bytes = [0u8; 65];
-        pubkey_bytes[0] = 0x02; // Wrong prefix
-
-        let result = Address::from_public_key_bytes(&pubkey_bytes);
-        assert!(matches!(result, Err(Error::InvalidPublicKey(_))));
-    }
-
-    #[test]
-    fn address_from_public_key_bytes_invalid_length() {
-        let pubkey_bytes = [0u8; 63];
-        let result = Address::from_public_key_bytes(&pubkey_bytes);
-        assert!(matches!(result, Err(Error::InvalidPublicKey(_))));
-    }
-
-    #[test]
-    fn address_hex_roundtrip() {
+    fn address_hex_roundtrip_and_prefixes() {
         let original = Address::new([0xab; 20]);
         let hex = original.to_hex();
-        let recovered = Address::from_hex(&hex).unwrap();
-        assert_eq!(original, recovered);
-    }
+        assert_eq!(Address::from_hex(&hex).unwrap(), original);
 
-    #[test]
-    fn address_from_hex_without_prefix() {
-        let addr = Address::new([0xcd; 20]);
-        let hex = addr.to_hex();
-        let hex_no_prefix = hex.strip_prefix("0x").unwrap();
-        let recovered = Address::from_hex(hex_no_prefix).unwrap();
-        assert_eq!(addr, recovered);
+        let upper_prefix = format!("0X{}", hex.strip_prefix("0x").unwrap());
+        assert_eq!(Address::from_hex(&upper_prefix).unwrap(), original);
+
+        let no_prefix = hex.strip_prefix("0x").unwrap();
+        assert_eq!(Address::from_hex(no_prefix).unwrap(), original);
+
+        // Wrong length returns AddressDerivationFailed
+        assert!(matches!(
+            Address::from_hex("0xdeadbeef"),
+            Err(Error::AddressDerivationFailed(_))
+        ));
     }
 
     #[test]
