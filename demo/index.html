@@ -37,7 +37,7 @@
             </ul>
             <p>Choose one of the following transports:</p>
             <ul class="platform-list">
-                <li><strong>Local PC/SC Bridge:</strong> <span class="status-badge supported">Recommended</span> &mdash; Works across macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave. Start it locally with <code>just cli-bridge</code> (or <code>cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge</code>), then paste the loopback URL and per-session bearer token below.</li>
+                <li><strong>Local PC/SC Bridge:</strong> <span class="status-badge supported">Recommended</span> &mdash; Works across macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave. Start it locally with <code>just cli-bridge</code> (or <code>cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge</code>), then paste the printed <code>http://127.0.0.1:&lt;port&gt;</code> URL and bearer token below.</li>
                 <li><strong>WebUSB:</strong> <span class="status-badge experimental">Experimental</span> &mdash; Only works for non-blocklisted CCID tokens or Chromium Isolated Web Apps with unrestricted USB permissions. On Linux, non-root USB access may also require <a href="https://developers.yubico.com/yubikey-manager/Device_Permissions.html" target="_blank" rel="noopener noreferrer">udev rules</a>.</li>
             </ul>
         </section>

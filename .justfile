@@ -172,7 +172,7 @@ cli-list:
 cli-info:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- info
 
-# Get Ethereum address from slot 9a
+# Show the P-256 public key and derived address (not a secp256k1 account) of slot 9a
 [group('cli')]
 cli-address:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- address
@@ -182,7 +182,7 @@ cli-address:
 cli-generate:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate
 
-# Sign a sample EIP-1559 transaction (requires PIN)
+# Sign a sample EIP-1559 transaction hash with the slot 9a P-256 key (requires PIN)
 [group('cli')]
 cli-sign-tx:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign-tx

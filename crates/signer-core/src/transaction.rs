@@ -9,9 +9,27 @@
 //! # Signing Flow
 //!
 //! 1. Create a transaction with the appropriate type
-//! 2. Call [`Transaction::signing_hash`] to get the hash to sign
+//! 2. Call [`Transaction::signing_hash`] to get the hash to sign (it rejects
+//!    `chain_id == 0`)
 //! 3. Sign the hash with the YubiKey
 //! 4. Create the signed transaction with [`Transaction::signed_rlp`]
+//!
+//! # P-256 signatures are not secp256k1 transaction signatures
+//!
+//! The YubiKey signs with P-256. Ethereum mainnet and standard EVM chains
+//! validate transaction signatures with secp256k1 `ecrecover`, so the envelope
+//! produced by [`Transaction::signed_rlp`] is not accepted by a standard node
+//! as a transaction from the key's derived [`Address`]. It is useful only to a
+//! verifier that checks the P-256 signature (for example with the EIP-7951
+//! `P256VERIFY` precompile) against a public key it already knows; the
+//! transaction does not carry that key.
+//!
+//! # JSON
+//!
+//! [`Transaction::from_json`] rejects unknown keys (including camelCase spellings
+//! such as `accessList`), a missing `to` (use `null` for contract creation), and
+//! amounts that are not a JSON unsigned integer, a decimal digit string, or a
+//! `0x`/`0X` hex string.
 //!
 //! # Example
 //!
@@ -331,6 +349,12 @@ impl LegacyTransaction {
 
     /// Creates a signed transaction by combining this transaction with a signature.
     ///
+    /// The P-256 `(r, s)` and recovery parameter are placed in a standard EIP-155
+    /// envelope. Standard EVM nodes validate this envelope with secp256k1
+    /// `ecrecover`, so they do not accept it as a transaction from the P-256 key's
+    /// derived [`Address`]; it is meant for verifiers that check P-256 signatures
+    /// against a known public key (see the [module docs](crate::transaction)).
+    ///
     /// # Arguments
     ///
     /// * `signature` - The signature from signing the hash
@@ -468,6 +492,12 @@ impl Eip1559Transaction {
     }
 
     /// Creates a signed transaction by combining this transaction with a signature.
+    ///
+    /// The P-256 `(r, s)` and y-parity are placed in a standard type-2 envelope.
+    /// Standard EVM nodes validate this envelope with secp256k1 `ecrecover`, so
+    /// they do not accept it as a transaction from the P-256 key's derived
+    /// [`Address`]; it is meant for verifiers that check P-256 signatures against
+    /// a known public key (see the [module docs](crate::transaction)).
     ///
     /// # Arguments
     ///
@@ -610,6 +640,10 @@ impl Transaction {
     }
 
     /// Creates a signed transaction by combining this transaction with a signature.
+    ///
+    /// The result carries a P-256 signature, which standard EVM nodes do not
+    /// accept (see [`LegacyTransaction::signed_rlp`] and
+    /// [`Eip1559Transaction::signed_rlp`]).
     ///
     /// # Arguments
     ///

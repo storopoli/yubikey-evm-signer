@@ -184,7 +184,7 @@ impl BridgeTransport {
     /// # Arguments
     ///
     /// * `url` - Loopback bridge URL (e.g. `"http://127.0.0.1:8765"`)
-    /// * `token` - Per-session bearer token printed by `yubikey-cli bridge`
+    /// * `token` - Bearer token printed by `yubikey-cli bridge` (valid until the bridge stops)
     ///
     /// # Errors
     ///

@@ -17,7 +17,7 @@
 //! # Using justfile (recommended)
 //! just cli-list          # List connected YubiKeys
 //! just cli-generate      # Generate a new P-256 key in slot 9a
-//! just cli-address       # Get Ethereum address
+//! just cli-address       # Show the P-256 public key and derived address
 //! just cli-sign-tx       # Sign a sample EIP-1559 transaction
 //!
 //! # Using cargo directly
@@ -42,12 +42,15 @@
 //!    ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a /tmp/pubkey.pem
 //!    ```
 //!
-//! 3. **Get your Ethereum address**:
+//! 3. **Show the public key and derived address**:
 //!    ```bash
 //!    just cli-address
 //!    ```
+//!    The address is `keccak256(X‖Y)[12..]` of the P-256 key, not a secp256k1
+//!    account: do not send funds to it on chains that validate transactions with
+//!    secp256k1. Register the printed public key with an EIP-7951 verifier.
 //!
-//! 4. **Sign transactions**:
+//! 4. **Sign transaction hashes** (P-256 signatures for EIP-7951 verifiers):
 //!    ```bash
 //!    just cli-sign-tx
 //!    # Or sign a custom hash:
@@ -126,10 +129,10 @@ USAGE:
 COMMANDS:
     list        List available YubiKey devices
     info        Show YubiKey connection info
-    address     Get Ethereum address from slot 9a
+    address     Show slot 9a's P-256 public key and derived address
     generate    Generate a new P-256 key in slot 9a (requires management key)
     sign <hex>  Sign a 32-byte hash (requires PIN)
-    sign-tx     Sign a sample EIP-1559 transaction (requires PIN)
+    sign-tx     Sign a sample EIP-1559 transaction hash (requires PIN)
     bridge      Start hardened local PC/SC HTTP bridge for browser apps
     help        Show this help message
 
@@ -174,6 +177,27 @@ fn warn_if_stale_certificate(info: &SlotPublicKey) {
             "Warning: the certificate in slot 9a does not match the slot's key; ignoring the stale certificate."
         );
     }
+}
+
+/// Label printed above the keccak-derived address of the P-256 key.
+const ADDRESS_LABEL: &str = "Derived Address (keccak256 of the P-256 key; not a secp256k1 account)";
+
+/// One-line explanation printed after the derived address.
+const ADDRESS_NOTE: &str = "Do not send funds to this address on chains that validate transactions with \
+     secp256k1; register the public key with an EIP-7951 (P256VERIFY) verifier instead.";
+
+/// Prints the slot 9a key that is about to sign, before the PIN prompt.
+fn print_signing_key(info: &SlotPublicKey) {
+    println!("Signing with the slot 9a P-256 key:");
+    println!(
+        "  Public Key: {}",
+        hex::encode(info.public_key.to_sec1_point(false).as_bytes())
+    );
+    println!(
+        "  Derived Address: {}",
+        Address::from_public_key(&info.public_key)
+    );
+    println!();
 }
 
 /// Connects to the first YubiKey and wraps it in a PIV session.
@@ -281,7 +305,7 @@ fn cmd_info() -> ExitCode {
 }
 
 fn cmd_address() -> ExitCode {
-    println!("Getting Ethereum address from slot 9a...\n");
+    println!("Reading the P-256 public key of slot 9a...\n");
 
     let Some(mut session) = connect_session() else {
         return ExitCode::FAILURE;
@@ -302,8 +326,10 @@ fn cmd_address() -> ExitCode {
                 }
             );
             println!();
-            println!("Ethereum Address:");
+            println!("{ADDRESS_LABEL}:");
             println!("  {address}");
+            println!();
+            println!("{ADDRESS_NOTE}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -346,7 +372,11 @@ fn cmd_generate(args: &[String]) -> ExitCode {
             warn_if_stale_certificate(&info);
             println!("Slot 9a already holds a P-256 key:");
             println!(
-                "  Ethereum Address: {}",
+                "  Public Key: {}",
+                hex::encode(info.public_key.to_sec1_point(false).as_bytes())
+            );
+            println!(
+                "  Derived Address: {}",
                 Address::from_public_key(&info.public_key)
             );
         }
@@ -368,7 +398,8 @@ fn cmd_generate(args: &[String]) -> ExitCode {
 
     println!();
     println!("WARNING: This replaces any existing key in slot 9a. The old private key is");
-    println!("destroyed and cannot be recovered; funds held by its address become inaccessible.");
+    println!("destroyed and cannot be recovered; anything that relies on it (for example a");
+    println!("smart account that registered its public key) can no longer be signed for.");
     println!();
 
     if !force {
@@ -425,8 +456,10 @@ fn cmd_generate(args: &[String]) -> ExitCode {
             let encoded = generated.public_key.to_sec1_point(false);
             println!("  {}", hex::encode(encoded.as_bytes()));
             println!();
-            println!("Ethereum Address:");
+            println!("{ADDRESS_LABEL}:");
             println!("  {address}");
+            println!();
+            println!("{ADDRESS_NOTE}");
             println!();
             if let Some(e) = &generated.certificate_delete_error {
                 eprintln!(
@@ -505,6 +538,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
         }
     };
     warn_if_stale_certificate(&key_info);
+    print_signing_key(&key_info);
 
     let pin = match prompt_pin() {
         Ok(pin) => Zeroizing::new(pin),
@@ -533,7 +567,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
                     println!("  s: 0x{}", hex::encode(eth_sig.s()));
                     println!("  v: {}", eth_sig.v());
                     println!();
-                    println!("Ethereum Signature (r || s || v):");
+                    println!("Signature (r || s || v):");
                     println!("  {eth_sig}");
                     ExitCode::SUCCESS
                 }
@@ -551,7 +585,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 }
 
 fn cmd_sign_tx() -> ExitCode {
-    println!("Creating and signing a sample EIP-1559 transaction...\n");
+    println!("Creating and signing a sample EIP-1559 transaction hash...\n");
 
     // Connect and read the public key before prompting for PIN
     let Some(mut session) = connect_session() else {
@@ -568,9 +602,7 @@ fn cmd_sign_tx() -> ExitCode {
         }
     };
     warn_if_stale_certificate(&key_info);
-
-    let address = Address::from_public_key(&key_info.public_key);
-    println!("Signing from: {address}\n");
+    print_signing_key(&key_info);
 
     let tx = Transaction::Eip1559(Eip1559Transaction {
         chain_id: 1, // Mainnet
@@ -621,7 +653,7 @@ fn cmd_sign_tx() -> ExitCode {
             match create_ethereum_signature(&der_signature, &hash_bytes, &key_info.public_key) {
                 Ok(eth_sig) => {
                     println!();
-                    println!("Transaction signed successfully!");
+                    println!("Transaction hash signed successfully!");
                     println!();
                     println!("Signature (low-S):");
                     println!("  r: 0x{}", hex::encode(eth_sig.r()));
@@ -630,6 +662,11 @@ fn cmd_sign_tx() -> ExitCode {
                     println!();
                     println!("Full Signature (65 bytes):");
                     println!("  {eth_sig}");
+                    println!();
+                    println!(
+                        "This is a P-256 signature for EIP-7951 (P256VERIFY) verifiers; standard EVM nodes"
+                    );
+                    println!("do not accept it as a transaction signature.");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -819,7 +856,7 @@ fn confirm_slot(slot_id: &str) -> Result<bool, String> {
 
 fn prompt_management_key_algorithm() -> Result<ManagementKeyAlgorithm, String> {
     print!(
-        "Management key algorithm [tdes/aes128/aes192/aes256] (default: aes192 on YubiKey 5.7+, tdes on older): "
+        "Management key algorithm [tdes/aes128/aes192/aes256] (default: aes192; factory default is tdes before firmware 5.7): "
     );
     io::stdout()
         .flush()
