@@ -7,6 +7,7 @@
 use aes as _;
 use alloy_primitives as _;
 use alloy_rlp as _;
+use ctrlc as _;
 use des as _;
 use flate2 as _;
 use getrandom as _;

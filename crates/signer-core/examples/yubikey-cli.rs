@@ -60,9 +60,14 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use yubikey_evm_signer_core::Error;
-use yubikey_evm_signer_core::bridge::{BridgeConfig, BridgeServer, DEFAULT_BRIDGE_PORT};
+use yubikey_evm_signer_core::bridge::{
+    BridgeConfig, BridgeServer, DEFAULT_BRIDGE_PORT, DEFAULT_IDLE_TIMEOUT,
+};
 use yubikey_evm_signer_core::crypto::create_ethereum_signature;
 use yubikey_evm_signer_core::yubikey::{
     ManagementKeyAlgorithm, PcscTransport, PivSession, PublicKeySource, Slot, SlotPublicKey,
@@ -111,6 +116,7 @@ fn main() -> ExitCode {
 }
 
 fn print_help() {
+    let default_idle = DEFAULT_IDLE_TIMEOUT.as_secs();
     println!(
         r#"YubiKey EVM Signer CLI
 
@@ -131,14 +137,19 @@ GENERATE OPTIONS:
     --force     Skip the typed slot confirmation (for scripted use)
 
 BRIDGE OPTIONS:
-    --port <port>             Loopback TCP port (default: {DEFAULT_BRIDGE_PORT})
+    --port <port>             TCP port on 127.0.0.1 (default: {DEFAULT_BRIDGE_PORT})
     --allow-origin <origin>   Additional allowed browser Origin (repeatable)
+    --idle-timeout <seconds>  Close an idle YubiKey session and reset the card after
+                              this many seconds ({MIN_IDLE_TIMEOUT_SECS}-{MAX_IDLE_TIMEOUT_SECS}, default: {default_idle})
+    --allow-generate          Allow browser pages to generate keys (overwrites slots;
+                              disabled by default)
 
 EXAMPLES:
     cargo run --example yubikey-cli --features pcsc -- list
     cargo run --example yubikey-cli --features pcsc -- address
     cargo run --example yubikey-cli --features pcsc -- generate
     cargo run --example yubikey-cli --features pcsc -- bridge --port 8765
+    cargo run --example yubikey-cli --features pcsc -- bridge --idle-timeout 300 --allow-generate
     cargo run --example yubikey-cli --features pcsc -- sign 0x$(printf '00%.0s' {{1..32}})
 "#
     );
@@ -634,9 +645,20 @@ fn cmd_sign_tx() -> ExitCode {
     }
 }
 
+/// Smallest `--idle-timeout` accepted by the CLI, in seconds.
+const MIN_IDLE_TIMEOUT_SECS: u64 = 10;
+
+/// Largest `--idle-timeout` accepted by the CLI, in seconds.
+const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
+
+const BRIDGE_USAGE: &str = "Usage: yubikey-cli bridge [--port <port>] [--allow-origin <origin>]... \
+     [--idle-timeout <seconds>] [--allow-generate]";
+
 fn cmd_bridge(args: &[String]) -> ExitCode {
     let mut port = DEFAULT_BRIDGE_PORT;
     let mut extra_origins: Vec<String> = Vec::new();
+    let mut idle_timeout = DEFAULT_IDLE_TIMEOUT;
+    let mut allow_generate = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -663,19 +685,43 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
                 };
                 extra_origins.push(origin.clone());
             }
+            "--idle-timeout" => {
+                i += 1;
+                let Some(secs_str) = args.get(i) else {
+                    eprintln!("Error: --idle-timeout requires a number of seconds");
+                    return ExitCode::FAILURE;
+                };
+                match secs_str.parse::<u64>() {
+                    Ok(secs) if (MIN_IDLE_TIMEOUT_SECS..=MAX_IDLE_TIMEOUT_SECS).contains(&secs) => {
+                        idle_timeout = Duration::from_secs(secs);
+                    }
+                    _ => {
+                        eprintln!(
+                            "Error: --idle-timeout must be a whole number of seconds between \
+                             {MIN_IDLE_TIMEOUT_SECS} and {MAX_IDLE_TIMEOUT_SECS}, got '{secs_str}'"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--allow-generate" => allow_generate = true,
             "--help" | "-h" => {
-                println!("Usage: yubikey-cli bridge [--port <port>] [--allow-origin <origin>]...");
+                println!("{BRIDGE_USAGE}");
                 return ExitCode::SUCCESS;
             }
             unknown => {
                 eprintln!("Unknown bridge option: {unknown}");
+                eprintln!("{BRIDGE_USAGE}");
                 return ExitCode::FAILURE;
             }
         }
         i += 1;
     }
 
-    let mut config = match BridgeConfig::loopback(port) {
+    let config = BridgeConfig::loopback(port)
+        .and_then(|config| config.with_idle_timeout(idle_timeout))
+        .map(|config| config.with_allow_key_generation(allow_generate));
+    let mut config = match config {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Failed to initialize bridge config: {e}");
@@ -688,6 +734,21 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
             eprintln!("Invalid --allow-origin value: {e}");
             return ExitCode::FAILURE;
         }
+    }
+
+    // Install the SIGINT/SIGTERM (and SIGHUP) handler before the bridge exists,
+    // so a signal always leads to a graceful shutdown that resets the card. A
+    // second signal while shutting down exits immediately.
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let signalled = AtomicBool::new(false);
+    if let Err(e) = ctrlc::set_handler(move || {
+        if signalled.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        let _ = stop_tx.send(());
+    }) {
+        eprintln!("Failed to install the signal handler: {e}");
+        return ExitCode::FAILURE;
     }
 
     let handle = match BridgeServer::start(config, || {
@@ -703,22 +764,37 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
     };
 
     println!("YubiKey Local PC/SC Bridge listening on {}", handle.url());
+    println!("(use exactly this URL; localhost and [::1] are rejected)");
     println!();
     println!("Allowed Origins:");
     for origin in handle.allowed_origins() {
         println!("  - {origin}");
     }
     println!();
-    println!("Session Bearer Token (paste into browser demo):");
+    println!("Bearer Token (valid until the bridge stops; paste into the browser page):");
     println!("  {}", handle.token());
     println!();
-    println!("Security: loopback-only, exact Origin allowlist, PIV-only APDU allowlist.");
+    if handle.allow_key_generation() {
+        println!(
+            "Key generation: ENABLED (--allow-generate): pages holding the token and the \
+             management key can overwrite PIV keys."
+        );
+    } else {
+        println!("Key generation: disabled (start with --allow-generate to enable it).");
+    }
+    println!(
+        "Idle timeout: {} s (an idle session is closed and the card reset).",
+        handle.idle_timeout().as_secs()
+    );
+    println!("Security: 127.0.0.1 only, exact Origin allowlist, PIV-only APDU allowlist.");
     println!("Press Ctrl+C to stop the bridge.");
 
-    let _keep_alive = handle;
-    loop {
-        std::thread::park();
-    }
+    let _ = stop_rx.recv();
+    println!();
+    println!("Stopping the bridge...");
+    handle.shutdown();
+    println!("Bridge stopped; the YubiKey session was closed.");
+    ExitCode::SUCCESS
 }
 
 fn prompt_pin() -> io::Result<String> {

@@ -149,7 +149,9 @@
 //!
 //! [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
 
-// Silence unused dev-dependency warning in unit test target (rpassword is used by yubikey-cli)
+// Silence unused dev-dependency warnings in unit test target (ctrlc and rpassword are used by yubikey-cli)
+#[cfg(test)]
+use ctrlc as _;
 #[cfg(test)]
 use rpassword as _;
 
