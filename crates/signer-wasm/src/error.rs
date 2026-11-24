@@ -3,18 +3,6 @@
 //! This module provides error types that can be properly propagated to
 //! JavaScript code. All errors implement conversion to [`JsValue`] for
 //! seamless integration with the JavaScript error handling model.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use yubikey_evm_signer_wasm::error::WasmError;
-//!
-//! // Errors can be returned from async functions and will be
-//! // converted to JavaScript Error objects automatically
-//! async fn connect() -> Result<(), WasmError> {
-//!     Err(WasmError::DeviceNotFound)
-//! }
-//! ```
 
 use std::{error, fmt};
 
@@ -25,11 +13,10 @@ use yubikey_evm_signer_core::error::Error as CoreError;
 /// Error type for WASM operations.
 ///
 /// This enum represents all possible errors that can occur during
-/// YubiKey operations in a browser environment. Each variant is
-/// designed to provide useful information to JavaScript callers.
-#[derive(Debug, Clone)]
+/// YubiKey operations in a browser environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasmError {
-    /// WebUSB is not available in this browser.
+    /// WebUSB is not available in this browser or context.
     WebUsbNotSupported,
 
     /// No YubiKey device was found or selected by the user.
@@ -38,20 +25,35 @@ pub enum WasmError {
     /// Failed to open the USB device.
     DeviceOpenFailed(String),
 
-    /// Failed to claim the USB interface.
+    /// Failed to claim the USB interface or blocked by browser policy.
     InterfaceClaimFailed(String),
 
     /// USB communication error.
     UsbError(String),
 
+    /// Local PC/SC loopback bridge error.
+    BridgeError(String),
+
     /// The PIV applet could not be selected.
     PivSelectFailed(String),
 
     /// PIN verification failed.
-    InvalidPin,
+    InvalidPin {
+        /// Remaining attempts reported by the card, if known.
+        remaining_attempts: Option<u8>,
+    },
 
     /// PIN is locked after too many failed attempts.
     PinLocked,
+
+    /// Security status is not satisfied (PIN, management key, or touch confirmation required).
+    SecurityStatusNotSatisfied,
+
+    /// Management key mutual authentication failed.
+    AuthenticationFailed,
+
+    /// The requested PIV slot identifier is invalid.
+    InvalidSlot(String),
 
     /// Key generation failed.
     KeyGenerationFailed(String),
@@ -59,8 +61,11 @@ pub enum WasmError {
     /// Signing operation failed.
     SigningFailed(String),
 
-    /// The operation timed out (e.g., waiting for touch).
+    /// The operation timed out (e.g., waiting for touch or CCID WTX limit exceeded).
     Timeout,
+
+    /// Invalid 32-byte digest hex string.
+    InvalidHash(String),
 
     /// Invalid transaction data.
     InvalidTransaction(String),
@@ -71,7 +76,7 @@ pub enum WasmError {
     /// Core library error.
     CoreError(String),
 
-    /// JavaScript error from WebUSB API.
+    /// JavaScript error from browser APIs.
     JsError(String),
 }
 
@@ -79,10 +84,16 @@ impl fmt::Display for WasmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WebUsbNotSupported => {
-                write!(f, "WebUSB is not supported in this browser")
+                write!(
+                    f,
+                    "WebUSB is not supported in this browser or requires a secure context (HTTPS/localhost)"
+                )
             }
             Self::DeviceNotFound => {
-                write!(f, "No YubiKey device found")
+                write!(
+                    f,
+                    "No YubiKey device found (note: Chromium blocks YubiKey VID 0x1050 and CCID class 0x0B on standard web pages; use YubiKeyDevice.connectBridge() with the local PC/SC bridge)"
+                )
             }
             Self::DeviceOpenFailed(msg) => {
                 write!(f, "Failed to open device: {msg}")
@@ -93,14 +104,40 @@ impl fmt::Display for WasmError {
             Self::UsbError(msg) => {
                 write!(f, "USB error: {msg}")
             }
+            Self::BridgeError(msg) => {
+                write!(f, "Bridge error: {msg}")
+            }
             Self::PivSelectFailed(msg) => {
                 write!(f, "Failed to select PIV applet: {msg}")
             }
-            Self::InvalidPin => {
+            Self::InvalidPin {
+                remaining_attempts: Some(n),
+            } => {
+                let unit = if *n == 1 { "attempt" } else { "attempts" };
+                write!(f, "Invalid PIN ({n} {unit} remaining)")
+            }
+            Self::InvalidPin {
+                remaining_attempts: None,
+            } => {
                 write!(f, "Invalid PIN")
             }
             Self::PinLocked => {
                 write!(f, "PIN is locked")
+            }
+            Self::SecurityStatusNotSatisfied => {
+                write!(
+                    f,
+                    "Security status not satisfied (PIN, management key authentication, or touch confirmation required)"
+                )
+            }
+            Self::AuthenticationFailed => {
+                write!(f, "Management key authentication failed")
+            }
+            Self::InvalidSlot(slot) => {
+                write!(
+                    f,
+                    "Invalid PIV slot '{slot}' (expected one of: 9a, 9c, 9d, 9e)"
+                )
             }
             Self::KeyGenerationFailed(msg) => {
                 write!(f, "Key generation failed: {msg}")
@@ -110,6 +147,9 @@ impl fmt::Display for WasmError {
             }
             Self::Timeout => {
                 write!(f, "Operation timed out")
+            }
+            Self::InvalidHash(msg) => {
+                write!(f, "Invalid hash: {msg}")
             }
             Self::InvalidTransaction(msg) => {
                 write!(f, "Invalid transaction: {msg}")
@@ -137,7 +177,17 @@ impl From<WasmError> for JsValue {
 
 impl From<CoreError> for WasmError {
     fn from(error: CoreError) -> Self {
-        Self::CoreError(error.to_string())
+        match error {
+            CoreError::DeviceNotFound => Self::DeviceNotFound,
+            CoreError::InvalidPin { remaining_attempts } => Self::InvalidPin { remaining_attempts },
+            CoreError::PinLocked => Self::PinLocked,
+            CoreError::SecurityStatusNotSatisfied => Self::SecurityStatusNotSatisfied,
+            CoreError::AuthenticationFailed => Self::AuthenticationFailed,
+            CoreError::TouchTimeout => Self::Timeout,
+            CoreError::InvalidTransaction(msg) => Self::InvalidTransaction(msg),
+            CoreError::InvalidTypedData(msg) => Self::InvalidTypedData(msg),
+            other => Self::CoreError(other.to_string()),
+        }
     }
 }
 
@@ -162,8 +212,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_display() {
+    fn error_display_and_core_mapping() {
         let error = WasmError::DeviceNotFound;
-        assert_eq!(error.to_string(), "No YubiKey device found");
+        assert!(error.to_string().contains("No YubiKey device found"));
+        assert!(error.to_string().contains("connectBridge"));
+
+        let pin_err: WasmError = CoreError::InvalidPin {
+            remaining_attempts: Some(2),
+        }
+        .into();
+        assert_eq!(pin_err.to_string(), "Invalid PIN (2 attempts remaining)");
+
+        let single_pin: WasmError = CoreError::InvalidPin {
+            remaining_attempts: Some(1),
+        }
+        .into();
+        assert_eq!(single_pin.to_string(), "Invalid PIN (1 attempt remaining)");
+
+        let sec_err: WasmError = CoreError::SecurityStatusNotSatisfied.into();
+        assert_eq!(sec_err, WasmError::SecurityStatusNotSatisfied);
+
+        let auth_err: WasmError = CoreError::AuthenticationFailed.into();
+        assert_eq!(auth_err, WasmError::AuthenticationFailed);
     }
 }

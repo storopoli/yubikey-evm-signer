@@ -28,29 +28,36 @@ js-sys.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
-  "Window",
+  "DomException",
+  "Headers",
   "Navigator",
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "RequestRedirect",
+  "Response",
   "Usb",
+  "UsbAlternateInterface",
+  "UsbConfiguration",
   "UsbDevice",
   "UsbDeviceFilter",
   "UsbDeviceRequestOptions",
-  "UsbConfiguration",
-  "UsbInterface",
-  "UsbAlternateInterface",
+  "UsbDirection",
   "UsbEndpoint",
   "UsbEndpointType",
-  "UsbDirection",
-  "UsbTransferStatus",
   "UsbInTransferResult",
+  "UsbInterface",
   "UsbOutTransferResult",
+  "UsbTransferStatus",
+  "Window",
 ] }
 
 # Utils
+getrandom.workspace = true
 hex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-
-# Ethereum
-alloy-primitives.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }

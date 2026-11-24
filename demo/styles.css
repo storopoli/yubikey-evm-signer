@@ -151,9 +151,30 @@ footer a:hover {
     background: #dcfce7;
 }
 
+.status-badge.experimental {
+    color: #92400e;
+    background: #fef3c7;
+}
+
 .status-badge.not-supported {
     color: #991b1b;
     background: #fee2e2;
+}
+
+.section-divider {
+    border: none;
+    border-top: 1px solid var(--color-border);
+    margin: 1.25rem 0;
+}
+
+.card h3 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.bridge-config {
+    margin-top: 0.5rem;
 }
 
 /* ============================================
@@ -184,6 +205,7 @@ footer a:hover {
 input[type="text"],
 input[type="password"],
 input[type="number"],
+select,
 textarea {
     width: 100%;
     padding: 0.5rem 0.75rem;
@@ -191,10 +213,13 @@ textarea {
     border-radius: var(--radius);
     font-size: 0.875rem;
     font-family: inherit;
+    background: var(--color-card);
+    color: var(--color-text);
     transition: border-color 0.15s;
 }
 
 input:focus,
+select:focus,
 textarea:focus {
     outline: none;
     border-color: var(--color-primary);
@@ -202,6 +227,7 @@ textarea:focus {
 }
 
 input:disabled,
+select:disabled,
 textarea:disabled {
     background: var(--color-bg);
     cursor: not-allowed;
@@ -265,6 +291,15 @@ button.secondary {
 
 button.secondary:hover:not(:disabled) {
     background: var(--color-secondary-hover);
+}
+
+button.danger {
+    background: var(--color-error);
+    color: white;
+}
+
+button.danger:hover:not(:disabled) {
+    background: #dc2626;
 }
 
 button:disabled {

@@ -155,6 +155,8 @@ use rpassword as _;
 
 // Modules
 pub mod address;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bridge;
 pub mod crypto;
 pub mod eip712;
 pub mod error;
