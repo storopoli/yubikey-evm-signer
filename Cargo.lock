@@ -1331,17 +1331,18 @@ dependencies = [
 name = "yubikey-evm-signer-wasm"
 version = "0.0.1"
 dependencies = [
- "alloy-primitives",
  "getrandom 0.4.3",
  "hex",
  "js-sys",
  "p256",
+ "serde",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
  "yubikey-evm-signer-core",
+ "zeroize",
 ]
 
 [[package]]

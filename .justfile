@@ -185,6 +185,11 @@ cli-sign-tx:
 cli-sign hash:
   cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign {{hash}}
 
+# Start hardened local PC/SC loopback bridge for browser apps
+[group('cli')]
+cli-bridge *args:
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge {{args}}
+
 # Show CLI help
 [group('cli')]
 cli-help:

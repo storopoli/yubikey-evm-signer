@@ -57,8 +57,11 @@ use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use yubikey_evm_signer_core::bridge::{BridgeConfig, BridgeServer, DEFAULT_BRIDGE_PORT};
 use yubikey_evm_signer_core::crypto::create_ethereum_signature;
-use yubikey_evm_signer_core::yubikey::{ManagementKeyAlgorithm, PcscTransport, PivSession, Slot};
+use yubikey_evm_signer_core::yubikey::{
+    ManagementKeyAlgorithm, PcscTransport, PivSession, Slot, Transport,
+};
 use yubikey_evm_signer_core::{Address, Eip1559Transaction, Transaction, U256};
 use zeroize::Zeroize;
 
@@ -77,6 +80,7 @@ fn main() -> ExitCode {
         "generate" => cmd_generate(),
         "sign" => cmd_sign(&args[2..]),
         "sign-tx" => cmd_sign_tx(),
+        "bridge" => cmd_bridge(&args[2..]),
         "--help" | "-h" | "help" => {
             print_help();
             ExitCode::SUCCESS
@@ -103,11 +107,17 @@ COMMANDS:
     generate    Generate a new P-256 key in slot 9a (requires management key)
     sign <hex>  Sign a 32-byte hash (requires PIN)
     sign-tx     Sign a sample EIP-1559 transaction (requires PIN)
+    bridge      Start hardened local PC/SC HTTP bridge for browser apps
     help        Show this help message
+
+BRIDGE OPTIONS:
+    --port <port>             Loopback TCP port (default: {DEFAULT_BRIDGE_PORT})
+    --allow-origin <origin>   Additional allowed browser Origin (repeatable)
 
 EXAMPLES:
     cargo run --example yubikey-cli --features pcsc -- list
     cargo run --example yubikey-cli --features pcsc -- address
+    cargo run --example yubikey-cli --features pcsc -- bridge --port 8765
     cargo run --example yubikey-cli --features pcsc -- sign 0x$(printf '00%.0s' {{1..32}})
 "#
     );
@@ -506,6 +516,93 @@ fn cmd_sign_tx() -> ExitCode {
             eprintln!("Signing failed: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn cmd_bridge(args: &[String]) -> ExitCode {
+    let mut port = DEFAULT_BRIDGE_PORT;
+    let mut extra_origins: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                let Some(port_str) = args.get(i) else {
+                    eprintln!("Error: --port requires a port number");
+                    return ExitCode::FAILURE;
+                };
+                match port_str.parse::<u16>() {
+                    Ok(parsed) => port = parsed,
+                    Err(e) => {
+                        eprintln!("Error: invalid port '{port_str}': {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--allow-origin" => {
+                i += 1;
+                let Some(origin) = args.get(i) else {
+                    eprintln!("Error: --allow-origin requires an Origin URL");
+                    return ExitCode::FAILURE;
+                };
+                extra_origins.push(origin.clone());
+            }
+            "--help" | "-h" => {
+                println!("Usage: yubikey-cli bridge [--port <port>] [--allow-origin <origin>]...");
+                return ExitCode::SUCCESS;
+            }
+            unknown => {
+                eprintln!("Unknown bridge option: {unknown}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+
+    let mut config = match BridgeConfig::loopback(port) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Failed to initialize bridge config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for origin in extra_origins {
+        if let Err(e) = config.add_allowed_origin(origin) {
+            eprintln!("Invalid --allow-origin value: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let handle = match BridgeServer::start(config, || {
+        let transport = PcscTransport::connect()?;
+        let boxed: Box<dyn Transport + Send> = Box::new(transport);
+        Ok(boxed)
+    }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("Failed to start local PC/SC bridge: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("YubiKey Local PC/SC Bridge listening on {}", handle.url());
+    println!();
+    println!("Allowed Origins:");
+    for origin in handle.allowed_origins() {
+        println!("  - {origin}");
+    }
+    println!();
+    println!("Session Bearer Token (paste into browser demo):");
+    println!("  {}", handle.token());
+    println!();
+    println!("Security: loopback-only, exact Origin allowlist, PIV-only APDU allowlist.");
+    println!("Press Ctrl+C to stop the bridge.");
+
+    let _keep_alive = handle;
+    loop {
+        std::thread::park();
     }
 }
 

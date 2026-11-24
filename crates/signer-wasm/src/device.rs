@@ -1,70 +1,146 @@
 //! YubiKey device abstraction for browser use.
 //!
-//! This module provides a high-level, JavaScript-friendly API for interacting
-//! with YubiKey devices via WebUSB. It wraps the lower-level transport and
-//! PIV operations into a simple interface suitable for Ethereum signing.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use yubikey_evm_signer_wasm::device::YubiKeyDevice;
-//!
-//! // Connect to a YubiKey (must be called from user gesture)
-//! let device = YubiKeyDevice::connect().await?;
-//!
-//! // Generate a new key
-//! device.generate_key("123456").await?;
-//!
-//! // Get the Ethereum address
-//! let address = device.get_address().await?;
-//!
-//! // Sign a transaction
-//! let signature = device.sign_hash("123456", &hash).await?;
-//! ```
+//! This module provides [`YubiKeyDevice`], a JavaScript-friendly API for
+//! interacting with YubiKey PIV applets over either the local PC/SC loopback
+//! bridge ([`YubiKeyDevice::connect_bridge`]) or raw WebUSB
+//! ([`YubiKeyDevice::connect`]). All PIV APDU construction, mutual management
+//! key cryptography, BER-TLV/X.509 parsing, and EIP-191/EIP-712/EIP-1559
+//! hashing are delegated directly to [`yubikey_evm_signer_core`].
 
 use std::fmt;
 
-use alloy_primitives::keccak256;
-use p256::Sec1Point;
 use p256::ecdsa::VerifyingKey;
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
-use yubikey_evm_signer_core::Address;
 use yubikey_evm_signer_core::crypto::create_ethereum_signature;
+use yubikey_evm_signer_core::eip712::TypedData;
 use yubikey_evm_signer_core::yubikey::Slot;
 use yubikey_evm_signer_core::yubikey::apdu::Apdu;
+use yubikey_evm_signer_core::yubikey::piv::{
+    ManagementKeyAlgorithm, build_generate_key_apdu, build_get_certificate_apdu,
+    build_mgmt_auth_request_witness_apdu, build_mgmt_auth_verify_apdu, build_select_piv_apdu,
+    build_sign_apdu, build_verify_pin_apdu, decrypt_mgmt_witness, encrypt_mgmt_challenge,
+    parse_challenge_response, parse_public_key_response, parse_signature_response,
+    parse_witness_response, verify_mgmt_challenge_response,
+};
+use yubikey_evm_signer_core::{Address, Transaction, eip191_hash};
 
+use crate::bridge_transport::BridgeTransport;
 use crate::error::{WasmError, WasmResult};
 use crate::transport::WebUsbTransport;
 
-/// PIV applet AID (Application Identifier).
-const PIV_AID: [u8; 9] = [0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00];
-
-/// PIV instruction codes.
-mod ins {
-    /// `SELECT` instruction.
-    pub(super) const SELECT: u8 = 0xA4;
-
-    /// `VERIFY` instruction.
-    pub(super) const VERIFY: u8 = 0x20;
-
-    /// `AUTHENTICATE` instruction.
-    pub(super) const AUTHENTICATE: u8 = 0x87;
-
-    /// `GENERATE ASYMMETRIC` instruction.
-    pub(super) const GENERATE_ASYMMETRIC: u8 = 0x47;
-
-    /// `GET DATA` instruction.
-    pub(super) const GET_DATA: u8 = 0xCB;
+/// Active browser transport backing a [`YubiKeyDevice`].
+enum DeviceTransport {
+    WebUsb(WebUsbTransport),
+    Bridge(BridgeTransport),
 }
 
-/// Algorithm identifier for P-256.
-const ALG_ECCP256: u8 = 0x11;
+impl DeviceTransport {
+    async fn transmit_async(
+        &mut self,
+        apdu: &Apdu,
+    ) -> WasmResult<yubikey_evm_signer_core::yubikey::ApduResponse> {
+        match self {
+            Self::WebUsb(t) => t.transmit_async(apdu).await,
+            Self::Bridge(t) => t.transmit_async(apdu).await,
+        }
+    }
+
+    async fn transmit_full_async(
+        &mut self,
+        apdu: &Apdu,
+        slot: Option<Slot>,
+    ) -> WasmResult<Vec<u8>> {
+        match self {
+            Self::WebUsb(t) => t.transmit_full_async(apdu, slot).await,
+            Self::Bridge(t) => t.transmit_full_async(apdu, slot).await,
+        }
+    }
+
+    async fn close(&mut self) -> WasmResult<()> {
+        match self {
+            Self::WebUsb(t) => t.close().await,
+            Self::Bridge(t) => t.close().await,
+        }
+    }
+
+    const fn is_connected(&self) -> bool {
+        match self {
+            Self::WebUsb(t) => t.is_connected(),
+            Self::Bridge(t) => t.is_connected(),
+        }
+    }
+}
+
+/// Parses a PIV slot string (`"9a"`, `"9c"`, `"9d"`, `"9e"`, case-insensitive).
+///
+/// # Errors
+///
+/// Returns [`WasmError::InvalidSlot`] if the slot string is unrecognized.
+pub fn parse_slot_str(slot: &str) -> WasmResult<Slot> {
+    match slot.trim().to_ascii_lowercase().as_str() {
+        "9a" => Ok(Slot::Authentication),
+        "9c" => Ok(Slot::Signature),
+        "9d" => Ok(Slot::KeyManagement),
+        "9e" => Ok(Slot::CardAuthentication),
+        other => Err(WasmError::InvalidSlot(other.to_string())),
+    }
+}
+
+/// Formats a [`Slot`] as its two-character lowercase hex identifier.
+#[must_use]
+pub const fn slot_to_str(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Authentication => "9a",
+        Slot::Signature => "9c",
+        Slot::KeyManagement => "9d",
+        Slot::CardAuthentication => "9e",
+    }
+}
+
+/// Parses an optional management key algorithm string (defaults to AES-192).
+///
+/// # Errors
+///
+/// Returns [`WasmError::AuthenticationFailed`] if the algorithm name is unsupported.
+pub fn parse_mgmt_algorithm(algorithm: Option<&str>) -> WasmResult<ManagementKeyAlgorithm> {
+    match algorithm
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("aes192") => Ok(ManagementKeyAlgorithm::Aes192),
+        Some("tdes" | "3des") => Ok(ManagementKeyAlgorithm::Tdes),
+        Some("aes128") => Ok(ManagementKeyAlgorithm::Aes128),
+        Some("aes256") => Ok(ManagementKeyAlgorithm::Aes256),
+        Some(_) => Err(WasmError::AuthenticationFailed),
+    }
+}
+
+/// Parses a 32-byte digest hex string (with optional `0x`/`0X` prefix).
+///
+/// # Errors
+///
+/// Returns [`WasmError::InvalidHash`] if the input is not valid 32-byte hex.
+pub fn parse_hash_hex(hash: &str) -> WasmResult<[u8; 32]> {
+    let trimmed = hash.trim();
+    let hex_str = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+
+    let bytes = hex::decode(hex_str).map_err(|e| WasmError::InvalidHash(e.to_string()))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        WasmError::InvalidHash(format!("hash must be exactly 32 bytes, got {}", v.len()))
+    })
+}
 
 /// A connected YubiKey device.
 ///
-/// This type represents an active connection to a YubiKey device and provides
-/// methods for Ethereum-related operations such as key generation and signing.
+/// Supports both the local PC/SC loopback bridge (recommended across all desktop
+/// browsers and OSes) and direct WebUSB.
 ///
 /// # Thread Safety
 ///
@@ -72,17 +148,20 @@ const ALG_ECCP256: u8 = 0x11;
 /// in a browser environment.
 #[wasm_bindgen]
 pub struct YubiKeyDevice {
-    /// The underlying WebUSB transport.
-    transport: WebUsbTransport,
+    /// The underlying transport (WebUSB or local PC/SC bridge).
+    transport: DeviceTransport,
 
-    /// The PIV slot to use for Ethereum signing.
+    /// The active PIV slot for key retrieval, generation, and signing.
     slot: Slot,
 
-    /// Cached public key (if retrieved).
+    /// Cached P-256 verifying key for the active slot.
     cached_public_key: Option<VerifyingKey>,
 
-    /// Whether PIN has been verified in current session.
+    /// Whether the PIN was verified during the current session.
     authenticated: bool,
+
+    /// Whether the management key was mutually authenticated in this session.
+    mgmt_authenticated: bool,
 }
 
 impl fmt::Debug for YubiKeyDevice {
@@ -90,6 +169,7 @@ impl fmt::Debug for YubiKeyDevice {
         f.debug_struct("YubiKeyDevice")
             .field("slot", &self.slot)
             .field("authenticated", &self.authenticated)
+            .field("mgmt_authenticated", &self.mgmt_authenticated)
             .field("has_cached_key", &self.cached_public_key.is_some())
             .finish_non_exhaustive()
     }
@@ -97,56 +177,196 @@ impl fmt::Debug for YubiKeyDevice {
 
 #[wasm_bindgen]
 impl YubiKeyDevice {
-    /// Connects to a YubiKey device via WebUSB.
+    /// Connects to a YubiKey device via WebUSB (experimental on standard web pages).
     ///
-    /// This method must be called in response to a user gesture (e.g., button click).
-    /// It will display the browser's device picker dialog.
-    ///
-    /// # Returns
-    ///
-    /// A `Promise` that resolves to a [`YubiKeyDevice`] instance.
+    /// Must be called from a user gesture (e.g., button click). Note that standard
+    /// Chromium browsers block YubiKey VID `0x1050` and CCID class `0x0B` on regular
+    /// web pages; use [`connect_bridge`](Self::connect_bridge) for full cross-browser
+    /// support with real YubiKeys.
     ///
     /// # Errors
     ///
-    /// - If WebUSB is not supported
-    /// - If no device was selected
-    /// - If the device could not be opened
+    /// Returns a JS `Error` if WebUSB is unsupported, blocked, cancelled, or PIV
+    /// selection fails.
     #[wasm_bindgen]
     pub async fn connect() -> Result<YubiKeyDevice, JsValue> {
-        Self::connect_internal().await.map_err(JsValue::from)
+        Self::connect_webusb_internal().await.map_err(JsValue::from)
     }
 
-    /// Internal connect implementation.
-    async fn connect_internal() -> WasmResult<YubiKeyDevice> {
-        let mut transport = WebUsbTransport::request_device().await?;
-
-        // Select PIV applet
-        let apdu = Apdu::new(0x00, ins::SELECT, 0x04, 0x00, PIV_AID.to_vec());
-        let response = transport.transmit_async(&apdu).await?;
-        response
-            .check()
-            .map_err(|e| WasmError::PivSelectFailed(e.to_string()))?;
-
-        Ok(Self {
-            transport,
-            slot: Slot::Authentication, // Slot 9a is recommended for Ethereum
-            cached_public_key: None,
-            authenticated: false,
-        })
-    }
-
-    /// Verifies the user's PIN.
+    /// Connects to a YubiKey device via the hardened local PC/SC loopback bridge.
     ///
-    /// This must be called before signing operations.
+    /// Works across Chrome, Firefox, Safari, Edge, and Brave on macOS, Linux, and Windows.
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN string (typically 6-8 digits)
+    /// * `url` - Loopback bridge URL (e.g. `"http://127.0.0.1:8765"`)
+    /// * `token` - Per-session bearer token printed by `yubikey-cli bridge`
     ///
     /// # Errors
     ///
-    /// - If the PIN is incorrect
-    /// - If the PIN is locked
+    /// Returns a JS `Error` if `url` is not loopback, authentication fails, or no
+    /// YubiKey is available on the local PC/SC daemon.
+    #[wasm_bindgen(js_name = "connectBridge")]
+    pub async fn connect_bridge(url: &str, token: &str) -> Result<YubiKeyDevice, JsValue> {
+        Self::connect_bridge_internal(url, token)
+            .await
+            .map_err(JsValue::from)
+    }
+
+    /// Internal WebUSB connection flow.
+    async fn connect_webusb_internal() -> WasmResult<YubiKeyDevice> {
+        let mut transport = WebUsbTransport::request_device().await?;
+
+        let select_apdu = build_select_piv_apdu();
+        if let Err(err) = transport.transmit_full_async(&select_apdu, None).await {
+            let _ = transport.close().await;
+            return Err(WasmError::PivSelectFailed(err.to_string()));
+        }
+
+        Ok(Self {
+            transport: DeviceTransport::WebUsb(transport),
+            slot: Slot::Authentication,
+            cached_public_key: None,
+            authenticated: false,
+            mgmt_authenticated: false,
+        })
+    }
+
+    /// Internal bridge connection flow (`/v1/connect` already selects `PIV_AID`).
+    async fn connect_bridge_internal(url: &str, token: &str) -> WasmResult<YubiKeyDevice> {
+        let transport = BridgeTransport::connect(url, token).await?;
+
+        Ok(Self {
+            transport: DeviceTransport::Bridge(transport),
+            slot: Slot::Authentication,
+            cached_public_key: None,
+            authenticated: false,
+            mgmt_authenticated: false,
+        })
+    }
+
+    /// Sets the active PIV slot (`"9a"`, `"9c"`, `"9d"`, or `"9e"`, case-insensitive).
+    ///
+    /// Changing the slot invalidates any cached public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if `slot` is not one of `9a`, `9c`, `9d`, or `9e`.
+    #[wasm_bindgen(js_name = "setSlot")]
+    pub fn set_slot(&mut self, slot: &str) -> Result<(), JsValue> {
+        let parsed = parse_slot_str(slot).map_err(JsValue::from)?;
+        if parsed != self.slot {
+            self.slot = parsed;
+            self.cached_public_key = None;
+        }
+        Ok(())
+    }
+
+    /// Returns the currently selected PIV slot (`"9a"`, `"9c"`, `"9d"`, or `"9e"`).
+    #[wasm_bindgen(js_name = "getSlot")]
+    pub fn get_slot(&self) -> String {
+        slot_to_str(self.slot).to_string()
+    }
+
+    /// Performs NIST SP 800-73-4 mutual management key authentication (required before `generateKey`).
+    ///
+    /// # Arguments
+    ///
+    /// * `key_hex` - Raw management key as hex (with optional `0x` prefix)
+    /// * `algorithm` - Optional algorithm: `"aes192"` (default for YubiKey 5.7+),
+    ///   `"tdes"` (default for YubiKey `< 5.7`), `"aes128"`, or `"aes256"`
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if the key/algorithm is invalid or mutual authentication fails.
+    #[wasm_bindgen(js_name = "authenticateManagementKey")]
+    pub async fn authenticate_management_key(
+        &mut self,
+        key_hex: &str,
+        algorithm: Option<String>,
+    ) -> Result<(), JsValue> {
+        self.authenticate_management_key_internal(key_hex, algorithm.as_deref())
+            .await
+            .map_err(JsValue::from)
+    }
+
+    /// Internal mutual management key authentication.
+    async fn authenticate_management_key_internal(
+        &mut self,
+        key_hex: &str,
+        algorithm: Option<&str>,
+    ) -> WasmResult<()> {
+        self.mgmt_authenticated = false;
+
+        let alg = parse_mgmt_algorithm(algorithm)?;
+        let trimmed = key_hex.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+
+        let key =
+            Zeroizing::new(hex::decode(stripped).map_err(|_| WasmError::AuthenticationFailed)?);
+        if key.len() != alg.key_len() {
+            return Err(WasmError::AuthenticationFailed);
+        }
+
+        // Step 1: Request encrypted witness from card
+        let witness_apdu = build_mgmt_auth_request_witness_apdu(alg);
+        let witness_resp = self
+            .transport
+            .transmit_full_async(&witness_apdu, None)
+            .await?;
+        let witness = parse_witness_response(&witness_resp, alg.block_size())
+            .ok_or(WasmError::AuthenticationFailed)?;
+
+        // Step 2: Decrypt witness and generate fresh CSPRNG host challenge
+        let decrypted_witness = Zeroizing::new(decrypt_mgmt_witness(alg, &key, &witness)?);
+        let mut our_challenge = Zeroizing::new(vec![0u8; alg.block_size()]);
+        getrandom::fill(&mut our_challenge)
+            .map_err(|e| WasmError::CoreError(format!("CSPRNG failed: {e}")))?;
+
+        // Step 3: Send decrypted witness (0x80) and plaintext host challenge (0x81)
+        let mut verify_apdu = build_mgmt_auth_verify_apdu(alg, &decrypted_witness, &our_challenge)?;
+        drop(decrypted_witness);
+
+        let transmit_res = self.transport.transmit_full_async(&verify_apdu, None).await;
+        verify_apdu.zeroize_data();
+
+        let card_data = match transmit_res {
+            Ok(data) => data,
+            Err(WasmError::SecurityStatusNotSatisfied) => {
+                return Err(WasmError::AuthenticationFailed);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Step 4: Verify card's encrypted challenge response in constant time
+        let expected_response = Zeroizing::new(encrypt_mgmt_challenge(alg, &key, &our_challenge)?);
+        drop(our_challenge);
+
+        let actual_response = Zeroizing::new(
+            parse_challenge_response(&card_data, alg.block_size())
+                .ok_or(WasmError::AuthenticationFailed)?,
+        );
+
+        if !verify_mgmt_challenge_response(&expected_response, &actual_response) {
+            return Err(WasmError::AuthenticationFailed);
+        }
+
+        self.mgmt_authenticated = true;
+        Ok(())
+    }
+
+    /// Verifies the user's PIV PIN (6-8 bytes).
+    ///
+    /// Always validates the PIN length locally and transmits `VERIFY` to the YubiKey,
+    /// scrubbing the APDU payload immediately afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if the PIN is invalid (with remaining retries when reported)
+    /// or locked.
     #[wasm_bindgen(js_name = "verifyPin")]
     pub async fn verify_pin(&mut self, pin: &str) -> Result<(), JsValue> {
         self.verify_pin_internal(pin).await.map_err(JsValue::from)
@@ -154,77 +374,68 @@ impl YubiKeyDevice {
 
     /// Internal PIN verification.
     async fn verify_pin_internal(&mut self, pin: &str) -> WasmResult<()> {
-        let pin_bytes = pin.as_bytes();
-        if pin_bytes.len() > 8 {
-            return Err(WasmError::InvalidPin);
-        }
+        // Always reset before verifying so stale state can never bypass a wrong PIN
+        self.authenticated = false;
 
-        // Pad PIN to 8 bytes with 0xFF
-        let mut padded_pin = [0xFF; 8];
-        padded_pin[..pin_bytes.len()].copy_from_slice(pin_bytes);
+        let mut apdu = build_verify_pin_apdu(pin)?;
+        let resp_res = self.transport.transmit_async(&apdu).await;
+        apdu.zeroize_data();
 
-        let apdu = Apdu::new(0x00, ins::VERIFY, 0x00, 0x80, padded_pin.to_vec());
-        let response = self.transport.transmit_async(&apdu).await?;
+        let response = resp_res?;
+        response.check().map_err(WasmError::from)?;
 
-        match response.check() {
-            Ok(()) => {
-                self.authenticated = true;
-                Ok(())
-            }
-            Err(e) => {
-                let error_str = e.to_string();
-                if error_str.contains("locked") {
-                    Err(WasmError::PinLocked)
-                } else {
-                    Err(WasmError::InvalidPin)
-                }
-            }
-        }
+        self.authenticated = true;
+        Ok(())
     }
 
-    /// Generates a new P-256 key pair in the YubiKey.
+    /// Generates a new P-256 key pair in the active PIV slot.
+    ///
+    /// Requires prior management key authentication via
+    /// [`authenticate_management_key`](Self::authenticate_management_key).
+    /// **Warning:** this overwrites any existing key in the active slot.
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN for authentication
+    /// * `pin` - Optional PIN; if non-empty, verified before key generation
     ///
     /// # Returns
     ///
-    /// The Ethereum address derived from the generated public key.
+    /// The checksummed Ethereum address derived from the generated public key.
     ///
     /// # Errors
     ///
-    /// - If PIN verification fails
-    /// - If key generation fails
+    /// Returns a JS `Error` if the management key is not authenticated or key
+    /// generation fails.
     #[wasm_bindgen(js_name = "generateKey")]
-    pub async fn generate_key(&mut self, pin: &str) -> Result<String, JsValue> {
-        self.generate_key_internal(pin).await.map_err(JsValue::from)
+    pub async fn generate_key(&mut self, pin: Option<String>) -> Result<String, JsValue> {
+        self.generate_key_internal(pin.as_deref())
+            .await
+            .map_err(JsValue::from)
     }
 
     /// Internal key generation.
-    async fn generate_key_internal(&mut self, pin: &str) -> WasmResult<String> {
-        // Verify PIN first
-        if !self.authenticated {
-            self.verify_pin_internal(pin).await?;
+    async fn generate_key_internal(&mut self, pin: Option<&str>) -> WasmResult<String> {
+        if !self.mgmt_authenticated {
+            return Err(WasmError::SecurityStatusNotSatisfied);
         }
 
-        // Build generate key APDU
-        let template = vec![0xAC, 0x03, 0x80, 0x01, ALG_ECCP256];
-        let apdu = Apdu::new(
-            0x00,
-            ins::GENERATE_ASYMMETRIC,
-            0x00,
-            self.slot.id(),
-            template,
-        );
+        if let Some(p) = pin
+            && !p.is_empty()
+        {
+            self.verify_pin_internal(p).await?;
+        }
 
-        let response = self.transport.transmit_async(&apdu).await?;
-        response
-            .check()
-            .map_err(|e| WasmError::KeyGenerationFailed(e.to_string()))?;
+        let apdu = build_generate_key_apdu(self.slot);
+        let data = self
+            .transport
+            .transmit_full_async(&apdu, Some(self.slot))
+            .await
+            .map_err(|e| match e {
+                WasmError::SecurityStatusNotSatisfied => WasmError::SecurityStatusNotSatisfied,
+                other => WasmError::KeyGenerationFailed(other.to_string()),
+            })?;
 
-        // Parse public key from response
-        let public_key = parse_public_key_response(response.data())
+        let public_key = parse_public_key_response(&data)
             .ok_or_else(|| WasmError::KeyGenerationFailed("invalid response".to_string()))?;
 
         let address = Address::from_public_key(&public_key);
@@ -233,16 +444,14 @@ impl YubiKeyDevice {
         Ok(address.to_checksum_hex())
     }
 
-    /// Gets the Ethereum address for the key in the current slot.
+    /// Retrieves the checksummed Ethereum address for the P-256 key in the active slot.
     ///
-    /// # Returns
-    ///
-    /// The checksummed Ethereum address as a hex string.
+    /// Reads and strictly validates the slot's X.509 certificate (including gzip-compressed
+    /// PIV certificates and multi-chunk `61 XX` responses).
     ///
     /// # Errors
     ///
-    /// - If no key is present in the slot
-    /// - If the key type is not supported
+    /// Returns a JS `Error` if the slot has no certificate or does not hold a P-256 key.
     #[wasm_bindgen(js_name = "getAddress")]
     pub async fn get_address(&mut self) -> Result<String, JsValue> {
         self.get_address_internal().await.map_err(JsValue::from)
@@ -250,28 +459,30 @@ impl YubiKeyDevice {
 
     /// Internal address retrieval.
     async fn get_address_internal(&mut self) -> WasmResult<String> {
-        // Use cached public key if available
         if let Some(ref pk) = self.cached_public_key {
             return Ok(Address::from_public_key(pk).to_checksum_hex());
         }
 
-        // Retrieve public key from device
-        let object_id = self.slot.object_id();
-        let data = vec![0x5C, 0x03, object_id[0], object_id[1], object_id[2]];
-        let apdu = Apdu::with_le(0x00, ins::GET_DATA, 0x3F, 0xFF, data, 256);
+        let apdu = build_get_certificate_apdu(self.slot);
+        let data = self
+            .transport
+            .transmit_full_async(&apdu, Some(self.slot))
+            .await?;
 
-        let response = self.transport.transmit_async(&apdu).await?;
-        response
-            .check()
-            .map_err(|e| WasmError::CoreError(e.to_string()))?;
-
-        if response.data().is_empty() {
-            return Err(WasmError::CoreError("slot is empty".to_string()));
+        if data.is_empty() {
+            return Err(WasmError::CoreError(format!(
+                "PIV slot {} is empty",
+                slot_to_str(self.slot)
+            )));
         }
 
-        // Parse public key from certificate
-        let public_key = parse_certificate_public_key(response.data())
-            .ok_or_else(|| WasmError::CoreError("invalid key type".to_string()))?;
+        let public_key = yubikey_evm_signer_core::yubikey::piv::parse_certificate_public_key(&data)
+            .ok_or_else(|| {
+                WasmError::CoreError(format!(
+                    "certificate in slot {} does not contain a valid P-256 public key",
+                    slot_to_str(self.slot)
+                ))
+            })?;
 
         let address = Address::from_public_key(&public_key);
         self.cached_public_key = Some(public_key);
@@ -279,40 +490,36 @@ impl YubiKeyDevice {
         Ok(address.to_checksum_hex())
     }
 
-    /// Signs a 32-byte hash using the YubiKey.
+    /// Signs a 32-byte prehashed digest using the YubiKey.
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN for authentication
-    /// * `hash` - The 32-byte hash to sign (as hex string with optional 0x prefix)
+    /// * `pin` - PIV PIN (always validated and verified when the slot requires a PIN or `pin` is non-empty)
+    /// * `hash` - 32-byte digest as hex (with optional `0x` prefix)
     ///
     /// # Returns
     ///
-    /// The signature as a hex string (r || s || v, 65 bytes).
+    /// The 65-byte low-S Ethereum signature (`r || s || v`) as a `0x`-prefixed hex string.
     ///
     /// # Errors
     ///
-    /// - If PIN verification fails
-    /// - If the hash is invalid
-    /// - If signing fails
+    /// Returns a JS `Error` if the hash or PIN is invalid, or signing fails.
     #[wasm_bindgen(js_name = "signHash")]
     pub async fn sign_hash(&mut self, pin: &str, hash: &str) -> Result<String, JsValue> {
-        self.sign_hash_internal(pin, hash)
+        let hash_bytes = parse_hash_hex(hash).map_err(JsValue::from)?;
+        self.sign_digest_internal(pin, &hash_bytes)
             .await
             .map_err(JsValue::from)
     }
 
-    /// Internal hash signing.
-    async fn sign_hash_internal(&mut self, pin: &str, hash: &str) -> WasmResult<String> {
-        // Parse hash
-        let hash_str = hash.strip_prefix("0x").unwrap_or(hash);
-        let hash_bytes: [u8; 32] = hex::decode(hash_str)
-            .map_err(|e| WasmError::InvalidTransaction(e.to_string()))?
-            .try_into()
-            .map_err(|_| WasmError::InvalidTransaction("hash must be 32 bytes".to_string()))?;
-
-        // Verify PIN if needed
-        if !self.authenticated {
+    /// Internal 32-byte digest signing.
+    async fn sign_digest_internal(
+        &mut self,
+        pin: &str,
+        hash_bytes: &[u8; 32],
+    ) -> WasmResult<String> {
+        // Always verify PIN when the slot requires it or a PIN string was provided
+        if self.slot.requires_pin() || !pin.is_empty() {
             self.verify_pin_internal(pin).await?;
         }
 
@@ -321,53 +528,55 @@ impl YubiKeyDevice {
             self.get_address_internal().await?;
         }
 
-        let public_key = self.cached_public_key.as_ref().unwrap();
+        let public_key = self.cached_public_key.ok_or_else(|| {
+            WasmError::SigningFailed(
+                "public key could not be retrieved for active slot".to_string(),
+            )
+        })?;
 
-        // Build sign APDU
-        let mut template = Vec::with_capacity(6 + hash_bytes.len());
-        template.push(0x7C);
-        template.push((4 + hash_bytes.len()) as u8);
-        template.push(0x82);
-        template.push(0x00);
-        template.push(0x81);
-        template.push(hash_bytes.len() as u8);
-        template.extend_from_slice(&hash_bytes);
+        let apdu = build_sign_apdu(self.slot, hash_bytes);
+        let response_data = match self
+            .transport
+            .transmit_full_async(&apdu, Some(self.slot))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(WasmError::SecurityStatusNotSatisfied) => {
+                self.authenticated = false;
+                return Err(WasmError::SecurityStatusNotSatisfied);
+            }
+            Err(e) => return Err(e),
+        };
 
-        let apdu = Apdu::with_le(
-            0x00,
-            ins::AUTHENTICATE,
-            ALG_ECCP256,
-            self.slot.id(),
-            template,
-            256,
-        );
+        // Slot 9c (Digital Signature) enforces PIN-always on YubiKey
+        if self.slot == Slot::Signature {
+            self.authenticated = false;
+        }
 
-        let response = self.transport.transmit_async(&apdu).await?;
-        response
-            .check()
-            .map_err(|e| WasmError::SigningFailed(e.to_string()))?;
-
-        // Parse DER signature
-        let der_sig = parse_signature_response(response.data())
+        let der_sig = parse_signature_response(&response_data)
             .ok_or_else(|| WasmError::SigningFailed("invalid signature response".to_string()))?;
 
-        // Convert to Ethereum signature format
-        let signature = create_ethereum_signature(&der_sig, &hash_bytes, public_key)
+        let signature = create_ethereum_signature(&der_sig, hash_bytes, &public_key)
             .map_err(|e| WasmError::SigningFailed(e.to_string()))?;
 
         Ok(signature.to_hex())
     }
 
-    /// Signs an Ethereum transaction.
+    /// Signs an Ethereum transaction (EIP-155 legacy or EIP-1559).
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN for authentication
-    /// * `tx_json` - The transaction as a JSON string
+    /// * `pin` - PIV PIN
+    /// * `tx_json` - Transaction JSON string (`type: "eip1559" | "legacy"`)
     ///
     /// # Returns
     ///
-    /// The signature as a hex string.
+    /// The 65-byte low-S signature (`r || s || v`) as a `0x`-prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if the transaction JSON is invalid, PIN verification fails,
+    /// or hardware signing fails.
     #[wasm_bindgen(js_name = "signTransaction")]
     pub async fn sign_transaction(&mut self, pin: &str, tx_json: &str) -> Result<String, JsValue> {
         self.sign_transaction_internal(pin, tx_json)
@@ -377,27 +586,27 @@ impl YubiKeyDevice {
 
     /// Internal transaction signing.
     async fn sign_transaction_internal(&mut self, pin: &str, tx_json: &str) -> WasmResult<String> {
-        use yubikey_evm_signer_core::Transaction;
-
         let tx: Transaction = serde_json::from_str(tx_json)
             .map_err(|e| WasmError::InvalidTransaction(e.to_string()))?;
 
-        let hash = tx.signing_hash();
-        let hash_hex = format!("0x{}", hex::encode(hash.as_slice()));
-
-        self.sign_hash_internal(pin, &hash_hex).await
+        let hash: [u8; 32] = tx.signing_hash().into();
+        self.sign_digest_internal(pin, &hash).await
     }
 
-    /// Signs EIP-712 typed data.
+    /// Signs EIP-712 typed structured data.
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN for authentication
-    /// * `typed_data_json` - The typed data as a JSON string
+    /// * `pin` - PIV PIN
+    /// * `typed_data_json` - EIP-712 typed data JSON string
     ///
     /// # Returns
     ///
-    /// The signature as a hex string.
+    /// The 65-byte low-S signature (`r || s || v`) as a `0x`-prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if the typed data is invalid or signing fails.
     #[wasm_bindgen(js_name = "signTypedData")]
     pub async fn sign_typed_data(
         &mut self,
@@ -409,14 +618,12 @@ impl YubiKeyDevice {
             .map_err(JsValue::from)
     }
 
-    /// Internal typed data signing.
+    /// Internal EIP-712 signing.
     async fn sign_typed_data_internal(
         &mut self,
         pin: &str,
         typed_data_json: &str,
     ) -> WasmResult<String> {
-        use yubikey_evm_signer_core::eip712::TypedData;
-
         let typed_data: TypedData = serde_json::from_str(typed_data_json)
             .map_err(|e| WasmError::InvalidTypedData(e.to_string()))?;
 
@@ -424,48 +631,45 @@ impl YubiKeyDevice {
             .signing_hash()
             .map_err(|e| WasmError::InvalidTypedData(e.to_string()))?;
 
-        let hash_hex = format!("0x{}", hex::encode(hash));
-
-        self.sign_hash_internal(pin, &hash_hex).await
+        self.sign_digest_internal(pin, &hash).await
     }
 
-    /// Signs a personal message (EIP-191).
+    /// Signs a personal message using EIP-191 (`personal_sign`).
     ///
     /// # Arguments
     ///
-    /// * `pin` - The PIN for authentication
-    /// * `message` - The message to sign (as UTF-8 string)
+    /// * `pin` - PIV PIN
+    /// * `message` - UTF-8 message string
     ///
     /// # Returns
     ///
-    /// The signature as a hex string.
+    /// The 65-byte low-S signature (`r || s || v`) as a `0x`-prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if PIN verification or signing fails.
     #[wasm_bindgen(js_name = "signMessage")]
     pub async fn sign_message(&mut self, pin: &str, message: &str) -> Result<String, JsValue> {
-        self.sign_message_internal(pin, message)
+        let hash: [u8; 32] = eip191_hash(message.as_bytes()).into();
+        self.sign_digest_internal(pin, &hash)
             .await
             .map_err(JsValue::from)
     }
 
-    /// Internal message signing (EIP-191).
-    async fn sign_message_internal(&mut self, pin: &str, message: &str) -> WasmResult<String> {
-        // EIP-191 personal message prefix
-        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
-        let mut data = prefix.into_bytes();
-        data.extend_from_slice(message.as_bytes());
-
-        let hash = keccak256(&data);
-        let hash_hex = format!("0x{}", hex::encode(hash.as_slice()));
-
-        self.sign_hash_internal(pin, &hash_hex).await
-    }
-
-    /// Disconnects from the YubiKey device.
+    /// Disconnects from the YubiKey and clears all cached session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS `Error` if closing the transport fails.
     #[wasm_bindgen]
     pub async fn disconnect(&mut self) -> Result<(), JsValue> {
+        self.authenticated = false;
+        self.mgmt_authenticated = false;
+        self.cached_public_key = None;
         self.transport.close().await.map_err(JsValue::from)
     }
 
-    /// Checks if the device is still connected.
+    /// Checks if the underlying device transport is still connected.
     #[wasm_bindgen(js_name = "isConnected")]
     #[allow(clippy::missing_const_for_fn)]
     pub fn is_connected(&self) -> bool {
@@ -473,129 +677,124 @@ impl YubiKeyDevice {
     }
 }
 
-/// Parses a public key from a `GENERATE ASYMMETRIC` response.
-fn parse_public_key_response(data: &[u8]) -> Option<VerifyingKey> {
-    // Response format: 7F 49 len 86 len point
-    let mut i = 0;
-
-    // Skip outer tag (7F 49)
-    if data.len() < 2 || data[i] != 0x7F || data[i + 1] != 0x49 {
-        return None;
-    }
-    i += 2;
-
-    // Skip length
-    let (_, consumed) = parse_der_length(data, i)?;
-    i = i.checked_add(consumed)?;
-
-    // Find tag 86
-    while i < data.len() {
-        if data[i] == 0x86 {
-            i += 1;
-            let (len, consumed) = parse_der_length(data, i)?;
-            i = i.checked_add(consumed)?;
-            let end = i.checked_add(len)?;
-
-            if len == 65 && data.get(i) == Some(&0x04) && end <= data.len() {
-                let point_bytes = &data[i..end];
-                let point = Sec1Point::from_bytes(point_bytes).ok()?;
-                return VerifyingKey::from_sec1_point(&point).ok();
-            }
-            break;
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// Parses a public key from a certificate response.
-fn parse_certificate_public_key(data: &[u8]) -> Option<VerifyingKey> {
-    // Look for uncompressed point (0x04 followed by 64 bytes)
-    for i in 0..data.len().saturating_sub(65) {
-        if data[i] == 0x04 {
-            let point_bytes = &data[i..i + 65];
-            if let Ok(point) = Sec1Point::from_bytes(point_bytes)
-                && let Ok(key) = VerifyingKey::from_sec1_point(&point)
-            {
-                return Some(key);
-            }
-        }
-    }
-    None
-}
-
-/// Parses a signature from a `GENERAL AUTHENTICATE` response.
-fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
-    // Response format: 7C len 82 len signature
-    let mut i = 0;
-
-    if data.is_empty() || data[i] != 0x7C {
-        return None;
-    }
-    i += 1;
-
-    // Skip outer length
-    if i >= data.len() {
-        return None;
-    }
-    let (_, consumed) = parse_der_length(data, i)?;
-    i = i.checked_add(consumed)?;
-
-    // Find tag 82
-    while i < data.len() {
-        if data[i] == 0x82 {
-            i += 1;
-            if i >= data.len() {
-                return None;
-            }
-
-            let (len, consumed) = parse_der_length(data, i)?;
-            i = i.checked_add(consumed)?;
-            let end = i.checked_add(len)?;
-
-            if end <= data.len() {
-                return Some(data[i..end].to_vec());
-            }
-            break;
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// Parses a DER-style length at `offset` and returns `(value, consumed_bytes)`.
-fn parse_der_length(data: &[u8], offset: usize) -> Option<(usize, usize)> {
-    let first = *data.get(offset)?;
-    if first < 0x80 {
-        return Some((first as usize, 1));
-    }
-
-    let len_bytes = (first & 0x7F) as usize;
-    if len_bytes == 0 {
-        return None;
-    }
-
-    let start = offset.checked_add(1)?;
-    let end = start.checked_add(len_bytes)?;
-    let bytes = data.get(start..end)?;
-
-    let mut len = 0usize;
-    for &b in bytes {
-        len = len.checked_shl(8)? | usize::from(b);
-    }
-
-    Some((len, 1 + len_bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn piv_aid() {
-        assert_eq!(PIV_AID.len(), 9);
-        assert_eq!(PIV_AID[0], 0xA0);
+    fn slot_and_algorithm_parsing() {
+        assert_eq!(parse_slot_str("9a").unwrap(), Slot::Authentication);
+        assert_eq!(parse_slot_str(" 9C ").unwrap(), Slot::Signature);
+        assert_eq!(parse_slot_str("9d").unwrap(), Slot::KeyManagement);
+        assert_eq!(parse_slot_str("9E").unwrap(), Slot::CardAuthentication);
+        assert!(matches!(
+            parse_slot_str("82"),
+            Err(WasmError::InvalidSlot(_))
+        ));
+
+        assert_eq!(slot_to_str(Slot::Authentication), "9a");
+        assert_eq!(slot_to_str(Slot::Signature), "9c");
+        assert_eq!(slot_to_str(Slot::KeyManagement), "9d");
+        assert_eq!(slot_to_str(Slot::CardAuthentication), "9e");
+
+        assert_eq!(
+            parse_mgmt_algorithm(None).unwrap(),
+            ManagementKeyAlgorithm::Aes192
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("")).unwrap(),
+            ManagementKeyAlgorithm::Aes192
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("AES192")).unwrap(),
+            ManagementKeyAlgorithm::Aes192
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("tdes")).unwrap(),
+            ManagementKeyAlgorithm::Tdes
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("3des")).unwrap(),
+            ManagementKeyAlgorithm::Tdes
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("aes128")).unwrap(),
+            ManagementKeyAlgorithm::Aes128
+        );
+        assert_eq!(
+            parse_mgmt_algorithm(Some("aes256")).unwrap(),
+            ManagementKeyAlgorithm::Aes256
+        );
+        assert!(matches!(
+            parse_mgmt_algorithm(Some("rsa")),
+            Err(WasmError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn parse_hash_hex_validates_length_and_encoding() {
+        let valid = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bytes = parse_hash_hex(valid).unwrap();
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[31], 0xEF);
+
+        assert!(matches!(
+            parse_hash_hex("0x1234"),
+            Err(WasmError::InvalidHash(_))
+        ));
+        assert!(matches!(
+            parse_hash_hex("0xzzzz"),
+            Err(WasmError::InvalidHash(_))
+        ));
+    }
+
+    #[test]
+    fn transaction_json_shapes_from_demo_and_readmes_deserialize() {
+        // Shape from demo/app.js
+        let demo_tx = r#"{
+            "type": "eip1559",
+            "chain_id": 1,
+            "nonce": 0,
+            "max_priority_fee_per_gas": "1000000000",
+            "max_fee_per_gas": "20000000000",
+            "gas_limit": 21000,
+            "to": "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD20",
+            "value": "0",
+            "input": "0x",
+            "access_list": []
+        }"#;
+        let parsed_demo: Transaction = serde_json::from_str(demo_tx).unwrap();
+        assert_eq!(parsed_demo.chain_id(), 1);
+        assert!(!parsed_demo.signing_hash().is_zero());
+
+        // Shape from README.md & packages/npm/README.md (omitted access_list, decimal strings)
+        let npm_readme_tx = r#"{
+            "type": "eip1559",
+            "chain_id": 1,
+            "nonce": 0,
+            "max_priority_fee_per_gas": "1000000000",
+            "max_fee_per_gas": "20000000000",
+            "gas_limit": 21000,
+            "to": "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD20",
+            "value": "1000000000000000000",
+            "input": "0x"
+        }"#;
+        let parsed_npm: Transaction = serde_json::from_str(npm_readme_tx).unwrap();
+        assert_eq!(parsed_npm.chain_id(), 1);
+
+        // Contract deployment (to: null) with hex calldata
+        let deploy_tx = r#"{
+            "type": "eip1559",
+            "chain_id": 11155111,
+            "nonce": 2,
+            "max_priority_fee_per_gas": "1000000000",
+            "max_fee_per_gas": "25000000000",
+            "gas_limit": 120000,
+            "to": null,
+            "value": "0",
+            "data": "0x60806040"
+        }"#;
+        let parsed_deploy: Transaction = serde_json::from_str(deploy_tx).unwrap();
+        assert_eq!(parsed_deploy.chain_id(), 11155111);
     }
 }

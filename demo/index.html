@@ -9,28 +9,29 @@
 <body>
     <header>
         <h1>YubiKey EVM Signer Demo</h1>
-        <p class="subtitle">Sign Ethereum transactions with YubiKey via WebUSB (EIP-7951)</p>
+        <p class="subtitle">Sign Ethereum transactions with YubiKey P-256 keys (EIP-7951) via Local PC/SC Bridge or WebUSB</p>
     </header>
 
     <main>
-        <!-- Browser Compatibility Warning -->
+        <!-- WASM Load / Initialization Warning -->
         <section id="compatibility-section" class="card warning hidden">
-            <h2>Browser Not Supported</h2>
-            <p>WebUSB is only available in Chromium-based browsers (Chrome, Edge, Brave, Opera).</p>
-            <p>Please switch to a supported browser to use this demo.</p>
+            <h2>Notice</h2>
+            <p id="compatibility-message">WebUSB is unavailable in this browser or context. Use the Local PC/SC Bridge below to connect your YubiKey in any browser.</p>
         </section>
 
-        <!-- Platform Compatibility Info -->
+        <!-- Browser & Transport Support (Issue #14) -->
         <section id="platform-info-section" class="card info">
-            <h2>Platform Compatibility</h2>
-            <p>WebUSB requires the browser to claim the YubiKey's CCID interface. This may conflict with system drivers:</p>
+            <h2>Browser &amp; Transport Support</h2>
+            <p>Standard Chromium browsers block raw WebUSB access to YubiKey PIV applets twice on regular web pages across all operating systems:</p>
             <ul class="platform-list">
-                <li><strong>macOS:</strong> <span class="status-badge not-supported">Not Supported</span> — The system's smart card driver claims the CCID interface, blocking WebUSB access. There is no practical workaround.</li>
-                <li><strong>Linux:</strong> <span class="status-badge supported">Supported</span> — Works well. May require <a href="https://developers.yubico.com/yubikey-manager/Device_Permissions.html" target="_blank">udev rules</a> for non-root access.</li>
-                <li><strong>Windows:</strong> <span class="status-badge supported">Supported</span> — Generally works. Some configurations with smart card drivers may have issues.</li>
-                <li><strong>Android:</strong> <span class="status-badge supported">Supported</span> — Works with USB OTG adapter in Chrome.</li>
+                <li><strong>Chromium USB Blocklist:</strong> <code>usb_blocklist.cc</code> hard-blocks Yubico VID <code>0x1050</code> (PIDs <code>0x0010</code>&ndash;<code>0x0410</code>).</li>
+                <li><strong>Protected Smart Card Class:</strong> Chromium enforces USB Smart Card class <code>0x0B</code> (CCID) as a WICG Protected Interface Class on standard <code>https://</code> and <code>http://localhost</code> pages.</li>
             </ul>
-            <p class="hint">For macOS, use the native Rust library with PCSC transport instead of this WebUSB demo.</p>
+            <p>Choose one of the following transports:</p>
+            <ul class="platform-list">
+                <li><strong>Local PC/SC Bridge:</strong> <span class="status-badge supported">Recommended</span> &mdash; Works across macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave. Start it locally with <code>just cli-bridge</code> (or <code>cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge</code>), then paste the loopback URL and per-session bearer token below.</li>
+                <li><strong>WebUSB:</strong> <span class="status-badge experimental">Experimental</span> &mdash; Only works for non-blocklisted CCID tokens or Chromium Isolated Web Apps with unrestricted USB permissions. On Linux, non-root USB access may also require <a href="https://developers.yubico.com/yubikey-manager/Device_Permissions.html" target="_blank" rel="noopener noreferrer">udev rules</a>.</li>
+            </ul>
         </section>
 
         <!-- Connection Section -->
@@ -40,18 +41,41 @@
                 <span class="label">Status:</span>
                 <span id="connection-status" class="status disconnected">Disconnected</span>
             </div>
+
+            <div class="form-group">
+                <label for="transport-mode">Transport:</label>
+                <select id="transport-mode">
+                    <option value="bridge" selected>Local PC/SC Bridge (Recommended &mdash; all OSes &amp; browsers)</option>
+                    <option value="webusb">WebUSB (Experimental &mdash; blocked for YubiKey on standard Chromium pages)</option>
+                </select>
+            </div>
+
+            <div id="bridge-config" class="bridge-config">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="bridge-url">Bridge URL (loopback only):</label>
+                        <input type="text" id="bridge-url" value="http://127.0.0.1:8765" placeholder="http://127.0.0.1:8765">
+                    </div>
+                    <div class="form-group">
+                        <label for="bridge-token">Session Bearer Token:</label>
+                        <input type="password" id="bridge-token" placeholder="Paste token from yubikey-cli bridge">
+                    </div>
+                </div>
+                <p class="hint">Run <code>just cli-bridge</code> locally and paste the printed session bearer token. Only loopback URLs (<code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code>) are accepted.</p>
+            </div>
+
             <div class="button-row">
                 <button id="connect-btn" class="primary">Connect YubiKey</button>
                 <button id="disconnect-btn" class="secondary" disabled>Disconnect</button>
             </div>
-            <p class="hint">Requires HTTPS and user gesture. A device picker dialog will appear.</p>
+            <p id="transport-hint" class="hint">Connects to the hardened local PC/SC bridge using constant-time Bearer auth and a PIV-only APDU allowlist.</p>
         </section>
 
         <!-- PIN Verification Section -->
         <section id="pin-section" class="card disabled-section">
             <h2>2. PIN Verification</h2>
             <div class="form-group">
-                <label for="pin-input">PIN (6-8 digits):</label>
+                <label for="pin-input">PIN (6&ndash;8 characters):</label>
                 <input type="password" id="pin-input" maxlength="8" placeholder="Enter PIN" disabled>
             </div>
             <div class="button-row">
@@ -65,16 +89,53 @@
 
         <!-- Key Management Section -->
         <section id="key-section" class="card disabled-section">
-            <h2>3. Key Management</h2>
+            <h2>3. Slot &amp; Key Management</h2>
+
+            <div class="form-group">
+                <label for="slot-select">PIV Slot:</label>
+                <select id="slot-select" disabled>
+                    <option value="9a" selected>9a &mdash; PIV Authentication (recommended)</option>
+                    <option value="9c">9c &mdash; Digital Signature (PIN every time)</option>
+                    <option value="9d">9d &mdash; Key Management</option>
+                    <option value="9e">9e &mdash; Card Authentication (no PIN)</option>
+                </select>
+            </div>
+
             <div class="button-row">
-                <button id="generate-key-btn" class="primary" disabled>Generate New Key</button>
                 <button id="get-address-btn" class="secondary" disabled>Get Address</button>
             </div>
             <div class="result-group">
                 <label>Ethereum Address:</label>
                 <div id="address-display" class="address-display">-</div>
             </div>
-            <p class="hint">Warning: Generate New Key will overwrite any existing key in the slot.</p>
+
+            <hr class="section-divider">
+
+            <h3>Management Key Authentication (Required for Key Generation)</h3>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="mgmt-alg-select">Algorithm:</label>
+                    <select id="mgmt-alg-select" disabled>
+                        <option value="aes192" selected>AES-192 (YubiKey 5.7+ default, 24 bytes)</option>
+                        <option value="tdes">3DES / TDES (YubiKey &lt; 5.7 default, 24 bytes)</option>
+                        <option value="aes128">AES-128 (16 bytes)</option>
+                        <option value="aes256">AES-256 (32 bytes)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="mgmt-key-input">Management Key (hex):</label>
+                    <input type="password" id="mgmt-key-input" placeholder="48 hex chars (24 bytes) for AES-192 / 3DES" disabled>
+                </div>
+            </div>
+            <div class="status-row">
+                <span class="label">Management Key:</span>
+                <span id="mgmt-status" class="status">Not authenticated</span>
+            </div>
+            <div class="button-row">
+                <button id="auth-mgmt-btn" class="secondary" disabled>Authenticate Management Key</button>
+                <button id="generate-key-btn" class="danger" disabled>Generate New Key</button>
+            </div>
+            <p class="hint">Warning: Generate New Key permanently overwrites any existing key in the selected PIV slot. Authenticate the management key first.</p>
         </section>
 
         <!-- Sign Transaction Section (EIP-1559) -->
@@ -83,14 +144,14 @@
             <div class="form-grid">
                 <div class="form-group">
                     <label for="tx-chain-id">Chain ID:</label>
-                    <input type="number" id="tx-chain-id" value="1" min="1" disabled>
+                    <input type="number" id="tx-chain-id" value="1" min="1" step="1" disabled>
                 </div>
                 <div class="form-group">
                     <label for="tx-nonce">Nonce:</label>
-                    <input type="number" id="tx-nonce" value="0" min="0" disabled>
+                    <input type="number" id="tx-nonce" value="0" min="0" step="1" disabled>
                 </div>
                 <div class="form-group">
-                    <label for="tx-to">To Address:</label>
+                    <label for="tx-to">To Address (empty for contract creation):</label>
                     <input type="text" id="tx-to" placeholder="0x..." disabled>
                 </div>
                 <div class="form-group">
@@ -99,7 +160,7 @@
                 </div>
                 <div class="form-group">
                     <label for="tx-gas-limit">Gas Limit:</label>
-                    <input type="number" id="tx-gas-limit" value="21000" disabled>
+                    <input type="number" id="tx-gas-limit" value="21000" min="1" step="1" disabled>
                 </div>
                 <div class="form-group">
                     <label for="tx-max-priority-fee">Max Priority Fee (wei):</label>
@@ -118,8 +179,8 @@
                 <button id="sign-tx-btn" class="primary" disabled>Sign Transaction</button>
             </div>
             <div class="result-group">
-                <label>Signed Transaction (RLP):</label>
-                <textarea id="tx-signature" class="signature-output" readonly placeholder="Signed transaction will appear here..."></textarea>
+                <label for="tx-signature">Transaction Signature (65 bytes, r || s || v):</label>
+                <textarea id="tx-signature" class="signature-output" readonly placeholder="65-byte signature (r || s || v) will appear here..."></textarea>
             </div>
         </section>
 
@@ -135,7 +196,7 @@
                 <button id="sign-typed-data-btn" class="primary" disabled>Sign Typed Data</button>
             </div>
             <div class="result-group">
-                <label>Signature:</label>
+                <label for="typed-data-signature">Signature (65 bytes, r || s || v):</label>
                 <textarea id="typed-data-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
             </div>
         </section>
@@ -151,7 +212,7 @@
                 <button id="sign-message-btn" class="primary" disabled>Sign Message</button>
             </div>
             <div class="result-group">
-                <label>Signature:</label>
+                <label for="message-signature">Signature (65 bytes, r || s || v):</label>
                 <textarea id="message-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
             </div>
         </section>
@@ -167,7 +228,7 @@
                 <button id="sign-hash-btn" class="primary" disabled>Sign Hash</button>
             </div>
             <div class="result-group">
-                <label>Signature:</label>
+                <label for="hash-signature">Signature (65 bytes, r || s || v):</label>
                 <textarea id="hash-signature" class="signature-output" readonly placeholder="Signature will appear here..."></textarea>
             </div>
         </section>
@@ -183,8 +244,8 @@
     <footer>
         <p>
             <span id="version">Version: -</span> |
-            <a href="https://github.com/storopoli/yubikey-evm-signer" target="_blank">GitHub</a> |
-            <a href="https://eips.ethereum.org/EIPS/eip-7951" target="_blank">EIP-7951</a>
+            <a href="https://github.com/storopoli/yubikey-evm-signer" target="_blank" rel="noopener noreferrer">GitHub</a> |
+            <a href="https://eips.ethereum.org/EIPS/eip-7951" target="_blank" rel="noopener noreferrer">EIP-7951</a>
         </p>
         <p class="warning-text">This is a demo. Use at your own risk. Never use production keys in testing.</p>
     </footer>

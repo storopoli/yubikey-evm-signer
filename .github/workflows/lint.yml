@@ -166,6 +166,9 @@ jobs:
           echo "$pack_output" | grep -Fq "dist/yubikey_evm_signer_wasm_bg.wasm"
           echo "$pack_output" | grep -Fq "dist/yubikey_evm_signer_wasm.d.ts"
 
+      - name: Verify demo integrity and WASM TypeScript exports
+        run: node scripts/verify-demo.mjs --check-wasm
+
   lint-success:
     name: Check that lints passed
     runs-on: ubuntu-latest
