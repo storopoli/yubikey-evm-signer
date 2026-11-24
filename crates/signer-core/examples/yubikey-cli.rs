@@ -68,8 +68,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 use p256::ecdsa::VerifyingKey;
@@ -485,35 +485,118 @@ fn report_unusable_pubkey_out(path: &Path, e: &io::Error) {
     );
 }
 
+/// Who may remove the `--pubkey-out` file, shared between the main thread and
+/// the `generate` signal handler without any lock, so the handler can never
+/// wait for a main thread that is stuck writing to a stalled console.
+///
+/// States (`state`), and who moves between them:
+///
+/// - [`Self::NO_FILE`]: no file was created. Nobody removes anything.
+/// - [`Self::EMPTY`]: the file exists and holds nothing yet; `path` is set.
+///   The main thread or the handler may remove it, but only after winning the
+///   compare-and-swap `EMPTY` → [`Self::GONE`] ([`Self::remove_if_empty`]), so
+///   exactly one of them does.
+/// - [`Self::MAIN`]: the main thread won `EMPTY` → `MAIN`
+///   ([`Self::claim_for_writing`]) to write the PEM. From then on only the main
+///   thread touches the file: it keeps it once written and removes it if the
+///   write failed. The handler leaves it alone.
+/// - [`Self::GONE`]: removed by whoever won `EMPTY` → `GONE`. Nobody touches
+///   the path again (it may already belong to someone else).
+#[derive(Debug, Default)]
+struct PubkeyOutReservation {
+    path: OnceLock<PathBuf>,
+    state: AtomicU8,
+}
+
+impl PubkeyOutReservation {
+    const NO_FILE: u8 = 0;
+    const EMPTY: u8 = 1;
+    const MAIN: u8 = 2;
+    const GONE: u8 = 3;
+
+    /// Records that `path` was just created and is empty (`NO_FILE` → `EMPTY`).
+    /// Does nothing if a path was already recorded.
+    fn created(&self, path: PathBuf) {
+        if self.path.set(path).is_ok() {
+            let _ = self.state.compare_exchange(
+                Self::NO_FILE,
+                Self::EMPTY,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// `EMPTY` → `to`; returns whether this call made the transition.
+    fn take_empty(&self, to: u8) -> bool {
+        self.state
+            .compare_exchange(Self::EMPTY, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Removes the file if it is still empty and unclaimed (`EMPTY` → `GONE`).
+    /// Never waits for the other thread. Returns whether this call removed it.
+    fn remove_if_empty(&self) -> bool {
+        if !self.take_empty(Self::GONE) {
+            return false;
+        }
+        if let Some(path) = self.path.get() {
+            let _ = fs::remove_file(path);
+        }
+        true
+    }
+
+    /// Claims the empty file for the main thread to write (`EMPTY` → `MAIN`).
+    /// Returns `false` if it was already removed.
+    fn claim_for_writing(&self) -> bool {
+        self.take_empty(Self::MAIN)
+    }
+}
+
 /// The `--pubkey-out` file, created right before the card is changed.
 ///
 /// The file is created exclusively (an existing file or symlink is never
 /// replaced) and is removed again when dropped unless [`Self::write_pem`]
-/// succeeded, so a failed run leaves no empty or partial file.
+/// succeeded, so a failed run leaves no empty or partial file. `reservation`
+/// lets the signal handler remove it too while it is still empty.
 #[derive(Debug)]
 struct PubkeyOutFile {
     path: PathBuf,
     file: File,
+    reservation: Arc<PubkeyOutReservation>,
+    /// Whether [`PubkeyOutReservation::claim_for_writing`] succeeded.
+    claimed: bool,
     written: bool,
 }
 
 impl PubkeyOutFile {
-    /// Creates `path`, failing if it already exists or cannot be created.
-    fn create(path: PathBuf) -> io::Result<Self> {
+    /// Creates `path`, failing if it already exists or cannot be created, and
+    /// records it in `reservation`.
+    fn create(path: PathBuf, reservation: Arc<PubkeyOutReservation>) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
         let file = options.open(&path)?;
+        reservation.created(path.clone());
         Ok(Self {
             path,
             file,
+            reservation,
+            claimed: false,
             written: false,
         })
     }
 
-    /// Writes `pem` to the file and flushes it to disk.
+    /// Claims the file, writes `pem` to it and flushes it to disk. Fails without
+    /// writing if an interrupt already removed the file.
     fn write_pem(&mut self, pem: &str) -> io::Result<()> {
+        if !self.claimed {
+            if !self.reservation.claim_for_writing() {
+                return Err(io::Error::other("an interrupt removed it"));
+            }
+            self.claimed = true;
+        }
         self.file.write_all(pem.as_bytes())?;
         self.file.sync_all()?;
         self.written = true;
@@ -523,10 +606,29 @@ impl PubkeyOutFile {
 
 impl Drop for PubkeyOutFile {
     fn drop(&mut self) {
-        if !self.written {
-            let _ = fs::remove_file(&self.path);
+        if self.claimed {
+            if !self.written {
+                let _ = fs::remove_file(&self.path);
+            }
+        } else {
+            self.reservation.remove_if_empty();
         }
     }
+}
+
+/// Handles one SIGINT/SIGTERM/SIGHUP during `generate`; returns whether the
+/// process must exit now (status 130).
+///
+/// The first signal only sets `interrupted`, which the main thread checks
+/// before GENERATE. A later one removes the `--pubkey-out` file if it is still
+/// empty. This touches only atomics and the file system, never a lock or the
+/// console, so it cannot wait for the main thread.
+fn generate_interrupt(interrupted: &AtomicBool, pubkey_out: &PubkeyOutReservation) -> bool {
+    if !interrupted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    pubkey_out.remove_if_empty();
+    true
 }
 
 /// Which outputs received the public key of a newly generated key.
@@ -800,31 +902,18 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // From here on, until the new key has been delivered, an interrupt must not
-    // kill the process between GENERATE and the output of the new key. The
-    // first SIGINT/SIGTERM/SIGHUP only sets `interrupted`, which stops the
-    // command before GENERATE if it has not been sent yet. A second one quits
-    // at once, first removing the --pubkey-out file if it is still empty
-    // (`unwritten`; locked by the main thread while it writes the file).
+    // From here on, an interrupt must not kill the process between GENERATE and
+    // the output of the new key; see `generate_interrupt`. The handler shares
+    // only atomics with this thread, so a second interrupt quits at once even
+    // while this thread is blocked writing to the console.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let unwritten: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let reservation = Arc::new(PubkeyOutReservation::default());
     let handler_result = {
-        let (interrupted, unwritten) = (Arc::clone(&interrupted), Arc::clone(&unwritten));
+        let (interrupted, reservation) = (Arc::clone(&interrupted), Arc::clone(&reservation));
         ctrlc::set_handler(move || {
-            if !interrupted.swap(true, Ordering::SeqCst) {
-                let _ = writeln!(
-                    io::stderr(),
-                    "\nInterrupted: stopping before the key is generated if possible; otherwise \
-                     finishing so that the new public key is not lost. Interrupt again to quit \
-                     at once (a key generated by then could be lost)."
-                );
-                return;
+            if generate_interrupt(&interrupted, &reservation) {
+                std::process::exit(EXIT_INTERRUPTED.into());
             }
-            let pending = unwritten.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(path) = pending.as_ref() {
-                let _ = fs::remove_file(path);
-            }
-            std::process::exit(EXIT_INTERRUPTED.into());
         })
     };
     if let Err(e) = handler_result {
@@ -838,19 +927,13 @@ fn cmd_generate(args: &[String]) -> ExitCode {
     // Claim the output file now, after every prompt; an unusable path still
     // fails while the slot is untouched.
     let mut pubkey_file = match pubkey_out {
-        Some(path) => {
-            let mut pending = unwritten.lock().unwrap_or_else(PoisonError::into_inner);
-            match PubkeyOutFile::create(path.clone()) {
-                Ok(file) => {
-                    *pending = Some(path);
-                    Some(file)
-                }
-                Err(e) => {
-                    report_unusable_pubkey_out(&path, &e);
-                    return ExitCode::FAILURE;
-                }
+        Some(path) => match PubkeyOutFile::create(path.clone(), Arc::clone(&reservation)) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                report_unusable_pubkey_out(&path, &e);
+                return ExitCode::FAILURE;
             }
-        }
+        },
         None => None,
     };
 
@@ -871,18 +954,19 @@ fn cmd_generate(args: &[String]) -> ExitCode {
 
     match outcome {
         Ok(CardChange::Generated(generated)) => {
-            // A second interrupt now waits until the key has been delivered.
-            let mut pending = unwritten.lock().unwrap_or_else(PoisonError::into_inner);
             let delivery = deliver_generated_key(
                 &generated,
                 pubkey_file.as_mut(),
                 &mut io::stdout().lock(),
                 &mut io::stderr().lock(),
             );
-            if delivery.file == Some(true) {
-                *pending = None;
+            if interrupted.load(Ordering::SeqCst) {
+                let _ = writeln!(
+                    io::stderr(),
+                    "Interrupted while the key was being generated; finished so that its public \
+                     key is not lost."
+                );
             }
-            drop(pending);
             if delivery.complete() {
                 ExitCode::SUCCESS
             } else {
@@ -1363,6 +1447,19 @@ mod tests {
         }
     }
 
+    /// Creates a `--pubkey-out` file with its own reservation.
+    fn create_file(path: PathBuf) -> io::Result<PubkeyOutFile> {
+        PubkeyOutFile::create(path, Arc::default())
+    }
+
+    /// A newly created `--pubkey-out` file whose handle is read-only, so
+    /// writing the PEM fails.
+    fn read_only_file(path: &Path) -> PubkeyOutFile {
+        let mut file = create_file(path.to_path_buf()).unwrap();
+        file.file = File::open(path).unwrap();
+        file
+    }
+
     #[test]
     fn public_key_pem_matches_openssl() {
         // The P-256 base point G (private key 1). Expected value produced by
@@ -1434,11 +1531,11 @@ mod tests {
         let existing = dir.0.join("existing.pem");
         fs::write(&existing, "keep me").unwrap();
 
-        let err = PubkeyOutFile::create(existing.clone()).unwrap_err();
+        let err = create_file(existing.clone()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&existing).unwrap(), "keep me");
 
-        assert!(PubkeyOutFile::create(dir.0.join("missing").join("key.pem")).is_err());
+        assert!(create_file(dir.0.join("missing").join("key.pem")).is_err());
     }
 
     #[test]
@@ -1464,7 +1561,7 @@ mod tests {
                 check_pubkey_out_path(&link).unwrap_err().kind(),
                 io::ErrorKind::AlreadyExists
             );
-            assert!(PubkeyOutFile::create(link).is_err());
+            assert!(create_file(link).is_err());
             assert!(!dir.0.join("nowhere").exists());
         }
 
@@ -1565,7 +1662,7 @@ mod tests {
         let path = dir.0.join("my key.pem");
         let generated = generated_key(None);
         let pem = public_key_pem(&generated.public_key).unwrap();
-        let mut file = PubkeyOutFile::create(path.clone()).unwrap();
+        let mut file = create_file(path.clone()).unwrap();
         let mut out = Console::new();
         out.file_must_hold = Some((path.clone(), pem.clone()));
         let mut err = Console::new();
@@ -1598,7 +1695,7 @@ mod tests {
         let path = dir.0.join("key.pem");
         let generated = generated_key(None);
         let pem = public_key_pem(&generated.public_key).unwrap();
-        let mut file = PubkeyOutFile::create(path.clone()).unwrap();
+        let mut file = create_file(path.clone()).unwrap();
         let mut err = Console::new();
 
         let delivery = deliver_generated_key(
@@ -1622,13 +1719,7 @@ mod tests {
     fn file_failure_still_prints_the_key() {
         let dir = TempDir::new("deliver-file");
         let path = dir.0.join("key.pem");
-        fs::write(&path, "").unwrap();
-        // A read-only handle: writing the PEM fails.
-        let mut file = PubkeyOutFile {
-            path: path.clone(),
-            file: File::open(&path).unwrap(),
-            written: false,
-        };
+        let mut file = read_only_file(&path);
         let generated = generated_key(Some(Error::SlotEmpty(0x9A)));
         let pem = public_key_pem(&generated.public_key).unwrap();
         let (mut out, mut err) = (Console::new(), Console::new());
@@ -1651,13 +1742,7 @@ mod tests {
     #[test]
     fn every_output_failing_is_reported_as_failure() {
         let dir = TempDir::new("deliver-none");
-        let path = dir.0.join("key.pem");
-        fs::write(&path, "").unwrap();
-        let mut file = PubkeyOutFile {
-            path,
-            file: File::open(dir.0.join("key.pem")).unwrap(),
-            written: false,
-        };
+        let mut file = read_only_file(&dir.0.join("key.pem"));
         let delivery = deliver_generated_key(
             &generated_key(None),
             Some(&mut file),
@@ -1693,10 +1778,10 @@ mod tests {
         let dir = TempDir::new("cleanup");
         let path = dir.0.join("key.pem");
 
-        drop(PubkeyOutFile::create(path.clone()).unwrap());
+        drop(create_file(path.clone()).unwrap());
         assert!(!path.exists(), "an unwritten file must be removed");
 
-        let mut file = PubkeyOutFile::create(path.clone()).unwrap();
+        let mut file = create_file(path.clone()).unwrap();
         file.write_pem("PEM\n").unwrap();
         drop(file);
         assert_eq!(fs::read_to_string(&path).unwrap(), "PEM\n");
@@ -1707,5 +1792,147 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode & !0o644, 0, "mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn interrupt_removes_the_file_only_while_it_is_empty() {
+        let dir = TempDir::new("interrupt-empty");
+        let path = dir.0.join("key.pem");
+        let interrupted = AtomicBool::new(false);
+        let mut file = create_file(path.clone()).unwrap();
+        let reservation = Arc::clone(&file.reservation);
+
+        // The handler first: the first interrupt only sets the flag, the second
+        // removes the still-empty file and asks to exit.
+        assert!(!generate_interrupt(&interrupted, &reservation));
+        assert!(path.exists());
+        assert!(generate_interrupt(&interrupted, &reservation));
+        assert!(!path.exists());
+
+        // The main thread then cannot claim the file: it writes nothing, still
+        // prints the key, and never removes the path, which may belong to
+        // someone else by now.
+        fs::write(&path, "someone else's").unwrap();
+        let (mut out, mut err) = (Console::new(), Console::new());
+        let delivery =
+            deliver_generated_key(&generated_key(None), Some(&mut file), &mut out, &mut err);
+        assert_eq!(delivery.file, Some(false));
+        assert!(out.text().contains("-----BEGIN PUBLIC KEY-----"));
+        assert!(err.text().contains("an interrupt removed it"));
+        drop(file);
+        assert!(generate_interrupt(&interrupted, &reservation));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "someone else's");
+    }
+
+    #[test]
+    fn interrupt_never_removes_a_claimed_file() {
+        let dir = TempDir::new("interrupt-claimed");
+        let interrupted = AtomicBool::new(true);
+
+        // The main thread first, and the write succeeded: the file is kept.
+        let written = dir.0.join("written.pem");
+        let mut file = create_file(written.clone()).unwrap();
+        let reservation = Arc::clone(&file.reservation);
+        file.write_pem("PEM\n").unwrap();
+        assert!(generate_interrupt(&interrupted, &reservation));
+        drop(file);
+        assert_eq!(fs::read_to_string(&written).unwrap(), "PEM\n");
+
+        // Claimed, but the write failed: the handler leaves the file to the
+        // main thread, which removes it.
+        let failed = dir.0.join("failed.pem");
+        let mut file = read_only_file(&failed);
+        let reservation = Arc::clone(&file.reservation);
+        assert!(file.write_pem("PEM\n").is_err());
+        assert!(generate_interrupt(&interrupted, &reservation));
+        assert!(failed.exists());
+        drop(file);
+        assert!(!failed.exists());
+    }
+
+    #[test]
+    fn exactly_one_side_wins_the_empty_file() {
+        let dir = TempDir::new("interrupt-race");
+        for i in 0..100 {
+            let path = dir.0.join(format!("key-{i}.pem"));
+            let mut file = create_file(path.clone()).unwrap();
+            let reservation = Arc::clone(&file.reservation);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let handler = {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reservation.remove_if_empty()
+                })
+            };
+            barrier.wait();
+            let main_won = file.write_pem("PEM\n").is_ok();
+            let handler_won = handler.join().unwrap();
+            assert_ne!(main_won, handler_won, "exactly one side wins");
+            drop(file);
+            if main_won {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "PEM\n");
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    /// A console whose first write blocks until `release` is dropped, then fails.
+    struct BlockedConsole {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockedConsole {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn second_interrupt_completes_while_the_console_is_blocked() {
+        let dir = TempDir::new("interrupt-blocked");
+        let path = dir.0.join("key.pem");
+        let generated = generated_key(None);
+        let pem = public_key_pem(&generated.public_key).unwrap();
+        let mut file = create_file(path.clone()).unwrap();
+        let reservation = Arc::clone(&file.reservation);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let main = std::thread::spawn(move || {
+            let mut out = BlockedConsole {
+                entered: entered_tx,
+                release: release_rx,
+            };
+            let delivery =
+                deliver_generated_key(&generated, Some(&mut file), &mut out, &mut Console::new());
+            drop(file);
+            delivery
+        });
+
+        // The main thread is now stuck in the console, after writing the file.
+        entered_rx.recv().unwrap();
+        let interrupted = AtomicBool::new(false);
+        assert!(!generate_interrupt(&interrupted, &reservation));
+        assert!(generate_interrupt(&interrupted, &reservation));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            pem,
+            "a written file is kept"
+        );
+
+        drop(release_tx);
+        let delivery = main.join().unwrap();
+        assert_eq!(delivery.file, Some(true));
+        assert!(!delivery.stdout);
+        assert_eq!(fs::read_to_string(&path).unwrap(), pem);
     }
 }
