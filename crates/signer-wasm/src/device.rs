@@ -589,7 +589,10 @@ impl YubiKeyDevice {
         let tx: Transaction = serde_json::from_str(tx_json)
             .map_err(|e| WasmError::InvalidTransaction(e.to_string()))?;
 
-        let hash: [u8; 32] = tx.signing_hash().into();
+        let hash: [u8; 32] = tx
+            .signing_hash()
+            .map_err(|e| WasmError::InvalidTransaction(e.to_string()))?
+            .into();
         self.sign_digest_internal(pin, &hash).await
     }
 
@@ -765,7 +768,7 @@ mod tests {
         }"#;
         let parsed_demo: Transaction = serde_json::from_str(demo_tx).unwrap();
         assert_eq!(parsed_demo.chain_id(), 1);
-        assert!(!parsed_demo.signing_hash().is_zero());
+        assert!(!parsed_demo.signing_hash().unwrap().is_zero());
 
         // Shape from README.md & packages/npm/README.md (omitted access_list, decimal strings)
         let npm_readme_tx = r#"{

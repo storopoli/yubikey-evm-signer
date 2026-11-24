@@ -57,8 +57,8 @@
 //!     access_list: vec![],
 //! });
 //!
-//! // Get the hash to sign
-//! let hash = tx.signing_hash();
+//! // Get the hash to sign (fails closed on chain ID 0)
+//! let hash = tx.signing_hash().unwrap();
 //! ```
 //!
 //! ## Signing with EIP-712 Typed Data

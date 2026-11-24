@@ -183,7 +183,6 @@ impl From<CoreError> for WasmError {
             CoreError::PinLocked => Self::PinLocked,
             CoreError::SecurityStatusNotSatisfied => Self::SecurityStatusNotSatisfied,
             CoreError::AuthenticationFailed => Self::AuthenticationFailed,
-            CoreError::TouchTimeout => Self::Timeout,
             CoreError::InvalidTransaction(msg) => Self::InvalidTransaction(msg),
             CoreError::InvalidTypedData(msg) => Self::InvalidTypedData(msg),
             other => Self::CoreError(other.to_string()),

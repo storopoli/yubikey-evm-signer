@@ -7,7 +7,7 @@
 //!
 //! - **YubiKey errors**: Device communication, PIN verification, and slot access
 //! - **Cryptographic errors**: Key generation, signing, and address derivation
-//! - **Transaction errors**: RLP encoding, EIP-712 hashing, and signature formatting
+//! - **Transaction errors**: Transaction validation, EIP-712 hashing, and signature formatting
 //!
 //! # Example
 //!
@@ -29,7 +29,6 @@
 //! }
 //! ```
 
-use alloy_rlp::Error as AlloyRlpError;
 use core::result::Result as CoreResult;
 use hex::FromHexError;
 use serde_json::Error as SerdeJsonError;
@@ -81,10 +80,6 @@ pub enum Error {
     /// Management key mutual authentication failed.
     #[error("management key authentication failed")]
     AuthenticationFailed,
-
-    /// Touch confirmation was not received within the timeout period.
-    #[error("touch confirmation timeout")]
-    TouchTimeout,
 
     // =========================================================================
     // PIV Slot Errors
@@ -142,10 +137,6 @@ pub enum Error {
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
 
-    /// Failed to RLP encode the transaction.
-    #[error("RLP encoding failed: {0}")]
-    RlpEncodingFailed(String),
-
     /// The chain ID is invalid or unsupported.
     #[error("invalid chain ID: {0}")]
     InvalidChainId(u64),
@@ -186,12 +177,6 @@ impl From<FromHexError> for Error {
 impl From<SerdeJsonError> for Error {
     fn from(err: SerdeJsonError) -> Self {
         Error::JsonError(err.to_string())
-    }
-}
-
-impl From<AlloyRlpError> for Error {
-    fn from(err: AlloyRlpError) -> Self {
-        Error::RlpEncodingFailed(err.to_string())
     }
 }
 

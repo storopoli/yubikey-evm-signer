@@ -31,7 +31,7 @@
 //!     access_list: vec![],
 //! });
 //!
-//! let hash = tx.signing_hash();
+//! let hash = tx.signing_hash().unwrap();
 //! // Sign this hash with YubiKey...
 //! ```
 
@@ -111,11 +111,139 @@ mod hex_or_bytes {
     }
 }
 
+/// Strict serde deserializer for [`U256`] amount fields.
+///
+/// Accepts only a JSON unsigned integer, a non-empty string of ASCII decimal digits,
+/// or `0x`/`0X` followed by one or more ASCII hex digits. Everything else (signs,
+/// whitespace, `_` separators, `0b`/`0o` prefixes, empty strings, floats) is
+/// rejected. Serialization is left to [`U256`]'s own `Serialize` implementation.
+pub(crate) mod strict_u256 {
+    use core::fmt;
+
+    use alloy_primitives::U256;
+    use serde::Deserializer;
+    use serde::de::{self, Visitor};
+
+    /// Parses a decimal-digit string or a `0x`/`0X`-prefixed hex-digit string.
+    pub(crate) fn parse(s: &str) -> Option<U256> {
+        let (digits, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (s, 10),
+        };
+        let valid_digit = |b: u8| {
+            if radix == 16 {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        };
+        if digits.is_empty() || !digits.bytes().all(valid_digit) {
+            return None;
+        }
+        U256::from_str_radix(digits, radix).ok()
+    }
+
+    struct StrictU256Visitor;
+
+    impl Visitor<'_> for StrictU256Visitor {
+        type Value = U256;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(
+                "an unsigned integer, a decimal digit string, or a 0x-prefixed hex string",
+            )
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(U256::from(v))
+        }
+
+        fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(U256::from(v))
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse(v).ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(v), &self))
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictU256Visitor)
+    }
+
+    /// Like [`deserialize`], for optional fields (`null` maps to `None`).
+    pub(crate) fn deserialize_option<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptionVisitor;
+
+        impl<'de> Visitor<'de> for OptionVisitor {
+            type Value = Option<U256>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or an unsigned integer")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserialize(deserializer).map(Some)
+            }
+        }
+
+        deserializer.deserialize_option(OptionVisitor)
+    }
+}
+
+/// Deserializes a required, nullable recipient address.
+///
+/// Unlike serde's default handling of `Option` fields, a missing `to` key is an
+/// error; only an explicit JSON `null` means contract creation.
+fn deserialize_required_to<'de, D>(
+    deserializer: D,
+) -> core::result::Result<Option<Address>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Address>::deserialize(deserializer)
+}
+
 /// An access list entry for EIP-2930/EIP-1559 transactions.
 ///
 /// Access lists specify which addresses and storage keys will be accessed
 /// during transaction execution, potentially reducing gas costs.
+///
+/// Unknown JSON keys are rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, RlpEncodable)]
+#[serde(deny_unknown_fields)]
 pub struct AccessListEntry {
     /// The address being accessed.
     pub address: alloy_primitives::Address,
@@ -129,8 +257,13 @@ pub struct AccessListEntry {
 /// This is the traditional Ethereum transaction format with chain ID
 /// replay protection as specified in [EIP-155].
 ///
+/// When deserialized from JSON, unknown keys are rejected and `to` is required
+/// (use an explicit `null` for contract creation). `U256` amounts accept a JSON
+/// unsigned integer, a decimal digit string, or a `0x`-prefixed hex string.
+///
 /// [EIP-155]: https://eips.ethereum.org/EIPS/eip-155
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegacyTransaction {
     /// The chain ID for replay protection.
     pub chain_id: u64,
@@ -139,16 +272,20 @@ pub struct LegacyTransaction {
     pub nonce: u64,
 
     /// The gas price in wei.
+    #[serde(deserialize_with = "strict_u256::deserialize")]
     pub gas_price: U256,
 
     /// The gas limit.
     pub gas_limit: u64,
 
     /// The recipient address, or `None` for contract creation.
-    #[serde(default)]
+    ///
+    /// Required in JSON; an explicit `null` means contract creation.
+    #[serde(deserialize_with = "deserialize_required_to")]
     pub to: Option<Address>,
 
     /// The value to transfer in wei.
+    #[serde(deserialize_with = "strict_u256::deserialize")]
     pub value: U256,
 
     /// The transaction input data.
@@ -164,9 +301,16 @@ impl LegacyTransaction {
     ///
     /// # Returns
     ///
-    /// The 32-byte hash to be signed.
-    #[must_use]
-    pub fn signing_hash(&self) -> B256 {
+    /// A [`Result`] containing the 32-byte hash to be signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0` (no replay protection).
+    pub fn signing_hash(&self) -> Result<B256> {
+        if self.chain_id == 0 {
+            return Err(Error::InvalidChainId(0));
+        }
+
         let mut buf = Vec::new();
 
         // For EIP-155, we encode: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
@@ -182,7 +326,7 @@ impl LegacyTransaction {
             0u8.encode(buf);
         });
 
-        keccak256(&buf)
+        Ok(keccak256(&buf))
     }
 
     /// Creates a signed transaction by combining this transaction with a signature.
@@ -197,17 +341,10 @@ impl LegacyTransaction {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
-    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0`.
     pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
         if self.chain_id == 0 {
             return Err(Error::InvalidChainId(0));
-        }
-        if signature.v() > 1 {
-            return Err(Error::InvalidSignature(format!(
-                "invalid recovery parameter v: {}",
-                signature.v()
-            )));
         }
 
         let mut buf = Vec::new();
@@ -243,8 +380,13 @@ impl LegacyTransaction {
 ///
 /// See [EIP-1559] for details.
 ///
+/// When deserialized from JSON, unknown keys are rejected and `to` is required
+/// (use an explicit `null` for contract creation). `U256` amounts accept a JSON
+/// unsigned integer, a decimal digit string, or a `0x`-prefixed hex string.
+///
 /// [EIP-1559]: https://eips.ethereum.org/EIPS/eip-1559
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Eip1559Transaction {
     /// The chain ID.
     pub chain_id: u64,
@@ -253,19 +395,24 @@ pub struct Eip1559Transaction {
     pub nonce: u64,
 
     /// The maximum priority fee per gas (tip).
+    #[serde(deserialize_with = "strict_u256::deserialize")]
     pub max_priority_fee_per_gas: U256,
 
     /// The maximum total fee per gas.
+    #[serde(deserialize_with = "strict_u256::deserialize")]
     pub max_fee_per_gas: U256,
 
     /// The gas limit.
     pub gas_limit: u64,
 
     /// The recipient address, or `None` for contract creation.
-    #[serde(default)]
+    ///
+    /// Required in JSON; an explicit `null` means contract creation.
+    #[serde(deserialize_with = "deserialize_required_to")]
     pub to: Option<Address>,
 
     /// The value to transfer in wei.
+    #[serde(deserialize_with = "strict_u256::deserialize")]
     pub value: U256,
 
     /// The transaction input data.
@@ -289,9 +436,16 @@ impl Eip1559Transaction {
     ///
     /// # Returns
     ///
-    /// The 32-byte hash to be signed.
-    #[must_use]
-    pub fn signing_hash(&self) -> B256 {
+    /// A [`Result`] containing the 32-byte hash to be signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0`.
+    pub fn signing_hash(&self) -> Result<B256> {
+        if self.chain_id == 0 {
+            return Err(Error::InvalidChainId(0));
+        }
+
         let mut buf = Vec::with_capacity(256);
 
         // Type prefix
@@ -310,7 +464,7 @@ impl Eip1559Transaction {
             self.access_list.encode(buf);
         });
 
-        keccak256(&buf)
+        Ok(keccak256(&buf))
     }
 
     /// Creates a signed transaction by combining this transaction with a signature.
@@ -325,17 +479,10 @@ impl Eip1559Transaction {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
-    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0`.
     pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
         if self.chain_id == 0 {
             return Err(Error::InvalidChainId(0));
-        }
-        if signature.v() > 1 {
-            return Err(Error::InvalidSignature(format!(
-                "invalid recovery parameter v: {}",
-                signature.v()
-            )));
         }
 
         let mut buf = Vec::with_capacity(256);
@@ -418,6 +565,9 @@ fn encode_bytes32(bytes: &[u8; 32], out: &mut Vec<u8>) {
 }
 
 /// A unified transaction type supporting multiple formats.
+///
+/// Serialized as an internally tagged JSON object whose `type` key is either
+/// `"legacy"` or `"eip1559"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Transaction {
@@ -434,9 +584,12 @@ impl Transaction {
     ///
     /// # Returns
     ///
-    /// The 32-byte hash that should be signed.
-    #[must_use]
-    pub fn signing_hash(&self) -> B256 {
+    /// A [`Result`] containing the 32-byte hash that should be signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0`.
+    pub fn signing_hash(&self) -> Result<B256> {
         match self {
             Self::Legacy(tx) => tx.signing_hash(),
             Self::Eip1559(tx) => tx.signing_hash(),
@@ -468,8 +621,7 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidChainId`] if `chain_id` is `0`
-    /// - [`Error::InvalidSignature`] if `signature.v()` is greater than `1`
+    /// Returns [`Error::InvalidChainId`] if `chain_id` is `0`.
     pub fn signed_rlp(&self, signature: &Signature) -> Result<Vec<u8>> {
         match self {
             Self::Legacy(tx) => tx.signed_rlp(signature),
@@ -489,7 +641,8 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::JsonError`] if parsing fails.
+    /// Returns [`crate::Error::JsonError`] if parsing fails, including unknown keys,
+    /// a missing `to` key, or a malformed integer amount.
     pub fn from_json(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
     }
@@ -527,8 +680,30 @@ mod tests {
         };
 
         assert_eq!(
-            hex::encode(tx.signing_hash()),
+            hex::encode(tx.signing_hash().unwrap()),
             "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53"
+        );
+
+        // The EIP's r and s happen to be valid low-S P-256 scalars, so the official
+        // signed transaction (v = 37 = 1 * 2 + 35 + 0) is a known answer for signed_rlp.
+        let r: [u8; 32] =
+            hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let s: [u8; 32] =
+            hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let sig = Signature::new(r, s, 0).unwrap();
+        assert_eq!(
+            hex::encode(tx.signed_rlp(&sig).unwrap()),
+            concat!(
+                "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7640000",
+                "8025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d899",
+                "7f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"
+            )
         );
     }
 
@@ -566,7 +741,7 @@ mod tests {
             "c0"
         ))
         .unwrap();
-        assert_eq!(tx.signing_hash(), keccak256(&expected_payload));
+        assert_eq!(tx.signing_hash().unwrap(), keccak256(&expected_payload));
 
         // Signed RLP with r=1, s=2, v=1
         let mut r = [0u8; 32];
@@ -620,9 +795,176 @@ mod tests {
             access_list: vec![],
         });
 
-        assert!(!legacy.signing_hash().is_zero());
-        assert!(!eip1559.signing_hash().is_zero());
-        assert_ne!(legacy.signing_hash(), eip1559.signing_hash());
+        // Expected values computed independently (Python keccak256 + RLP).
+        assert_eq!(
+            hex::encode(legacy.signing_hash().unwrap()),
+            "f538abbdf85a0d7b6aee12131da82ec4529fb8a489bce5afa3e36ecb7ce45484"
+        );
+        assert_eq!(
+            hex::encode(eip1559.signing_hash().unwrap()),
+            "ad72b2ec7e639f616dee88804b17cec3db21a952725dd75a691001659b71af63"
+        );
+    }
+
+    /// Signature with r = 1, s = 2, y-parity 1 used by the EIP-1559 known-answer tests.
+    fn r1_s2_v1() -> Signature {
+        let mut r = [0u8; 32];
+        r[31] = 1;
+        let mut s = [0u8; 32];
+        s[31] = 2;
+        Signature::new(r, s, 1).unwrap()
+    }
+
+    #[test]
+    fn eip1559_known_answer_non_empty_access_list() {
+        let mut key_one = [0u8; 32];
+        key_one[31] = 1;
+        let tx = Eip1559Transaction {
+            chain_id: 1,
+            nonce: 7,
+            max_priority_fee_per_gas: U256::from(2_000_000_000u64),
+            max_fee_per_gas: U256::from(30_000_000_000u64),
+            gas_limit: 50_000,
+            to: Some(Address::new([0x11; 20])),
+            value: U256::from(12_345u64),
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+            access_list: vec![
+                AccessListEntry {
+                    address: alloy_primitives::Address::repeat_byte(0x22),
+                    storage_keys: vec![B256::from(key_one), B256::repeat_byte(0xff)],
+                },
+                AccessListEntry {
+                    address: alloy_primitives::Address::repeat_byte(0x33),
+                    storage_keys: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(
+            hex::encode(tx.signing_hash().unwrap()),
+            "240e1e0de1d6aad3fe8a040b68fd1688c35900636f1569f37626c70b406b40ef"
+        );
+        assert_eq!(
+            hex::encode(tx.signed_rlp(&r1_s2_v1()).unwrap()),
+            concat!(
+                "02f8a4010784773594008506fc23ac0082c3509411111111111111111111111111111111111111118230",
+                "3984deadbeeff872f859942222222222222222222222222222222222222222f842a00000000000000000",
+                "000000000000000000000000000000000000000000000001a0ffffffffffffffffffffffffffffffffff",
+                "ffffffffffffffffffffffffffffffd6943333333333333333333333333333333333333333c0010102"
+            )
+        );
+    }
+
+    #[test]
+    fn eip1559_known_answer_contract_creation() {
+        let tx = Eip1559Transaction {
+            chain_id: 5,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 100_000,
+            to: None,
+            value: U256::ZERO,
+            data: vec![0x60, 0x80, 0x60, 0x40, 0x52],
+            access_list: vec![],
+        };
+
+        assert_eq!(
+            hex::encode(tx.signing_hash().unwrap()),
+            "6d4ced661f89b6ed0bc7535d031bb9fc3550952722c5568b53053b4df5f3b3ad"
+        );
+        assert_eq!(
+            hex::encode(tx.signed_rlp(&r1_s2_v1()).unwrap()),
+            "02d405800102830186a08080856080604052c0010102"
+        );
+    }
+
+    #[test]
+    fn eip1559_known_answer_long_data() {
+        // 100 bytes of calldata needs the long-string RLP header (0xb8 0x64) and the
+        // payload needs the long-list header (0xf8 ..).
+        let tx = Eip1559Transaction {
+            chain_id: 1,
+            nonce: 3,
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+            max_fee_per_gas: U256::from(2_000_000_000u64),
+            gas_limit: 200_000,
+            to: Some(Address::new([0x44; 20])),
+            value: U256::ZERO,
+            data: (0u8..100).collect(),
+            access_list: vec![],
+        };
+
+        assert_eq!(
+            hex::encode(tx.signing_hash().unwrap()),
+            "342e7eed105c78386c84e2c7c940862f3a23261495435a9ab21358256303c678"
+        );
+        assert_eq!(
+            hex::encode(tx.signed_rlp(&r1_s2_v1()).unwrap()),
+            concat!(
+                "02f8900103843b9aca00847735940083030d409444444444444444444444444444444444444444448",
+                "0b864000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425",
+                "262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e",
+                "4f505152535455565758595a5b5c5d5e5f60616263c0010102"
+            )
+        );
+    }
+
+    #[test]
+    fn signing_hash_rejects_chain_id_zero() {
+        let legacy = LegacyTransaction {
+            chain_id: 0,
+            nonce: 0,
+            gas_price: U256::from(1u64),
+            gas_limit: 21000,
+            to: Some(Address::zero()),
+            value: U256::ZERO,
+            data: vec![],
+        };
+        assert!(matches!(
+            legacy.signing_hash(),
+            Err(Error::InvalidChainId(0))
+        ));
+        assert!(matches!(
+            Transaction::Legacy(legacy).signing_hash(),
+            Err(Error::InvalidChainId(0))
+        ));
+
+        let eip1559 = Eip1559Transaction {
+            chain_id: 0,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 21000,
+            to: Some(Address::zero()),
+            value: U256::ZERO,
+            data: vec![],
+            access_list: vec![],
+        };
+        assert!(matches!(
+            eip1559.signing_hash(),
+            Err(Error::InvalidChainId(0))
+        ));
+        assert!(matches!(
+            Transaction::Eip1559(eip1559).signing_hash(),
+            Err(Error::InvalidChainId(0))
+        ));
+
+        // The same rejection applies to JSON input with "chain_id": 0
+        let json = r#"{
+            "type": "eip1559",
+            "chain_id": 0,
+            "nonce": 0,
+            "max_priority_fee_per_gas": "1",
+            "max_fee_per_gas": "2",
+            "gas_limit": 21000,
+            "to": "0x0000000000000000000000000000000000000001",
+            "value": "0"
+        }"#;
+        assert!(matches!(
+            Transaction::from_json(json).unwrap().signing_hash(),
+            Err(Error::InvalidChainId(0))
+        ));
     }
 
     #[test]
@@ -716,13 +1058,15 @@ mod tests {
             Transaction::Legacy(_) => panic!("expected eip1559"),
         }
 
-        // Backwards-compatible byte array format for data on LegacyTransaction
+        // Backwards-compatible byte array format for data on LegacyTransaction;
+        // contract creation requires an explicit "to": null
         let legacy_byte_array = r#"{
             "type": "legacy",
             "chain_id": 1,
             "nonce": 5,
             "gas_price": "20000000000",
             "gas_limit": 21000,
+            "to": null,
             "value": "0",
             "data": [222, 173, 190, 239]
         }"#;
@@ -734,11 +1078,262 @@ mod tests {
             }
             Transaction::Eip1559(_) => panic!("expected legacy"),
         }
+
+        // Legacy round trip through the internally tagged enum, including `to: None`
+        let legacy = Transaction::Legacy(LegacyTransaction {
+            chain_id: 1,
+            nonce: 5,
+            gas_price: U256::from(20_000_000_000u64),
+            gas_limit: 21000,
+            to: None,
+            value: U256::ZERO,
+            data: vec![0x60],
+        });
+        let legacy_json = legacy.to_json().unwrap();
+        assert!(legacy_json.contains("\"type\":\"legacy\""));
+        assert!(legacy_json.contains("\"to\":null"));
+        assert_eq!(Transaction::from_json(&legacy_json).unwrap(), legacy);
+    }
+
+    /// A valid EIP-1559 JSON object as a `serde_json::Map`, for mutation in tests.
+    fn base_eip1559_json() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({
+            "type": "eip1559",
+            "chain_id": 1,
+            "nonce": 0,
+            "max_priority_fee_per_gas": "1000000000",
+            "max_fee_per_gas": "20000000000",
+            "gas_limit": 21000,
+            "to": "0x0000000000000000000000000000000000000001",
+            "value": "1000000000000000000",
+            "data": "0x",
+            "access_list": []
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    /// A valid legacy JSON object as a `serde_json::Map`, for mutation in tests.
+    fn base_legacy_json() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({
+            "type": "legacy",
+            "chain_id": 1,
+            "nonce": 0,
+            "gas_price": "20000000000",
+            "gas_limit": 21000,
+            "to": "0x0000000000000000000000000000000000000001",
+            "value": "1000000000000000000",
+            "data": "0x"
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn parse_map(map: &serde_json::Map<String, serde_json::Value>) -> Result<Transaction> {
+        Transaction::from_json(&serde_json::Value::Object(map.clone()).to_string())
+    }
+
+    #[test]
+    fn transaction_json_rejects_unknown_keys_and_missing_to() {
+        // The internally tagged `type` key still parses with deny_unknown_fields
+        assert!(matches!(
+            parse_map(&base_eip1559_json()).unwrap(),
+            Transaction::Eip1559(_)
+        ));
+        assert!(matches!(
+            parse_map(&base_legacy_json()).unwrap(),
+            Transaction::Legacy(_)
+        ));
+
+        for base in [base_eip1559_json(), base_legacy_json()] {
+            // Misspelled `to` ("To") is an unknown key, not contract creation
+            let mut misspelled = base.clone();
+            let to = misspelled.remove("to").unwrap();
+            misspelled.insert("To".to_string(), to);
+            assert!(matches!(parse_map(&misspelled), Err(Error::JsonError(_))));
+
+            // Missing `to` is an error
+            let mut missing = base.clone();
+            missing.remove("to");
+            let err = parse_map(&missing).unwrap_err();
+            assert!(err.to_string().contains("missing field `to`"), "{err}");
+
+            // Explicit null `to` is contract creation
+            let mut create = base.clone();
+            create.insert("to".to_string(), serde_json::Value::Null);
+            let tx = parse_map(&create).unwrap();
+            let to = match tx {
+                Transaction::Legacy(tx) => tx.to,
+                Transaction::Eip1559(tx) => tx.to,
+            };
+            assert!(to.is_none());
+
+            // Arbitrary extra key is rejected
+            let mut extra = base.clone();
+            extra.insert("from".to_string(), serde_json::json!("0x00"));
+            assert!(matches!(parse_map(&extra), Err(Error::JsonError(_))));
+
+            // `input` alias is still accepted, but not together with `data`
+            let mut input_alias = base.clone();
+            input_alias.remove("data");
+            input_alias.insert("input".to_string(), serde_json::json!("0xdeadbeef"));
+            assert!(parse_map(&input_alias).is_ok());
+            let mut both = base.clone();
+            both.insert("input".to_string(), serde_json::json!("0xdeadbeef"));
+            assert!(matches!(parse_map(&both), Err(Error::JsonError(_))));
+        }
+
+        // camelCase "accessList" is not silently dropped
+        let mut camel = base_eip1559_json();
+        camel.remove("access_list");
+        camel.insert(
+            "accessList".to_string(),
+            serde_json::json!([{
+                "address": "0x2222222222222222222222222222222222222222",
+                "storage_keys": []
+            }]),
+        );
+        assert!(matches!(parse_map(&camel), Err(Error::JsonError(_))));
+
+        // Unknown keys inside access list entries are rejected
+        let mut bad_entry = base_eip1559_json();
+        bad_entry.insert(
+            "access_list".to_string(),
+            serde_json::json!([{
+                "address": "0x2222222222222222222222222222222222222222",
+                "storageKeys": []
+            }]),
+        );
+        assert!(matches!(parse_map(&bad_entry), Err(Error::JsonError(_))));
+
+        // A well-formed access list entry parses
+        let mut good_entry = base_eip1559_json();
+        good_entry.insert(
+            "access_list".to_string(),
+            serde_json::json!([{
+                "address": "0x2222222222222222222222222222222222222222",
+                "storage_keys": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                ]
+            }]),
+        );
+        match parse_map(&good_entry).unwrap() {
+            Transaction::Eip1559(tx) => assert_eq!(tx.access_list[0].storage_keys.len(), 1),
+            Transaction::Legacy(_) => panic!("expected eip1559"),
+        }
+
+        // Unknown transaction type is rejected
+        let mut bad_type = base_eip1559_json();
+        bad_type.insert("type".to_string(), serde_json::json!("eip2930"));
+        assert!(matches!(parse_map(&bad_type), Err(Error::JsonError(_))));
+    }
+
+    #[test]
+    fn transaction_json_u256_fields_are_strict() {
+        let fields_1559 = ["value", "max_priority_fee_per_gas", "max_fee_per_gas"];
+        let fields_legacy = ["value", "gas_price"];
+
+        let accepted = [
+            (serde_json::json!(16), U256::from(16u64)),
+            (serde_json::json!(u64::MAX), U256::from(u64::MAX)),
+            (serde_json::json!("16"), U256::from(16u64)),
+            (serde_json::json!("0016"), U256::from(16u64)),
+            (serde_json::json!("0x10"), U256::from(16u64)),
+            (serde_json::json!("0X10"), U256::from(16u64)),
+            (serde_json::json!("0xFf"), U256::from(255u64)),
+            (serde_json::json!("0"), U256::ZERO),
+            (
+                serde_json::json!(
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                ),
+                U256::MAX,
+            ),
+            (
+                serde_json::json!(format!("0x{}", "f".repeat(64))),
+                U256::MAX,
+            ),
+        ];
+        let rejected = [
+            serde_json::json!("0x1_0"),
+            serde_json::json!("1_000"),
+            serde_json::json!("0b1"),
+            serde_json::json!("0o7"),
+            serde_json::json!(""),
+            serde_json::json!("0x"),
+            serde_json::json!(" 1"),
+            serde_json::json!("1 "),
+            serde_json::json!("+1"),
+            serde_json::json!("-1"),
+            serde_json::json!("1e18"),
+            serde_json::json!("0xg"),
+            serde_json::json!("ff"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(1e30),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            // U256::MAX + 1
+            serde_json::json!(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639936"
+            ),
+            serde_json::json!(format!("0x1{}", "0".repeat(64))),
+        ];
+
+        let get = |tx: &Transaction, field: &str| -> U256 {
+            match (tx, field) {
+                (Transaction::Eip1559(tx), "value") => tx.value,
+                (Transaction::Eip1559(tx), "max_priority_fee_per_gas") => {
+                    tx.max_priority_fee_per_gas
+                }
+                (Transaction::Eip1559(tx), "max_fee_per_gas") => tx.max_fee_per_gas,
+                (Transaction::Legacy(tx), "value") => tx.value,
+                (Transaction::Legacy(tx), "gas_price") => tx.gas_price,
+                _ => unreachable!(),
+            }
+        };
+
+        for (base, fields) in [
+            (base_eip1559_json(), &fields_1559[..]),
+            (base_legacy_json(), &fields_legacy[..]),
+        ] {
+            for field in fields {
+                for (input, expected) in &accepted {
+                    let mut map = base.clone();
+                    map.insert((*field).to_string(), input.clone());
+                    let tx = parse_map(&map)
+                        .unwrap_or_else(|e| panic!("{field}={input} should parse: {e}"));
+                    assert_eq!(get(&tx, field), *expected, "{field}={input}");
+                }
+                for input in &rejected {
+                    let mut map = base.clone();
+                    map.insert((*field).to_string(), input.clone());
+                    assert!(
+                        matches!(parse_map(&map), Err(Error::JsonError(_))),
+                        "{field}={input} should be rejected"
+                    );
+                }
+            }
+        }
+
+        // Serialization output is unchanged (ruint's 0x-prefixed lowercase hex)
+        let tx =
+            Transaction::from_json(&serde_json::Value::Object(base_eip1559_json()).to_string())
+                .unwrap();
+        let json = tx.to_json().unwrap();
+        assert!(json.contains("\"value\":\"0xde0b6b3a7640000\""), "{json}");
+        assert!(
+            json.contains("\"max_fee_per_gas\":\"0x4a817c800\""),
+            "{json}"
+        );
+        assert_eq!(Transaction::from_json(&json).unwrap(), tx);
     }
 
     #[test]
     fn signed_rlp_validation_and_large_chain_id_no_overflow() {
         let sig = Signature::new([1u8; 32], [2u8; 32], 1).unwrap();
+        assert_eq!(sig.v(), 1);
 
         // chain_id == 0 must be rejected
         let zero_legacy = LegacyTransaction {
@@ -781,8 +1376,20 @@ mod tests {
             value: U256::ZERO,
             data: vec![],
         };
+        // v = (2^64 - 1) * 2 + 35 + 1 = 0x020000000000000022, RLP 0x89 || 9 bytes
         let rlp = max_chain_legacy.signed_rlp(&sig).unwrap();
-        assert!(!rlp.is_empty());
+        assert_eq!(
+            hex::encode(&rlp),
+            concat!(
+                "f8688001825208940000000000000000000000000000000000000000808089020000000000000022",
+                "a00101010101010101010101010101010101010101010101010101010101010101",
+                "a00202020202020202020202020202020202020202020202020202020202020202"
+            )
+        );
+        assert_eq!(
+            hex::encode(max_chain_legacy.signing_hash().unwrap()),
+            "b48d94328e0ed474963920c683d2c4de675a3399b1e51e4024be953cecab7687"
+        );
     }
 
     #[test]
@@ -821,6 +1428,10 @@ mod tests {
             access_list: vec![entry],
         };
 
-        assert!(!tx.signing_hash().is_zero());
+        // Expected value computed independently (Python keccak256 + RLP).
+        assert_eq!(
+            hex::encode(tx.signing_hash().unwrap()),
+            "af5ad7f2b610e3413e450e064629cc1f55af96b2a01aa772481e0c6250df3da7"
+        );
     }
 }

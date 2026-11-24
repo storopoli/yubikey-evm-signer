@@ -677,7 +677,7 @@ fn bridge_security_boundaries_and_end_to_end_signing() {
         data: vec![],
         access_list: vec![],
     });
-    let tx_hash: [u8; 32] = tx.signing_hash().into();
+    let tx_hash: [u8; 32] = tx.signing_hash().unwrap().into();
     let sign_apdu = build_sign_apdu(Slot::Authentication, &tx_hash)
         .to_bytes()
         .unwrap();

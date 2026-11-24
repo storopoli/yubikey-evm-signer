@@ -483,7 +483,13 @@ fn cmd_sign_tx() -> ExitCode {
     println!("  Gas Limit: 21000");
     println!();
 
-    let signing_hash = tx.signing_hash();
+    let signing_hash = match tx.signing_hash() {
+        Ok(hash) => hash,
+        Err(e) => {
+            eprintln!("Failed to compute signing hash: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let hash_bytes: [u8; 32] = signing_hash.into();
     println!("Signing Hash: 0x{}", hex::encode(hash_bytes));
     println!();

@@ -498,7 +498,7 @@ mod tests {
         let addr = Address::new(bytes);
         let checksum = addr.to_checksum_hex();
 
-        // EIP-55 checksum should preserve mixed case
-        assert!(checksum.contains(|c: char| c.is_ascii_uppercase()));
+        // Exact EIP-55 test vector
+        assert_eq!(checksum, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
     }
 }
