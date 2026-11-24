@@ -186,7 +186,8 @@ pub fn public_key_to_hex(public_key: &VerifyingKey) -> String {
 /// Every async method takes `&mut self`, so the object supports **one call at a
 /// time**. While a call is pending (for example a signature waiting for a
 /// touch), any other call on the same object, including the synchronous
-/// `getSlot`, `setSlot`, `hasStaleCertificate` and `isConnected`, throws
+/// `getSlot`, `setSlot`, `hasStaleCertificate`, `lastGeneratedPublicKey` and
+/// `isConnected`, throws
 /// synchronously with the wasm-bindgen error "recursive use of an object
 /// detected which would lead to unsafe aliasing in rust", and the pending call
 /// is unaffected. Await each call before starting the next one; for example,
@@ -202,6 +203,8 @@ pub fn public_key_to_hex(public_key: &VerifyingKey) -> String {
 /// fails with an error starting with `Disconnected:` (or the card-reset
 /// message), the verified PIN, management key authentication and cached public
 /// key are discarded, and [`is_connected`](Self::is_connected) returns `false`.
+/// A key generated before the session was lost stays available through
+/// [`last_generated_public_key`](Self::last_generated_public_key).
 /// Create a new device with [`connect_bridge`](Self::connect_bridge) or
 /// [`connect`](Self::connect) to continue.
 ///
@@ -222,6 +225,11 @@ pub struct YubiKeyDevice {
     /// Cached P-256 verifying key for the active slot.
     cached_public_key: Option<VerifyingKey>,
 
+    /// Public key returned by the last successful `GENERATE` in the active slot.
+    /// Kept when the session ends (it may be the only copy of the key); cleared
+    /// when a new generation starts and when the slot changes.
+    last_generated_public_key: Option<VerifyingKey>,
+
     /// Whether the slot's certificate object is known not to describe the key
     /// in the active slot (stale certificate found by the last lookup, or not
     /// deleted after the last key generation). Reset by changing the slot.
@@ -241,6 +249,10 @@ impl fmt::Debug for YubiKeyDevice {
             .field("authenticated", &self.authenticated)
             .field("mgmt_authenticated", &self.mgmt_authenticated)
             .field("has_cached_key", &self.cached_public_key.is_some())
+            .field(
+                "has_last_generated_key",
+                &self.last_generated_public_key.is_some(),
+            )
             .field("stale_certificate", &self.stale_certificate)
             .finish_non_exhaustive()
     }
@@ -309,7 +321,8 @@ impl YubiKeyDevice {
     /// Sets the active PIV slot (`"9a"`, `"9c"`, `"9d"`, or `"9e"`, case-insensitive).
     ///
     /// Changing the slot invalidates the cached public key and resets
-    /// [`has_stale_certificate`](Self::has_stale_certificate).
+    /// [`has_stale_certificate`](Self::has_stale_certificate) and
+    /// [`last_generated_public_key`](Self::last_generated_public_key).
     ///
     /// Throws if another call on this object is pending (see the class docs).
     ///
@@ -322,6 +335,7 @@ impl YubiKeyDevice {
         if parsed != self.slot {
             self.slot = parsed;
             self.cached_public_key = None;
+            self.last_generated_public_key = None;
             self.stale_certificate = false;
         }
         Ok(())
@@ -478,6 +492,14 @@ impl YubiKeyDevice {
     /// [`has_stale_certificate`](Self::has_stale_certificate) returns `true`:
     /// remove or replace the old certificate before relying on it.
     ///
+    /// The new public key is kept for
+    /// [`last_generated_public_key`](Self::last_generated_public_key) even if
+    /// the session ends while the certificate is being deleted (the call then
+    /// still resolves, but the device is disconnected and
+    /// [`get_public_key`](Self::get_public_key) fails). On firmware without
+    /// attestation or slot metadata that is the only way to obtain the key, so
+    /// read it right after this call resolves.
+    ///
     /// One call at a time: see the class docs.
     ///
     /// # Arguments
@@ -488,7 +510,8 @@ impl YubiKeyDevice {
     ///
     /// The checksummed `keccak256(X‖Y)[12..]` identifier of the new P-256 public
     /// key. It is **not** a secp256k1 account (see the class docs); use
-    /// [`get_public_key`](Self::get_public_key) for the key itself.
+    /// [`last_generated_public_key`](Self::last_generated_public_key) for the
+    /// key itself.
     ///
     /// # Errors
     ///
@@ -502,6 +525,9 @@ impl YubiKeyDevice {
 
     /// Internal key generation.
     async fn generate_key_internal(&mut self, pin: Option<&str>) -> WasmResult<String> {
+        // Never report a key from an earlier call as the result of this one.
+        self.last_generated_public_key = None;
+
         if !self.mgmt_authenticated {
             return Err(WasmError::SecurityStatusNotSatisfied);
         }
@@ -532,7 +558,9 @@ impl YubiKeyDevice {
             .ok_or_else(|| WasmError::KeyGenerationFailed("invalid response".to_string()))?;
 
         // The new key exists on the card from here on, so no later failure may
-        // hide it: a certificate that could not be deleted is only reported.
+        // hide it: record it where losing the session cannot clear it, and only
+        // report a certificate that could not be deleted.
+        self.last_generated_public_key = Some(public_key);
         let certificate_deleted = match self
             .transport
             .exchange_full_async(&build_delete_certificate_apdu(slot))
@@ -621,6 +649,34 @@ impl YubiKeyDevice {
     #[allow(clippy::missing_const_for_fn)]
     pub fn has_stale_certificate(&self) -> bool {
         self.stale_certificate
+    }
+
+    /// Returns the P-256 public key created by the last successful
+    /// [`generate_key`](Self::generate_key) in the active slot, as uncompressed
+    /// SEC1 hex (`0x04‖X‖Y`, the same format as
+    /// [`get_public_key`](Self::get_public_key)), or `undefined`.
+    ///
+    /// Unlike the cached key behind `getPublicKey()`, this value survives the
+    /// end of the session (and [`disconnect`](Self::disconnect)) and needs no
+    /// card access: if `generateKey()` resolved, the new key is here even when
+    /// the device reports itself disconnected. That matters on firmware older
+    /// than 5.3 without attestation (older than 4.3), where the key cannot be
+    /// read from the card again until a certificate for it is stored.
+    ///
+    /// It is reset to `undefined` when `generateKey()` starts (so after a
+    /// rejected `generateKey()` it is `undefined`) and when
+    /// [`set_slot`](Self::set_slot) changes the slot, so a defined value always
+    /// belongs to the slot returned by [`get_slot`](Self::get_slot). If
+    /// `generateKey()` rejects because the session ended while the card was
+    /// generating, the slot's key may still have been replaced without the new
+    /// key being reported.
+    ///
+    /// Throws if another call on this object is pending (see the class docs).
+    #[wasm_bindgen(js_name = "lastGeneratedPublicKey")]
+    pub fn last_generated_public_key(&self) -> Option<String> {
+        self.last_generated_public_key
+            .as_ref()
+            .map(public_key_to_hex)
     }
 
     /// Signs a 32-byte prehashed digest using the YubiKey.
@@ -836,6 +892,7 @@ impl YubiKeyDevice {
             transport,
             slot: Slot::Authentication,
             cached_public_key: None,
+            last_generated_public_key: None,
             stale_certificate: false,
             authenticated: false,
             mgmt_authenticated: false,
@@ -843,6 +900,9 @@ impl YubiKeyDevice {
     }
 
     /// Discards the verified PIN, management key authentication and cached key.
+    ///
+    /// The last generated public key is kept on purpose: it may be the only
+    /// copy of a key the card just created.
     const fn forget_session(&mut self) {
         self.authenticated = false;
         self.mgmt_authenticated = false;
@@ -1341,6 +1401,10 @@ mod tests {
                 dev.cached_public_key.as_ref(),
                 Some(new_key.verifying_key())
             );
+            assert_eq!(
+                dev.last_generated_public_key(),
+                Some(public_key_to_hex(new_key.verifying_key()))
+            );
             assert!(!dev.has_stale_certificate());
             assert_eq!(instructions(&sent), vec![INS_GENERATE, INS_PUT_DATA]);
             assert_eq!(
@@ -1374,27 +1438,98 @@ mod tests {
             Some(new_key.verifying_key())
         );
 
-        // Session lost during the delete: the new key's address is still
-        // returned and the staleness is still reported, but the device is
+        // Session lost during the delete (whether or not the card deleted the
+        // certificate before the reply was lost): the new key's address is
+        // still returned, the staleness is still reported, and the new public
+        // key stays readable without the session, while the device is
         // disconnected and its session state is gone.
+        let new_key_hex = format!("0x{}", hex::encode(point(&new_key)));
+        for lost in [
+            WasmError::Disconnected("bridge session ended".into()),
+            WasmError::CardReset,
+        ] {
+            let handler = card(
+                reply(ok(metadata_body(0x11, &point(&old_key)))),
+                reply(ok(cert_object(&point(&old_key)))),
+                new_key.clone(),
+                reply(Err(lost)),
+            );
+            let (mut dev, sent) = device(handler, Slot::Authentication);
+            dev.mgmt_authenticated = true;
+            dev.authenticated = true;
+            let address = block_on(async {
+                let result = dev.generate_key_internal(None).await;
+                dev.settle(result).await
+            })
+            .unwrap();
+            assert_eq!(address, address_of(&new_key));
+            assert!(dev.has_stale_certificate());
+            assert!(!dev.is_connected());
+            assert!(!dev.authenticated);
+            assert!(!dev.mgmt_authenticated);
+            assert!(dev.cached_public_key.is_none());
+            assert_eq!(
+                dev.last_generated_public_key().as_deref(),
+                Some(new_key_hex.as_str())
+            );
+
+            // Reading it needs no card access, and disconnect() keeps it.
+            let sent_before = sent.borrow().len();
+            block_on(dev.disconnect()).unwrap();
+            assert_eq!(
+                dev.last_generated_public_key().as_deref(),
+                Some(new_key_hex.as_str())
+            );
+            assert_eq!(sent.borrow().len(), sent_before);
+        }
+    }
+
+    #[test]
+    fn last_generated_public_key_never_outlives_its_slot_or_call() {
+        let (old_key, new_key) = (signing_key(1), signing_key(3));
         let handler = card(
             reply(ok(metadata_body(0x11, &point(&old_key)))),
-            reply(ok(cert_object(&point(&old_key)))),
+            reply(sw(0x6A, 0x82)),
             new_key.clone(),
-            reply(Err(WasmError::Disconnected("bridge session ended".into()))),
+            reply(sw(0x90, 0x00)),
         );
         let (mut dev, _) = device(handler, Slot::Authentication);
+        assert_eq!(dev.last_generated_public_key(), None);
+
         dev.mgmt_authenticated = true;
-        let address = block_on(async {
+        block_on(dev.generate_key_internal(None)).unwrap();
+        let new_key_hex = format!("0x{}", hex::encode(point(&new_key)));
+        assert_eq!(dev.last_generated_public_key(), Some(new_key_hex));
+
+        // Re-selecting the same slot keeps it; changing the slot drops it.
+        dev.set_slot("9A").unwrap();
+        assert!(dev.last_generated_public_key().is_some());
+        dev.set_slot("9c").unwrap();
+        assert_eq!(dev.last_generated_public_key(), None);
+        dev.set_slot("9a").unwrap();
+        assert_eq!(dev.last_generated_public_key(), None);
+
+        // A rejected generateKey() clears the key of an earlier call.
+        dev.last_generated_public_key = Some(*new_key.verifying_key());
+        dev.mgmt_authenticated = false;
+        assert_eq!(
+            block_on(dev.generate_key_internal(None)),
+            Err(WasmError::SecurityStatusNotSatisfied)
+        );
+        assert_eq!(dev.last_generated_public_key(), None);
+
+        let (transport, _) = ScriptedTransport::new(Box::new(|_| {
+            Err(WasmError::Disconnected("gone; reconnect".into()))
+        }));
+        let mut dev = YubiKeyDevice::with_transport(DeviceTransport::Scripted(transport));
+        dev.mgmt_authenticated = true;
+        dev.last_generated_public_key = Some(*new_key.verifying_key());
+        let result = block_on(async {
             let result = dev.generate_key_internal(None).await;
             dev.settle(result).await
-        })
-        .unwrap();
-        assert_eq!(address, address_of(&new_key));
-        assert!(dev.has_stale_certificate());
-        assert!(!dev.is_connected());
-        assert!(!dev.mgmt_authenticated);
-        assert!(dev.cached_public_key.is_none());
+        });
+        assert!(matches!(result, Err(WasmError::Disconnected(_))));
+        assert_eq!(dev.last_generated_public_key(), None);
     }
 
     #[test]

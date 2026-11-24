@@ -99,8 +99,8 @@ Await each call before starting the next one: a `YubiKeyDevice` handles one call
 
 ## Usage rules
 
-- **One call at a time.** A `YubiKeyDevice` handles one call at a time. While a call is pending (for example a signature waiting for a touch), any other call on the same object, including `getSlot()`, `setSlot()`, `hasStaleCertificate()`, and `isConnected()`, throws synchronously with `recursive use of an object detected which would lead to unsafe aliasing in rust`; the pending call is unaffected. Await each call, or route all calls through one queue.
-- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. Over the bridge this includes a bridge that stopped answering or was restarted (its old token is rejected with `401`). Create a new device with `connectBridge()` or `connect()` to continue, using the token the bridge currently prints.
+- **One call at a time.** A `YubiKeyDevice` handles one call at a time. While a call is pending (for example a signature waiting for a touch), any other call on the same object, including `getSlot()`, `setSlot()`, `hasStaleCertificate()`, `lastGeneratedPublicKey()`, and `isConnected()`, throws synchronously with `recursive use of an object detected which would lead to unsafe aliasing in rust`; the pending call is unaffected. Await each call, or route all calls through one queue.
+- **Lost sessions.** When a call fails with an error starting with `Disconnected:` or with the card-reset error (`YubiKey was reset by another application; …`), the device discards its verified PIN, management key authentication, and cached public key, and `isConnected()` returns `false`. A key generated before the session ended stays available from `lastGeneratedPublicKey()`. Over the bridge this includes a bridge that stopped answering or was restarted (its old token is rejected with `401`). Create a new device with `connectBridge()` or `connect()` to continue, using the token the bridge currently prints.
 - **PINs.** Prompt for the PIN at runtime and pass it to each signing call; never hardcode it or keep it in browser storage.
 
 ## API Reference
@@ -136,7 +136,7 @@ Connect to a CCID smart card directly via WebUSB (experimental; requires a secur
 
 #### `setSlot(slot: string): void`
 
-Select the active PIV slot (`'9a'`, `'9c'`, `'9d'`, or `'9e'`, case-insensitive). Changing the slot invalidates the cached public key and resets `hasStaleCertificate()`.
+Select the active PIV slot (`'9a'`, `'9c'`, `'9d'`, or `'9e'`, case-insensitive). Changing the slot invalidates the cached public key and resets `hasStaleCertificate()` and `lastGeneratedPublicKey()`.
 
 #### `getSlot(): string`
 
@@ -155,14 +155,14 @@ Verify the PIV PIN (6–8 bytes). Signing methods verify the PIN they are given 
 
 #### `generateKey(pin?: string): Promise<string>`
 
-Generate a new P-256 key pair in the active PIV slot and return the checksummed address identifier of the new key (not a secp256k1 account; use `getPublicKey()` for the key itself). Requires prior `authenticateManagementKey()`; a non-empty `pin` is verified first.
+Generate a new P-256 key pair in the active PIV slot and return the checksummed address identifier of the new key (not a secp256k1 account; use `lastGeneratedPublicKey()` for the key itself). Requires prior `authenticateManagementKey()`; a non-empty `pin` is verified first.
 
-After generating the key, the slot's certificate, which described the destroyed key, is deleted. If that deletion fails, the call still succeeds with the new key and `hasStaleCertificate()` returns `true`; remove or replace the old certificate before any other software relies on it.
+After generating the key, the slot's certificate, which described the destroyed key, is deleted. If that deletion fails, the call still succeeds with the new key and `hasStaleCertificate()` returns `true`; remove or replace the old certificate before any other software relies on it. If the session ends during the deletion, the call also still succeeds, but the device is disconnected afterwards and `getPublicKey()` fails; `lastGeneratedPublicKey()` still returns the new key.
 
-On firmware older than 5.3, the key can only be read back through a certificate. Call `getPublicKey()` before the session ends (it returns the new key from the cache), convert it to PEM, and store a certificate for it:
+On firmware older than 5.3, the key can only be read back through a certificate. Right after `generateKey()` resolves, read `lastGeneratedPublicKey()` (it needs no session), convert it to PEM, and store a certificate for it:
 
 ```bash
-PUBKEY=0x04...   # the getPublicKey() result
+PUBKEY=0x04...   # the lastGeneratedPublicKey() result
 printf '3059301306072a8648ce3d020106082a8648ce3d030107034200%s' "${PUBKEY#0x}" \
   | xxd -r -p | openssl pkey -pubin -inform DER -out pubkey.pem
 ykman piv certificates generate -s "CN=YubiKey EVM Signer" 9a pubkey.pem
@@ -181,6 +181,12 @@ The key is read from the YubiKey's slot metadata on firmware 5.3 and newer, whic
 #### `getPublicKey(): Promise<string>`
 
 Return the P-256 public key of the active slot as uncompressed SEC1 hex, `0x04‖X‖Y` (65 bytes, lowercase, `0x`-prefixed). `X` and `Y` are the `qx` and `qy` inputs of `P256VERIFY`. Uses the same lookup and cache as `getAddress()`.
+
+#### `lastGeneratedPublicKey(): string | undefined`
+
+Return the P-256 public key created by the last successful `generateKey()` in the active slot, as `0x04‖X‖Y` hex (the `getPublicKey()` format), or `undefined`. It is synchronous, sends nothing to the card, and survives the end of the session and `disconnect()`: whenever `generateKey()` resolved, the new key is here, even if `isConnected()` is now `false`.
+
+It is reset to `undefined` when `generateKey()` starts (so it is `undefined` after a rejected `generateKey()`) and when `setSlot()` changes the slot, so a defined value always belongs to the slot `getSlot()` returns. If `generateKey()` rejects because the session ended while the card was generating, the slot's key may have been replaced without the new key being reported.
 
 #### `hasStaleCertificate(): boolean`
 

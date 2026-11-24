@@ -87,10 +87,10 @@ Two-crate workspace with native and browser transports:
     - `PivSession` / `PivExclusive` and sans-IO PIV APDU builders/parsers in `piv.rs`; slot public keys come from Yubico `GET METADATA` (firmware 5.3+) with certificate fallback and stale-certificate detection; `generate_key` returns `GeneratedKey` and deletes the slot certificate
     - `Slot` enum for PIV slot management
     - `Apdu` for command encoding
-  - `examples/yubikey-cli.rs`: Native PC/SC CLI (`list`, `info`, `address`, `generate [--force]`, `sign`, `sign-tx`, `bridge [--port] [--allow-origin]... [--idle-timeout] [--allow-generate]`)
+  - `examples/yubikey-cli.rs`: Native PC/SC CLI (`list`, `info`, `address`, `generate [--force] [--pubkey-out <path>]`, `sign`, `sign-tx`, `bridge [--port] [--allow-origin]... [--idle-timeout] [--allow-generate]`)
 
 - **signer-wasm** (`yubikey-evm-signer-wasm`): Browser WASM bindings
-  - `device.rs`: `YubiKeyDevice` class exposed to JavaScript (`connectBridge`, `connect`, `getPublicKey`, `getAddress`, `hasStaleCertificate`, signing methods); one call at a time; session-ending errors clear PIN/management state
+  - `device.rs`: `YubiKeyDevice` class exposed to JavaScript (`connectBridge`, `connect`, `getPublicKey`, `getAddress`, `hasStaleCertificate`, `lastGeneratedPublicKey`, signing methods); one call at a time; session-ending errors clear PIN/management state and the cached key but keep the last generated public key
   - `bridge_transport.rs`: Async `BridgeTransport` connecting to `yubikey-cli bridge` over `fetch()`; accepts only `http://127.0.0.1:<port>` (port `80` excluded) and tokens of at least 32 visible ASCII characters; maps `409`/`503`, and on an established session an unreachable bridge or `401`/`500`, to `Disconnected`
   - `transport.rs`: Async `WebUsbTransport` (browser async CCID transport; does not implement core's synchronous `Transport` trait; closes itself after an unrecoverable CCID error) and shared `AsyncApduTransport` retry/chaining helpers
   - `error.rs`: `WasmError`, whose `Display` strings are the JavaScript error messages documented in `packages/npm/README.md`

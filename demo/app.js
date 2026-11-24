@@ -616,17 +616,16 @@ async function generateKey() {
         } catch (error) {
             return { slot, error };
         }
-        // The new key exists from here on: report it even if reading it back fails
-        // (getPublicKey() needs the session, which may have ended meanwhile).
+        // The new key exists from here on. lastGeneratedPublicKey() needs no card
+        // access and survives a session that ended while the old certificate was
+        // being deleted; on old firmware it may be the only copy of the key.
         const staleCertificate = device.hasStaleCertificate();
-        let publicKey = null;
-        try {
-            publicKey = await device.getPublicKey();
-        } catch (error) {
-            log(`Could not read back the new public key: ${errorMessage(error)}`, 'warn');
-        }
+        const publicKey = device.lastGeneratedPublicKey() ?? null;
         return { slot, address, publicKey, staleCertificate };
     });
+    // runDeviceTask has already switched the page to its disconnected state if
+    // the session ended; the key is shown below, after that transition, so the
+    // transition cannot wipe it.
     if (!result.current) return;
 
     if (!result.ok) {
@@ -650,6 +649,12 @@ async function generateKey() {
     log(`Key generated in slot ${slot}. Derived address: ${address}`, 'success');
     if (publicKey) {
         log(`P-256 public key: ${publicKey}`, 'info');
+    }
+    if (!state.device) {
+        log(
+            `The session ended after the key was generated; save the public key above now (on firmware older than 5.3 it cannot be read back until a certificate for it is stored in slot ${slot})`,
+            'warn'
+        );
     }
     if (staleCertificate) {
         log(

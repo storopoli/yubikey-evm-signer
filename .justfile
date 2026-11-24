@@ -179,8 +179,9 @@ cli-address:
 
 # Generate a new P-256 key in slot 9a (requires management key and typed confirmation; destroys existing key!) (options: --force, --pubkey-out <path>)
 [group('cli')]
+[positional-arguments]
 cli-generate *args:
-  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate {{args}}
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- generate "$@"
 
 # Sign a sample EIP-1559 transaction hash with the slot 9a P-256 key (requires PIN)
 [group('cli')]
@@ -194,8 +195,9 @@ cli-sign hash:
 
 # Start hardened local PC/SC loopback bridge for browser apps (options: --port, --allow-origin, --idle-timeout <seconds>, --allow-generate)
 [group('cli')]
+[positional-arguments]
 cli-bridge *args:
-  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge {{args}}
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge "$@"
 
 # Show CLI help
 [group('cli')]
