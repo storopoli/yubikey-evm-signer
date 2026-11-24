@@ -22,7 +22,8 @@ const state = {
     slot: null,
     pinVerified: false,
     mgmtAuthenticated: false,
-    address: null
+    address: null,
+    publicKey: null
 };
 
 // ============================================
@@ -55,6 +56,7 @@ const elements = {
     slotSelect: document.getElementById('slot-select'),
     getAddressBtn: document.getElementById('get-address-btn'),
     addressDisplay: document.getElementById('address-display'),
+    publicKeyDisplay: document.getElementById('public-key-display'),
     mgmtAlgSelect: document.getElementById('mgmt-alg-select'),
     mgmtKeyInput: document.getElementById('mgmt-key-input'),
     mgmtStatus: document.getElementById('mgmt-status'),
@@ -207,11 +209,9 @@ function updateConnectionUI(connected) {
 
     if (!connected) {
         // Clear sensitive inputs and all cached outputs on disconnect
-        state.address = null;
-
         elements.pinInput.value = '';
         elements.mgmtKeyInput.value = '';
-        elements.addressDisplay.textContent = '-';
+        showKey(null, null);
         elements.txSignature.value = '';
         elements.typedDataSignature.value = '';
         elements.messageSignature.value = '';
@@ -236,6 +236,14 @@ function updateMgmtUI(authenticated) {
     elements.mgmtStatus.textContent = authenticated ? 'Authenticated' : 'Not authenticated';
     elements.mgmtStatus.className = `status ${authenticated ? 'verified' : ''}`;
     updateControls();
+}
+
+/** Shows the active slot's derived address and P-256 public key (`null` clears them). */
+function showKey(address, publicKey) {
+    state.address = address;
+    state.publicKey = publicKey;
+    elements.addressDisplay.textContent = address || '-';
+    elements.publicKeyDisplay.textContent = publicKey || '-';
 }
 
 /** Shows `slot` (as reported by the device) in the slot dropdown. */
@@ -326,8 +334,14 @@ function errorMessage(error) {
  * Resolves to `{ current, ok, value, error }`. `current` is false when the task
  * did not run (another one was pending) or when `state.device` changed while it
  * was pending; callers must not write a non-current result into the UI.
+ *
+ * If the task leaves the device disconnected (the bridge session expired or was
+ * replaced, the card was reset, the YubiKey or bridge went away), the page
+ * switches to its disconnected state before resolving; the result is still
+ * `current` so the caller logs the device's error message. Pass
+ * `{ closing: true }` for the task that disconnects on purpose.
  */
-async function runDeviceTask(task) {
+async function runDeviceTask(task, { closing = false } = {}) {
     if (state.busy) {
         log('Another YubiKey operation is still in progress; wait for it to finish', 'warn');
         return { current: false, ok: false };
@@ -349,9 +363,23 @@ async function runDeviceTask(task) {
     const current = state.device === device;
     if (!current) {
         log('Discarding the result of an operation started on a previous connection', 'warn');
+    } else if (device && !closing && !isStillConnected(device)) {
+        state.device = null;
+        state.slot = null;
+        updateConnectionUI(false);
+        log('The YubiKey session ended; connect again to continue', 'warn');
     }
     updateControls();
     return { current, ...outcome };
+}
+
+/** `device.isConnected()`, treating a throwing call as still connected. */
+function isStillConnected(device) {
+    try {
+        return device.isConnected();
+    } catch {
+        return true;
+    }
 }
 
 // ============================================
@@ -444,7 +472,7 @@ async function disconnectDevice() {
             // disconnect() ran but reported an error: trust the transport state.
             return { closed: !device.isConnected(), error };
         }
-    });
+    }, { closing: true });
     if (!result.current) return;
 
     if (!result.ok || !result.value.closed) {
@@ -500,8 +528,7 @@ async function changeSlot() {
         return;
     }
     if (result.value.slot !== previousSlot) {
-        state.address = null;
-        elements.addressDisplay.textContent = '-';
+        showKey(null, null);
     }
     log(`Active PIV slot set to ${result.value.slot}`, 'info');
 }
@@ -577,11 +604,22 @@ async function generateKey() {
             return { slot, cancelled: true };
         }
         log(`Generating new P-256 key in slot ${slot}...`);
+        let address;
         try {
-            return { slot, address: await device.generateKey(optionalPin) };
+            address = await device.generateKey(optionalPin);
         } catch (error) {
             return { slot, error };
         }
+        // The new key exists from here on: report it even if reading it back fails
+        // (getPublicKey() needs the session, which may have ended meanwhile).
+        const staleCertificate = device.hasStaleCertificate();
+        let publicKey = null;
+        try {
+            publicKey = await device.getPublicKey();
+        } catch (error) {
+            log(`Could not read back the new public key: ${errorMessage(error)}`, 'warn');
+        }
+        return { slot, address, publicKey, staleCertificate };
     });
     if (!result.current) return;
 
@@ -601,25 +639,44 @@ async function generateKey() {
         return;
     }
 
-    const { slot, address } = result.value;
-    state.address = address;
-    elements.addressDisplay.textContent = address;
-    log(`Key generated in slot ${slot}. Address: ${address}`, 'success');
+    const { slot, address, publicKey, staleCertificate } = result.value;
+    showKey(address, publicKey);
+    log(`Key generated in slot ${slot}. Derived address: ${address}`, 'success');
+    if (publicKey) {
+        log(`P-256 public key: ${publicKey}`, 'info');
+    }
+    if (staleCertificate) {
+        log(
+            `The old certificate in slot ${slot} could not be deleted and still describes the previous key; remove or replace it before other software relies on it`,
+            'warn'
+        );
+    }
 }
 
 async function getAddress() {
     if (!state.device) return;
 
     const result = await runDeviceTask(async (device) => {
-        log(`Retrieving address from slot ${device.getSlot()}...`);
-        return device.getAddress();
+        const slot = device.getSlot();
+        log(`Reading the P-256 public key in slot ${slot}...`);
+        const address = await device.getAddress();
+        // Same lookup and cache as getAddress(): no further card commands.
+        const publicKey = await device.getPublicKey();
+        return { slot, address, publicKey, staleCertificate: device.hasStaleCertificate() };
     });
     if (!result.current) return;
 
     if (result.ok) {
-        state.address = result.value;
-        elements.addressDisplay.textContent = result.value;
-        log(`Address: ${result.value}`, 'success');
+        const { slot, address, publicKey, staleCertificate } = result.value;
+        showKey(address, publicKey);
+        log(`Derived address: ${address}`, 'success');
+        log(`P-256 public key: ${publicKey}`, 'info');
+        if (staleCertificate) {
+            log(
+                `The certificate in slot ${slot} belongs to an older key; the address and public key above come from the slot's key metadata`,
+                'warn'
+            );
+        }
     } else {
         log(`Get address failed: ${errorMessage(result.error)}`, 'error');
     }

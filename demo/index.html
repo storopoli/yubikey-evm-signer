@@ -113,9 +113,14 @@
                 <button id="get-address-btn" class="secondary" disabled>Get Address</button>
             </div>
             <div class="result-group">
-                <label>Ethereum Address:</label>
+                <label>P-256 Public Key (0x04 &#8214; X &#8214; Y, for EIP-7951 P256VERIFY):</label>
+                <div id="public-key-display" class="address-display">-</div>
+            </div>
+            <div class="result-group">
+                <label>Derived Address (keccak256 of the P-256 key &mdash; not a standard EOA):</label>
                 <div id="address-display" class="address-display">-</div>
             </div>
+            <p class="hint">The derived address is <code>keccak256(X &#8214; Y)[12..]</code> of the slot's P-256 key. It is not a secp256k1 account: on standard EVM chains nothing can be sent from it and these signatures do not <code>ecrecover</code> to it. Contracts that verify them with <code>P256VERIFY</code> (EIP-7951), such as smart accounts, need the public key above.</p>
 
             <hr class="section-divider">
 
@@ -143,7 +148,8 @@
                 <button id="auth-mgmt-btn" class="secondary" disabled>Authenticate Management Key</button>
                 <button id="generate-key-btn" class="danger" disabled>Generate New Key</button>
             </div>
-            <p class="hint">Warning: Generate New Key permanently overwrites any existing key in the selected PIV slot. Authenticate the management key first.</p>
+            <p class="hint">Warning: Generate New Key permanently overwrites any existing key in the selected PIV slot and deletes the slot's old certificate. Authenticate the management key first.</p>
+            <p class="hint">Over the Local PC/SC Bridge, management key authentication and key generation require starting the bridge with <code>yubikey-cli bridge --allow-generate</code> (<code>just cli-bridge --allow-generate</code>); otherwise the bridge refuses them (403).</p>
         </section>
 
         <!-- Sign Transaction Section (EIP-1559) -->

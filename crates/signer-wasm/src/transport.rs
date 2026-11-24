@@ -12,11 +12,15 @@
 //! Linux, and Windows, prefer [`BridgeTransport`](crate::bridge_transport::BridgeTransport)
 //! via [`YubiKeyDevice::connect_bridge`](crate::YubiKeyDevice::connect_bridge).
 
+use std::cell::Cell;
 use std::fmt;
+use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{DomException, UsbConfiguration, UsbDevice, UsbEndpoint, UsbInterface};
+use web_sys::{
+    DomException, UsbConfiguration, UsbConnectionEvent, UsbDevice, UsbEndpoint, UsbInterface,
+};
 use zeroize::Zeroize;
 
 use yubikey_evm_signer_core::yubikey::Slot;
@@ -49,6 +53,14 @@ const MAX_RESPONSE_CHUNKS: usize = 128;
 /// Maximum consecutive leading USB zero-length packet (ZLP) terminators skipped
 /// before the start of a CCID frame.
 const CCID_MAX_LEADING_ZLPS: usize = 2;
+
+/// Maximum complete CCID frames with a stale `bSeq` (responses to earlier
+/// commands) discarded while waiting for one response frame.
+const CCID_MAX_STALE_FRAMES: usize = 8;
+
+/// `DOMException` names that WebUSB `transferIn()`/`transferOut()` reject with
+/// when the device is gone (unplugged, or closed under the page).
+const DEVICE_LOST_DOM_ERRORS: [&str; 2] = ["NetworkError", "NotFoundError"];
 
 /// CCID command: `PC_to_RDR_IccPowerOn` (`0x62`).
 pub const CCID_PC_TO_RDR_ICC_POWER_ON: u8 = 0x62;
@@ -270,7 +282,52 @@ struct CcidInterfaceInfo {
     max_packet_size: usize,
 }
 
+/// A `navigator.usb` `disconnect` listener that flags one device as unplugged.
+///
+/// Dropping it removes the listener before the closure is freed, so neither
+/// the listener nor the closure outlives the transport that owns it.
+struct DisconnectListener {
+    usb: web_sys::Usb,
+    callback: Closure<dyn FnMut(UsbConnectionEvent)>,
+}
+
+impl DisconnectListener {
+    /// Registers a listener that sets `unplugged` when `device` is disconnected.
+    ///
+    /// Returns `None` if the listener cannot be registered; the transport then
+    /// relies on transfer errors to notice that the device is gone.
+    fn register(device: &UsbDevice, unplugged: Rc<Cell<bool>>) -> Option<Self> {
+        let usb = web_sys::window()?.navigator().usb();
+        let watched = device.clone();
+        let callback =
+            Closure::<dyn FnMut(UsbConnectionEvent)>::new(move |event: UsbConnectionEvent| {
+                if js_sys::Object::is(&event.device(), &watched) {
+                    unplugged.set(true);
+                }
+            });
+        usb.add_event_listener_with_callback("disconnect", callback.as_ref().unchecked_ref())
+            .ok()?;
+        Some(Self { usb, callback })
+    }
+}
+
+impl Drop for DisconnectListener {
+    fn drop(&mut self) {
+        let _ = self.usb.remove_event_listener_with_callback(
+            "disconnect",
+            self.callback.as_ref().unchecked_ref(),
+        );
+    }
+}
+
 /// WebUSB CCID transport for browser-based YubiKey communication.
+///
+/// Any failure while exchanging a CCID message (transfer error, framing error,
+/// or [`WasmError::Timeout`]) leaves the card's response stream in an unknown
+/// state, so the transport releases the interface, closes the device and
+/// becomes unusable: that call and every later one fail with
+/// [`WasmError::Disconnected`] until a new transport is opened. The transport
+/// also counts as disconnected once the browser reports the device unplugged.
 pub struct WebUsbTransport {
     /// The USB device handle.
     device: UsbDevice,
@@ -290,8 +347,14 @@ pub struct WebUsbTransport {
     /// CCID sequence number for message ordering.
     sequence: u8,
 
-    /// Whether the device is currently connected.
+    /// Whether the device is open and the transport usable.
     connected: bool,
+
+    /// Set by the `navigator.usb` `disconnect` listener when the device is unplugged.
+    unplugged: Rc<Cell<bool>>,
+
+    /// The registered `disconnect` listener (removed on close and on drop).
+    disconnect_listener: Option<DisconnectListener>,
 }
 
 impl fmt::Debug for WebUsbTransport {
@@ -303,6 +366,11 @@ impl fmt::Debug for WebUsbTransport {
             .field("max_packet_size", &self.max_packet_size)
             .field("sequence", &self.sequence)
             .field("connected", &self.connected)
+            .field("unplugged", &self.unplugged.get())
+            .field(
+                "has_disconnect_listener",
+                &self.disconnect_listener.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -348,7 +416,11 @@ impl WebUsbTransport {
 
         // Run remaining setup, closing and releasing on any error
         match Self::setup_opened_device(device.clone()).await {
-            Ok(transport) => Ok(transport),
+            Ok(mut transport) => {
+                transport.disconnect_listener =
+                    DisconnectListener::register(&transport.device, transport.unplugged.clone());
+                Ok(transport)
+            }
             Err((err, claimed_iface)) => {
                 if let Some(iface) = claimed_iface {
                     let _ = JsFuture::from(device.release_interface(iface)).await;
@@ -412,6 +484,8 @@ impl WebUsbTransport {
             max_packet_size: info.max_packet_size,
             sequence: 0,
             connected: true,
+            unplugged: Rc::new(Cell::new(false)),
+            disconnect_listener: None,
         };
 
         // Power on the ICC and validate the ATR DataBlock response
@@ -515,13 +589,11 @@ impl WebUsbTransport {
             let promise = self
                 .device
                 .transfer_out_with_u8_slice(self.endpoint_out, slice)
-                .map_err(|e| {
-                    WasmError::UsbError(format!("transfer_out: {}", format_js_error(&e)))
-                })?;
+                .map_err(|e| transfer_error("transfer_out", &e))?;
 
-            let result = JsFuture::from(promise).await.map_err(|e| {
-                WasmError::UsbError(format!("transfer_out: {}", format_js_error(&e)))
-            })?;
+            let result = JsFuture::from(promise)
+                .await
+                .map_err(|e| transfer_error("transfer_out", &e))?;
 
             let transfer: web_sys::UsbOutTransferResult = result.unchecked_into();
             if transfer.status() != web_sys::UsbTransferStatus::Ok {
@@ -549,7 +621,7 @@ impl WebUsbTransport {
 
         let result = JsFuture::from(promise)
             .await
-            .map_err(|e| WasmError::UsbError(format!("transfer_in: {}", format_js_error(&e))))?;
+            .map_err(|e| transfer_error("transfer_in", &e))?;
 
         let transfer: web_sys::UsbInTransferResult = result.unchecked_into();
         if transfer.status() != web_sys::UsbTransferStatus::Ok {
@@ -602,26 +674,73 @@ impl WebUsbTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`WasmError::UsbError`], [`WasmError::Timeout`], or [`WasmError::CoreError`].
+    /// - [`WasmError::Disconnected`] if the transport is closed or unusable, the
+    ///   device was unplugged, or the CCID exchange failed (transfer or framing
+    ///   error, or no response within the time-extension limit). In the last
+    ///   case the transport has just released the device and is now unusable.
+    /// - [`WasmError::UsbError`] / [`WasmError::CoreError`] if the APDU cannot be
+    ///   encoded or the card's response is shorter than a status word.
     pub async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
-        if !self.connected {
-            return Err(WasmError::UsbError(
-                "WebUSB transport is disconnected".to_string(),
-            ));
-        }
+        self.ensure_usable()?;
 
         let mut apdu_bytes = apdu
             .to_bytes()
             .map_err(|e| WasmError::CoreError(e.to_string()))?;
         let seq = self.next_sequence();
-        let mut ccid_command = wrap_ccid_xfr_block(seq, &apdu_bytes)?;
+        let wrapped = wrap_ccid_xfr_block(seq, &apdu_bytes);
         apdu_bytes.zeroize();
+        let mut ccid_command = wrapped?;
 
         let send_result = self.send_ccid_and_wait(&ccid_command, seq).await;
         ccid_command.zeroize();
 
-        let apdu_response = send_result?;
+        let apdu_response = match send_result {
+            Ok(bytes) => bytes,
+            Err(cause) => return Err(self.abandon(cause).await),
+        };
         ApduResponse::try_from_bytes(apdu_response).map_err(|e| WasmError::UsbError(e.to_string()))
+    }
+
+    /// Exchanges an APDU like [`Self::transmit_full_async`] but returns the
+    /// final status word instead of converting it into an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, timeout, or response-size errors.
+    pub async fn exchange_full_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
+        exchange_apdu_full(self, apdu).await
+    }
+
+    /// Fails fast with [`WasmError::Disconnected`] unless the transport is usable.
+    fn ensure_usable(&self) -> WasmResult<()> {
+        if self.unplugged.get() {
+            return Err(WasmError::Disconnected(
+                "the YubiKey was unplugged; reconnect it".to_string(),
+            ));
+        }
+        if !self.connected {
+            return Err(WasmError::Disconnected(
+                "the WebUSB connection is closed; reconnect the YubiKey".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Abandons the connection after a failed CCID exchange: releases the
+    /// interface and closes the device (best effort), marks the transport
+    /// unusable, and returns the error to report.
+    ///
+    /// After such a failure the card's response to the failed command may still
+    /// be queued, so reusing the connection would desynchronize every later
+    /// command.
+    async fn abandon(&mut self, cause: WasmError) -> WasmError {
+        self.disconnect_listener = None;
+        if self.connected {
+            let _ = JsFuture::from(self.device.release_interface(self.interface_number)).await;
+            let _ = JsFuture::from(self.device.close()).await;
+            self.connected = false;
+        }
+        unusable_transport_error(cause)
     }
 
     /// Transmits an APDU, automatically handling ISO 7816-4 `0x6C XX` wrong-`Le`
@@ -644,6 +763,7 @@ impl WebUsbTransport {
     ///
     /// Always returns `Ok(())` after best-effort interface release and device close.
     pub async fn close(&mut self) -> WasmResult<()> {
+        self.disconnect_listener = None;
         if self.connected {
             let _ = JsFuture::from(self.device.release_interface(self.interface_number)).await;
             let _ = JsFuture::from(self.device.close()).await;
@@ -652,10 +772,13 @@ impl WebUsbTransport {
         Ok(())
     }
 
-    /// Checks if the transport is connected.
+    /// Checks if the transport is connected and usable.
+    ///
+    /// Returns `false` after [`Self::close`], after an unrecoverable CCID error,
+    /// and once the browser reports the device unplugged.
     #[must_use]
-    pub const fn is_connected(&self) -> bool {
-        self.connected
+    pub fn is_connected(&self) -> bool {
+        self.connected && !self.unplugged.get()
     }
 }
 
@@ -680,12 +803,29 @@ pub(crate) trait AsyncApduTransport {
 
 /// Transmits an APDU across any [`AsyncApduTransport`], handling ISO 7816-4
 /// `0x6C XX` wrong-`Le` retries and `0x61 XX` `GET RESPONSE` chaining (capped
-/// at 16 KiB / 128 chunks).
+/// at 16 KiB / 128 chunks), and maps a non-success status word to an error.
 pub(crate) async fn transmit_apdu_full<T: AsyncApduTransport>(
     transport: &mut T,
     apdu: &Apdu,
     slot: Option<Slot>,
 ) -> WasmResult<Vec<u8>> {
+    let response = exchange_apdu_full(transport, apdu).await?;
+    check_response(&response, slot)?;
+    Ok(response.into_data())
+}
+
+/// Exchanges an APDU across any [`AsyncApduTransport`] like
+/// [`transmit_apdu_full`], but returns the final status word instead of
+/// converting it into an error.
+///
+/// On success the response carries the concatenated data of every chunk with
+/// status word `0x9000`; otherwise it is an empty response carrying the first
+/// non-success, non-`0x61` status word (the same contract as the native
+/// session's exchange, so the sans-IO PIV decision helpers can be shared).
+pub(crate) async fn exchange_apdu_full<T: AsyncApduTransport>(
+    transport: &mut T,
+    apdu: &Apdu,
+) -> WasmResult<ApduResponse> {
     let mut response = transport.transmit_one(apdu).await?;
 
     if let Some(correct_le) = response.wrong_le() {
@@ -695,7 +835,9 @@ pub(crate) async fn transmit_apdu_full<T: AsyncApduTransport>(
         response = retry_result?;
     }
 
-    check_response(&response, slot)?;
+    if !response.is_success() && !response.has_more_data() {
+        return Ok(status_only(&response));
+    }
 
     let mut remaining = response.remaining_bytes();
     let mut data = response.into_data();
@@ -722,7 +864,9 @@ pub(crate) async fn transmit_apdu_full<T: AsyncApduTransport>(
             chunk_resp = transport.transmit_one(&retry).await?;
         }
 
-        check_response(&chunk_resp, slot)?;
+        if !chunk_resp.is_success() && !chunk_resp.has_more_data() {
+            return Ok(status_only(&chunk_resp));
+        }
 
         remaining = chunk_resp.remaining_bytes();
         let chunk = chunk_resp.into_data();
@@ -734,7 +878,13 @@ pub(crate) async fn transmit_apdu_full<T: AsyncApduTransport>(
         data.extend_from_slice(&chunk);
     }
 
-    Ok(data)
+    data.extend_from_slice(&[0x90, 0x00]);
+    ApduResponse::try_from_bytes(data).map_err(WasmError::from)
+}
+
+/// Returns a data-less response carrying only `response`'s status word.
+fn status_only(response: &ApduResponse) -> ApduResponse {
+    ApduResponse::new(vec![response.sw1(), response.sw2()])
 }
 
 /// Stateful assembler for multi-packet CCID `RDR_to_PC_DataBlock` USB transfers.
@@ -742,11 +892,16 @@ pub(crate) async fn transmit_apdu_full<T: AsyncApduTransport>(
 /// Tolerates up to [`CCID_MAX_LEADING_ZLPS`] leading zero-length packets (legal
 /// USB bulk transfer terminators left behind by a previous packet-aligned CCID
 /// frame) while rejecting mid-frame or unbounded empty transfers.
+///
+/// Complete frames whose `bSeq` is not the expected one answer an earlier
+/// command (left queued by an abandoned exchange); up to
+/// [`CCID_MAX_STALE_FRAMES`] of them are discarded before failing.
 #[derive(Debug)]
 struct CcidFrameAssembler {
     expected_seq: u8,
     buf: Vec<u8>,
     skipped_leading_zlps: usize,
+    discarded_stale_frames: usize,
 }
 
 impl CcidFrameAssembler {
@@ -755,6 +910,7 @@ impl CcidFrameAssembler {
             expected_seq,
             buf: Vec::with_capacity(initial_capacity),
             skipped_leading_zlps: 0,
+            discarded_stale_frames: 0,
         }
     }
 
@@ -781,6 +937,20 @@ impl CcidFrameAssembler {
             let header = parse_ccid_header(&self.buf)?;
             let expected_total = CCID_HEADER_LEN + header.data_len;
             if self.buf.len() >= expected_total {
+                if header.seq != self.expected_seq {
+                    self.discarded_stale_frames += 1;
+                    if self.discarded_stale_frames > CCID_MAX_STALE_FRAMES {
+                        return Err(WasmError::UsbError(format!(
+                            "CCID sequence mismatch: expected {}, still receiving frames for \
+                             earlier commands after discarding {CCID_MAX_STALE_FRAMES}",
+                            self.expected_seq
+                        )));
+                    }
+                    // Start over with the next frame (which may again follow a ZLP).
+                    self.buf.zeroize();
+                    self.skipped_leading_zlps = 0;
+                    return Ok(None);
+                }
                 return unwrap_ccid_datablock(&self.buf[..expected_total], self.expected_seq)
                     .map(Some);
             }
@@ -797,6 +967,44 @@ fn check_response(response: &ApduResponse, slot: Option<Slot>) -> WasmResult<()>
         None => response.check(),
     };
     res.map_err(WasmError::from)
+}
+
+/// Maps a rejected `transferIn()`/`transferOut()` to a [`WasmError`].
+fn transfer_error(context: &str, value: &JsValue) -> WasmError {
+    let dom_name = value.dyn_ref::<DomException>().map(DomException::name);
+    transfer_error_from_parts(context, dom_name.as_deref(), &format_js_error(value))
+}
+
+/// Maps a transfer failure to [`WasmError::Disconnected`] when its
+/// `DOMException` name means the device is gone, otherwise to
+/// [`WasmError::UsbError`].
+fn transfer_error_from_parts(context: &str, dom_name: Option<&str>, detail: &str) -> WasmError {
+    if dom_name.is_some_and(|name| DEVICE_LOST_DOM_ERRORS.contains(&name)) {
+        WasmError::Disconnected(format!(
+            "the YubiKey was unplugged or its USB connection was lost ({context}: {detail}); \
+             reconnect it"
+        ))
+    } else {
+        WasmError::UsbError(format!("{context}: {detail}"))
+    }
+}
+
+/// Converts the cause of an abandoned CCID exchange into the
+/// [`WasmError::Disconnected`] reported to the caller.
+fn unusable_transport_error(cause: WasmError) -> WasmError {
+    match cause {
+        WasmError::Disconnected(_) => cause,
+        WasmError::Timeout => WasmError::Disconnected(
+            "the YubiKey did not answer within the CCID time-extension limit; the WebUSB \
+             connection was closed so a late answer cannot be mistaken for the next one, \
+             reconnect the YubiKey"
+                .to_string(),
+        ),
+        other => WasmError::Disconnected(format!(
+            "{other}; the WebUSB connection was closed because the CCID response stream is \
+             out of sync, reconnect the YubiKey"
+        )),
+    }
 }
 
 /// Formats a JS exception value into a concise message.
@@ -839,9 +1047,236 @@ fn classify_claim_interface_error(value: JsValue) -> WasmError {
     ))
 }
 
+/// Native test helpers: a scripted APDU transport and a minimal executor.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::RefCell;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    /// Card behaviour: answers one APDU.
+    pub(crate) type Handler = Box<dyn FnMut(&Apdu) -> WasmResult<ApduResponse>>;
+
+    /// In-memory transport that records every APDU it sends and answers it with
+    /// a handler. A session-ending error from the handler disconnects it, like
+    /// the bridge and WebUSB transports do.
+    pub(crate) struct ScriptedTransport {
+        handler: Handler,
+        sent: Rc<RefCell<Vec<Vec<u8>>>>,
+        connected: bool,
+    }
+
+    impl ScriptedTransport {
+        /// Returns the transport and a handle to the raw APDUs it sends.
+        pub(crate) fn new(handler: Handler) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    handler,
+                    sent: Rc::clone(&sent),
+                    connected: true,
+                },
+                sent,
+            )
+        }
+
+        pub(crate) async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
+            self.transmit_one(apdu).await
+        }
+
+        pub(crate) async fn transmit_full_async(
+            &mut self,
+            apdu: &Apdu,
+            slot: Option<Slot>,
+        ) -> WasmResult<Vec<u8>> {
+            transmit_apdu_full(self, apdu, slot).await
+        }
+
+        pub(crate) async fn exchange_full_async(
+            &mut self,
+            apdu: &Apdu,
+        ) -> WasmResult<ApduResponse> {
+            exchange_apdu_full(self, apdu).await
+        }
+
+        #[expect(clippy::unused_async, reason = "mirrors the async transport API")]
+        pub(crate) async fn close(&mut self) -> WasmResult<()> {
+            self.connected = false;
+            Ok(())
+        }
+
+        pub(crate) const fn is_connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    impl AsyncApduTransport for ScriptedTransport {
+        async fn transmit_one(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
+            if !self.connected {
+                return Err(WasmError::Disconnected("scripted transport closed".into()));
+            }
+            self.sent.borrow_mut().push(apdu.to_bytes().unwrap());
+            let result = (self.handler)(apdu);
+            if matches!(&result, Err(e) if e.ends_session()) {
+                self.connected = false;
+            }
+            result
+        }
+
+        fn transport_error(&self, msg: String) -> WasmError {
+            WasmError::UsbError(msg)
+        }
+    }
+
+    /// `data || 90 00`.
+    pub(crate) fn ok(mut data: Vec<u8>) -> WasmResult<ApduResponse> {
+        data.extend_from_slice(&[0x90, 0x00]);
+        Ok(ApduResponse::new(data))
+    }
+
+    /// Status-word-only response.
+    pub(crate) fn sw(sw1: u8, sw2: u8) -> WasmResult<ApduResponse> {
+        Ok(ApduResponse::new(vec![sw1, sw2]))
+    }
+
+    /// Polls a future that never waits on real I/O to completion.
+    pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use super::test_support::{ScriptedTransport, block_on, ok, sw};
     use super::*;
+
+    fn datablock(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![CCID_RDR_TO_PC_DATABLOCK];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&[0x00, seq, 0x00, 0x00, 0x00]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn ccid_frame_assembler_discards_stale_frames() {
+        // The response to an abandoned command (seq 3) is still queued ahead of
+        // the response to command 4: it is discarded, then 4 is returned.
+        let mut asm = CcidFrameAssembler::new(4, 64);
+        assert!(
+            asm.push_packet(&datablock(3, &[0x6A, 0x82]))
+                .unwrap()
+                .is_none()
+        );
+        // A packet-aligned stale frame may be followed by a ZLP.
+        assert!(asm.push_packet(&[]).unwrap().is_none());
+        // A stale WTX frame is discarded too.
+        let mut stale_wtx = datablock(3, &[]);
+        stale_wtx[7] = 0x80;
+        assert!(asm.push_packet(&stale_wtx).unwrap().is_none());
+        let fresh = datablock(4, &[0x90, 0x00]);
+        assert!(asm.push_packet(&fresh[..6]).unwrap().is_none());
+        assert_eq!(
+            asm.push_packet(&fresh[6..]).unwrap(),
+            Some(CcidDatablock::Data(vec![0x90, 0x00]))
+        );
+
+        // Bounded: more than CCID_MAX_STALE_FRAMES stale frames fail.
+        let mut flooded = CcidFrameAssembler::new(9, 64);
+        for _ in 0..CCID_MAX_STALE_FRAMES {
+            assert!(
+                flooded
+                    .push_packet(&datablock(8, &[0x90, 0x00]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            flooded.push_packet(&datablock(8, &[0x90, 0x00])),
+            Err(WasmError::UsbError(msg)) if msg.contains("sequence mismatch")
+        ));
+    }
+
+    #[test]
+    fn transfer_errors_classify_device_loss() {
+        for name in ["NetworkError", "NotFoundError"] {
+            let err = transfer_error_from_parts("transfer_in", Some(name), "gone");
+            assert!(err.ends_session(), "{name}");
+            assert!(err.to_string().contains("unplugged"));
+            assert!(err.to_string().contains("reconnect"));
+        }
+        assert!(matches!(
+            transfer_error_from_parts("transfer_out", Some("InvalidStateError"), "x"),
+            WasmError::UsbError(msg) if msg == "transfer_out: x"
+        ));
+        assert!(matches!(
+            transfer_error_from_parts("transfer_in", None, "y"),
+            WasmError::UsbError(_)
+        ));
+    }
+
+    #[test]
+    fn abandoned_exchanges_report_a_reconnect_error() {
+        let timeout = unusable_transport_error(WasmError::Timeout);
+        assert!(timeout.ends_session());
+        assert!(timeout.to_string().contains("reconnect"));
+
+        let framing = unusable_transport_error(WasmError::UsbError("CCID frame truncated".into()));
+        assert!(framing.ends_session());
+        assert!(framing.to_string().contains("CCID frame truncated"));
+        assert!(framing.to_string().contains("reconnect"));
+
+        let lost = WasmError::Disconnected("unplugged; reconnect it".into());
+        assert_eq!(unusable_transport_error(lost.clone()), lost);
+    }
+
+    #[test]
+    fn exchange_returns_status_words_and_chains_responses() {
+        let get_data =
+            yubikey_evm_signer_core::yubikey::piv::build_get_certificate_apdu(Slot::Authentication);
+
+        // Non-success status word: status-only response, not an error
+        let (mut t, _) = ScriptedTransport::new(Box::new(|_| sw(0x6A, 0x82)));
+        let resp = block_on(exchange_apdu_full(&mut t, &get_data)).unwrap();
+        assert_eq!((resp.sw1(), resp.sw2()), (0x6A, 0x82));
+        assert!(resp.data().is_empty());
+        // ...which transmit_apdu_full maps to a slot error
+        assert!(matches!(
+            block_on(transmit_apdu_full(&mut t, &get_data, Some(Slot::Authentication))),
+            Err(WasmError::CoreError(msg)) if msg.contains("empty")
+        ));
+
+        // 61xx chaining is concatenated into one 9000 response
+        let mut script: VecDeque<WasmResult<ApduResponse>> = VecDeque::from([
+            Ok(ApduResponse::new(vec![0x01, 0x02, 0x61, 0x02])),
+            ok(vec![0x03, 0x04]),
+        ]);
+        let (mut t, sent) = ScriptedTransport::new(Box::new(move |_| script.pop_front().unwrap()));
+        let resp = block_on(exchange_apdu_full(&mut t, &get_data)).unwrap();
+        assert!(resp.is_success());
+        assert_eq!(resp.data(), &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(sent.borrow()[1], vec![0x00, 0xC0, 0x00, 0x00, 0x02]);
+
+        // A failing GET RESPONSE yields its status word
+        let mut script: VecDeque<WasmResult<ApduResponse>> = VecDeque::from([
+            Ok(ApduResponse::new(vec![0x01, 0x61, 0x10])),
+            sw(0x6F, 0x00),
+        ]);
+        let (mut t, _) = ScriptedTransport::new(Box::new(move |_| script.pop_front().unwrap()));
+        let resp = block_on(exchange_apdu_full(&mut t, &get_data)).unwrap();
+        assert_eq!((resp.sw1(), resp.sw2()), (0x6F, 0x00));
+        assert!(resp.data().is_empty());
+    }
 
     #[test]
     fn ccid_constants_and_power_on_frame() {

@@ -19,11 +19,53 @@
 //!
 //! - **Local PC/SC Bridge (Recommended)**: [`YubiKeyDevice::connect_bridge`]
 //!   connects to `yubikey-cli bridge` over a hardened loopback HTTP endpoint
-//!   (`http://127.0.0.1:8765`) with per-session Bearer auth, exact `Origin`
-//!   allowlist, and PIV-only APDU allowlist. Works in Chrome, Firefox, Safari,
-//!   Edge, and Brave on macOS, Linux, and Windows.
+//!   (only `http://127.0.0.1:<port>`, e.g. `http://127.0.0.1:8765`) with Bearer
+//!   auth, exact `Origin` allowlist, and PIV-only APDU allowlist. Works in
+//!   Chrome, Firefox, Safari, Edge, and Brave on macOS, Linux, and Windows.
 //! - **WebUSB (Experimental)**: [`YubiKeyDevice::connect`] targets non-blocklisted
 //!   CCID devices or Isolated Web Apps with unrestricted USB permissions.
+//!
+//! # Building: `web_sys_unstable_apis` is required
+//!
+//! The WebUSB bindings this crate uses are behind `web-sys`'s unstable-API
+//! gate, so **every build that compiles this crate** (including a project that
+//! depends on it from crates.io) must pass `--cfg=web_sys_unstable_apis` to
+//! `rustc`. Without it, compilation fails with errors about missing
+//! `web_sys::Usb*` types. Add this to the depending project's
+//! `.cargo/config.toml`:
+//!
+//! ```toml
+//! [build]
+//! rustflags = ["--cfg=web_sys_unstable_apis"]
+//!
+//! [target.wasm32-unknown-unknown]
+//! rustflags = ["--cfg=web_sys_unstable_apis"]
+//! ```
+//!
+//! or set it for one command:
+//!
+//! ```sh
+//! RUSTFLAGS="--cfg=web_sys_unstable_apis" cargo build --target wasm32-unknown-unknown
+//! ```
+//!
+//! A `RUSTFLAGS` environment variable replaces the `rustflags` from
+//! `.cargo/config.toml`, so if you set `RUSTFLAGS` for another reason, include
+//! `--cfg=web_sys_unstable_apis` in it as well.
+//!
+//! # Addresses and public keys
+//!
+//! The YubiKey holds a P-256 (secp256r1) key. `getPublicKey()` returns it as
+//! `0x04‖X‖Y`, which is what an EIP-7951 `P256VERIFY` verifier (for example a
+//! smart account) needs. `getAddress()` returns `keccak256(X‖Y)[12..]`, which
+//! identifies the key but is **not** a secp256k1 externally owned account: on
+//! standard EVM chains nothing can be sent from it.
+//!
+//! # One call at a time
+//!
+//! A [`YubiKeyDevice`] handles one call at a time: calling any method while
+//! another call on the same object is pending throws "recursive use of an
+//! object detected which would lead to unsafe aliasing in rust". Await each call
+//! before starting the next.
 //!
 //! # Quick Start (Local PC/SC Bridge)
 //!
@@ -34,14 +76,19 @@
 //! await init();
 //!
 //! // Connect to the local PC/SC bridge started with `just cli-bridge`
+//! // (only http://127.0.0.1:<port> is accepted)
 //! const device = await YubiKeyDevice.connectBridge(
 //!     "http://127.0.0.1:8765",
-//!     "<session-bearer-token>"
+//!     "<bearer-token-printed-by-the-bridge>"
 //! );
 //!
-//! // Read existing Ethereum address (non-destructive; requires PIV certificate in slot)
+//! // Read the slot's P-256 public key (0x04 || X || Y) for EIP-7951 verifiers,
+//! // and its keccak256-derived address identifier (not a secp256k1 account)
+//! const publicKey = await device.getPublicKey();
 //! const address = await device.getAddress();
-//! console.log("Ethereum address:", address);
+//! if (device.hasStaleCertificate()) {
+//!     console.warn("The slot's certificate belongs to an older key");
+//! }
 //!
 //! // Sign an EIP-1559 transaction (returns 65-byte low-S signature r || s || v)
 //! const tx = JSON.stringify({

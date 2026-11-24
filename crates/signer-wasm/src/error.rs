@@ -40,6 +40,13 @@ pub enum WasmError {
     /// The YubiKey was reset by another application; re-select and re-verify the PIN.
     CardReset,
 
+    /// The session or the device is gone (bridge session expired, replaced or
+    /// closed by a card reset, bridge or reader lost, YubiKey unplugged, or the
+    /// WebUSB transport was closed after an unrecoverable error).
+    ///
+    /// The device must be reconnected; the message says why.
+    Disconnected(String),
+
     /// The operation needs a verified PIN, but the PIN has not been verified yet.
     PinRequired,
 
@@ -122,6 +129,9 @@ impl fmt::Display for WasmError {
                     "YubiKey was reset by another application; reconnect and verify the PIN again"
                 )
             }
+            Self::Disconnected(msg) => {
+                write!(f, "Disconnected: {msg}")
+            }
             Self::PinRequired => {
                 write!(f, "PIN verification required before this operation")
             }
@@ -184,6 +194,16 @@ impl fmt::Display for WasmError {
 
 impl error::Error for WasmError {}
 
+impl WasmError {
+    /// Returns `true` if this error means the session or the device is gone, so
+    /// all PIN, management key and cached key state must be discarded and the
+    /// caller has to reconnect.
+    #[must_use]
+    pub const fn ends_session(&self) -> bool {
+        matches!(self, Self::Disconnected(_) | Self::CardReset)
+    }
+}
+
 impl From<WasmError> for JsValue {
     fn from(error: WasmError) -> Self {
         JsError::new(&error.to_string()).into()
@@ -195,6 +215,9 @@ impl From<CoreError> for WasmError {
         match error {
             CoreError::DeviceNotFound => Self::DeviceNotFound,
             CoreError::CardReset => Self::CardReset,
+            CoreError::DeviceDisconnected => {
+                Self::Disconnected("YubiKey device disconnected; reconnect to continue".to_string())
+            }
             CoreError::PinRequired => Self::PinRequired,
             CoreError::InvalidPin { remaining_attempts } => Self::InvalidPin { remaining_attempts },
             CoreError::PinLocked => Self::PinLocked,
@@ -257,5 +280,15 @@ mod tests {
 
         let pin_required: WasmError = CoreError::PinRequired.into();
         assert_eq!(pin_required, WasmError::PinRequired);
+        assert!(!pin_required.ends_session());
+
+        // Session-ending errors
+        assert!(reset_err.ends_session());
+        let gone: WasmError = CoreError::DeviceDisconnected.into();
+        assert!(gone.ends_session());
+        assert!(gone.to_string().starts_with("Disconnected: "));
+        assert!(gone.to_string().contains("reconnect"));
+        assert!(!WasmError::Timeout.ends_session());
+        assert!(!WasmError::BridgeError("x".to_string()).ends_session());
     }
 }

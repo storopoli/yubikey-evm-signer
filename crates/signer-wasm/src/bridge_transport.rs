@@ -1,10 +1,14 @@
 //! Browser HTTP transport for the local PC/SC loopback bridge.
 //!
 //! [`BridgeTransport`] talks to a locally running `yubikey-cli bridge` over
-//! `http://127.0.0.1:<port>`, `http://localhost:<port>`, or `http://[::1]:<port>`
-//! using browser `fetch()` with CORS and a per-session Bearer token. Because it
-//! delegates smart card I/O to native PC/SC, it works with real YubiKeys across
-//! macOS, Linux, and Windows in Chrome, Firefox, Safari, Edge, and Brave.
+//! `http://127.0.0.1:<port>` using browser `fetch()` with CORS and a bearer
+//! token. Because it delegates smart card I/O to native PC/SC, it works with
+//! real YubiKeys across macOS, Linux, and Windows in Chrome, Firefox, Safari,
+//! Edge, and Brave.
+//!
+//! Only `127.0.0.1` is accepted: the bridge binds and answers only there, and a
+//! `localhost` or `[::1]` URL could reach another local process listening on
+//! the IPv6 loopback, which would receive the bearer token and the PIN.
 
 use std::fmt;
 
@@ -18,104 +22,115 @@ use yubikey_evm_signer_core::yubikey::Slot;
 use yubikey_evm_signer_core::yubikey::apdu::{Apdu, ApduResponse};
 
 use crate::error::{WasmError, WasmResult};
-use crate::transport::{AsyncApduTransport, transmit_apdu_full};
+use crate::transport::{AsyncApduTransport, exchange_apdu_full, transmit_apdu_full};
 
-/// Validates that `url` is a strict plaintext loopback URL for the local PC/SC bridge.
+/// Error message for every rejected bridge URL.
+pub const BRIDGE_URL_ERROR: &str =
+    "Bridge URL must be http://127.0.0.1:<port> (localhost and [::1] are not accepted)";
+
+/// Minimum bridge bearer token length, in characters (same rule as the bridge).
+pub const BRIDGE_MIN_TOKEN_LEN: usize = 32;
+
+/// Validates the local PC/SC bridge URL and returns its canonical form.
 ///
-/// Accepts only `http://127.0.0.1:<port>`, `http://localhost:<port>`, or
-/// `http://[::1]:<port>` (with optional trailing `/`). Rejects non-loopback hosts,
-/// HTTPS/other schemes, embedded credentials (`user:pass@`), paths, queries, and
-/// fragments so PINs and management key traffic can never be sent to remote servers.
+/// Accepts only `http://127.0.0.1:<port>` with a decimal port of 1 to 5 digits
+/// in `1..=65535`, an optional trailing `/`, and surrounding whitespace. The
+/// result is `http://127.0.0.1:<port>` without the slash and without leading
+/// zeros in the port. Every other URL is rejected, including `localhost`,
+/// `[::1]`, other hosts, `https://`, credentials, paths, queries and fragments.
 ///
 /// # Errors
 ///
-/// Returns [`WasmError::BridgeError`] if the URL is not a valid loopback bridge URL.
+/// Returns [`WasmError::BridgeError`] with [`BRIDGE_URL_ERROR`].
 pub fn validate_bridge_url(url: &str) -> WasmResult<String> {
+    let reject = || WasmError::BridgeError(BRIDGE_URL_ERROR.to_string());
     let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must not be empty".to_string(),
-        ));
+    let authority_port = trimmed
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(reject)?;
+    let port_str = authority_port.strip_suffix('/').unwrap_or(authority_port);
+    if port_str.is_empty() || port_str.len() > 5 || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(reject());
     }
-
-    if trimmed
-        .bytes()
-        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
-    {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must not contain whitespace or control characters".to_string(),
-        ));
+    match port_str.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(format!("http://127.0.0.1:{port}")),
+        _ => Err(reject()),
     }
-
-    if trimmed.contains('@') || trimmed.contains('?') || trimmed.contains('#') {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must not contain credentials, query parameters, or fragments".to_string(),
-        ));
-    }
-
-    let Some(rest) = trimmed
-        .strip_prefix("http://")
-        .or_else(|| trimmed.strip_prefix("HTTP://"))
-    else {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must use http:// on a loopback address (e.g. http://127.0.0.1:8765)"
-                .to_string(),
-        ));
-    };
-
-    let authority = rest.strip_suffix('/').unwrap_or(rest);
-    if authority.contains('/') {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must not contain a path (expected http://127.0.0.1:<port>)".to_string(),
-        ));
-    }
-
-    if let Some(port_str) = authority.strip_prefix("[::1]:") {
-        let port = parse_valid_port(port_str)?;
-        return Ok(format!("http://[::1]:{port}"));
-    }
-
-    let Some((host, port_str)) = authority.split_once(':') else {
-        return Err(WasmError::BridgeError(
-            "Bridge URL must specify an explicit loopback host and port (e.g. http://127.0.0.1:8765)"
-                .to_string(),
-        ));
-    };
-
-    // Reject extra colons (e.g. malformed IPv6)
-    if port_str.contains(':') {
-        return Err(WasmError::BridgeError(
-            "Bridge URL authority is malformed".to_string(),
-        ));
-    }
-
-    let host_lower = host.to_ascii_lowercase();
-    if host_lower != "127.0.0.1" && host_lower != "localhost" {
-        return Err(WasmError::BridgeError(format!(
-            "Bridge URL host '{host}' is not loopback (only 127.0.0.1, localhost, or [::1] are permitted)"
-        )));
-    }
-
-    let port = parse_valid_port(port_str)?;
-    Ok(format!("http://{host_lower}:{port}"))
 }
 
-/// Parses a strictly decimal non-zero TCP port number.
-fn parse_valid_port(port_str: &str) -> WasmResult<u16> {
-    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+/// Validates a bridge bearer token (surrounding whitespace is ignored).
+///
+/// The bridge only accepts tokens of at least [`BRIDGE_MIN_TOKEN_LEN`] visible
+/// ASCII characters, so anything else is rejected before a request is sent.
+///
+/// # Errors
+///
+/// Returns [`WasmError::BridgeError`] if the token is too short or contains
+/// whitespace, control or non-ASCII characters.
+pub fn validate_bridge_token(token: &str) -> WasmResult<&str> {
+    let trimmed = token.trim();
+    if trimmed.len() < BRIDGE_MIN_TOKEN_LEN || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(WasmError::BridgeError(format!(
-            "Invalid bridge port '{port_str}'"
+            "Bridge bearer token must be at least {BRIDGE_MIN_TOKEN_LEN} visible ASCII characters \
+             with no spaces; paste the token printed by `yubikey-cli bridge`"
         )));
     }
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| WasmError::BridgeError(format!("Invalid bridge port '{port_str}'")))?;
-    if port == 0 {
-        return Err(WasmError::BridgeError(
-            "Bridge port must be between 1 and 65535".to_string(),
-        ));
+    Ok(trimmed)
+}
+
+/// Message for a `fetch()` that rejected without an HTTP response.
+///
+/// Either nothing listens at `base_url`, or the bridge is running but refused
+/// this page's origin: that `403` carries no CORS headers, so the browser hides
+/// it and `fetch()` rejects exactly as if the bridge were down.
+#[must_use]
+pub fn fetch_failure_message(base_url: &str, page_origin: &str) -> String {
+    format!(
+        "Failed to reach the local PC/SC bridge at {base_url}. Either the bridge is not \
+         running (start it with `just cli-bridge` or `yubikey-cli bridge`), or it is running \
+         but does not allow this page's origin {page_origin} (the browser hides the bridge's \
+         reply in that case); restart it with `yubikey-cli bridge --allow-origin {page_origin}`."
+    )
+}
+
+/// Maps a non-success bridge HTTP status and its `error` message to a [`WasmError`].
+///
+/// `409` (session unknown, replaced, expired, or closed after another PC/SC
+/// client reset the card) and `503` (YubiKey or reader lost, or bridge shutting
+/// down) end the session and map to [`WasmError::Disconnected`]; everything
+/// else is a [`WasmError::BridgeError`]. The server's message is always kept
+/// verbatim.
+#[must_use]
+pub fn bridge_http_error(status: u16, server_msg: &str) -> WasmError {
+    match status {
+        401 => WasmError::BridgeError(
+            "Bridge authentication failed (401 Unauthorized): verify your session bearer token"
+                .to_string(),
+        ),
+        403 => WasmError::BridgeError(format!(
+            "Bridge refused the request (403 Forbidden): {server_msg}"
+        )),
+        404 => WasmError::BridgeError(format!("Bridge found no YubiKey (404): {server_msg}")),
+        408 => WasmError::BridgeError(format!(
+            "Bridge timed out reading the request (408 Request Timeout): {server_msg}; retry"
+        )),
+        409 => WasmError::Disconnected(format!(
+            "bridge session ended (409 Conflict): {server_msg}. The session expired after being \
+             idle, was replaced by another connection, or another PC/SC client reset the \
+             YubiKey; reconnect (PIV selection, PIN and management key authentication must be \
+             repeated)"
+        )),
+        413 => WasmError::BridgeError(format!(
+            "Bridge rejected an oversized request (413 Payload Too Large): {server_msg}"
+        )),
+        503 => WasmError::Disconnected(format!(
+            "bridge lost the YubiKey or is shutting down (503 Service Unavailable): \
+             {server_msg}; reconnect once the YubiKey is plugged in and the bridge is running"
+        )),
+        _ => WasmError::BridgeError(format!(
+            "Bridge request failed (HTTP {status}): {server_msg}"
+        )),
     }
-    Ok(port)
 }
 
 /// Browser transport communicating with a local PC/SC loopback bridge via `fetch()`.
@@ -173,20 +188,14 @@ impl BridgeTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`WasmError::BridgeError`] if the URL is non-loopback, the token is
-    /// empty/invalid, the bridge is unreachable, or PIV selection fails.
+    /// Returns [`WasmError::BridgeError`] if the URL is not
+    /// `http://127.0.0.1:<port>`, the token is not at least
+    /// [`BRIDGE_MIN_TOKEN_LEN`] visible ASCII characters (both checked before any
+    /// request), the bridge is unreachable or refuses the request, or PIV
+    /// selection fails; [`WasmError::Disconnected`] on `409`/`503`.
     pub async fn connect(url: &str, token: &str) -> WasmResult<Self> {
         let base_url = validate_bridge_url(url)?;
-        let token_trimmed = token.trim();
-        if token_trimmed.is_empty()
-            || token_trimmed
-                .bytes()
-                .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
-        {
-            return Err(WasmError::BridgeError(
-                "Bridge bearer token must be non-empty and contain no whitespace".to_string(),
-            ));
-        }
+        let token_trimmed = validate_bridge_token(token)?;
 
         let mut transport = Self {
             base_url,
@@ -215,13 +224,19 @@ impl BridgeTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`WasmError::BridgeError`] or [`WasmError::CoreError`].
+    /// Returns [`WasmError::BridgeError`] or [`WasmError::CoreError`];
+    /// [`WasmError::Disconnected`] if the session is closed or the bridge answers
+    /// `409`/`503` (the transport is then disconnected).
     pub async fn transmit_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
         let session_id = self
             .session_id
             .as_ref()
             .filter(|_| self.connected)
-            .ok_or_else(|| WasmError::BridgeError("bridge transport is not connected".to_string()))?
+            .ok_or_else(|| {
+                WasmError::Disconnected(
+                    "the bridge session is closed; reconnect to the bridge".to_string(),
+                )
+            })?
             .clone();
 
         let apdu_bytes = Zeroizing::new(
@@ -264,6 +279,16 @@ impl BridgeTransport {
         slot: Option<Slot>,
     ) -> WasmResult<Vec<u8>> {
         transmit_apdu_full(self, apdu, slot).await
+    }
+
+    /// Exchanges an APDU like [`Self::transmit_full_async`] but returns the
+    /// final status word instead of converting it into an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns bridge or response-size errors.
+    pub async fn exchange_full_async(&mut self, apdu: &Apdu) -> WasmResult<ApduResponse> {
+        exchange_apdu_full(self, apdu).await
     }
 
     /// Disconnects the active bridge session (`POST /v1/disconnect`).
@@ -320,10 +345,8 @@ impl BridgeTransport {
         let resp_value = JsFuture::from(window.fetch_with_request(&request))
             .await
             .map_err(|_| {
-                WasmError::BridgeError(format!(
-                    "Failed to reach local PC/SC bridge at {}. Start it with `just cli-bridge` or `cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge`.",
-                    self.base_url
-                ))
+                let origin = window.origin();
+                WasmError::BridgeError(fetch_failure_message(&self.base_url, &origin))
             })?;
 
         let response: Response = resp_value.unchecked_into();
@@ -351,25 +374,13 @@ impl BridgeTransport {
                 }
             });
 
-        match status {
-            401 => Err(WasmError::BridgeError(
-                "Bridge authentication failed (401 Unauthorized): verify your session bearer token"
-                    .to_string(),
-            )),
-            403 => Err(WasmError::BridgeError(format!(
-                "Bridge rejected request (403 Forbidden): {server_msg}"
-            ))),
-            409 | 503 => {
-                self.connected = false;
-                self.session_id = None;
-                Err(WasmError::BridgeError(format!(
-                    "Bridge session disconnected ({status}): {server_msg}"
-                )))
-            }
-            _ => Err(WasmError::BridgeError(format!(
-                "Bridge request failed (HTTP {status}): {server_msg}"
-            ))),
+        let error = bridge_http_error(status, &server_msg);
+        if error.ends_session() {
+            // The bridge dropped (or never had) this session: never reuse it.
+            self.connected = false;
+            self.session_id = None;
         }
+        Err(error)
     }
 }
 
@@ -388,46 +399,125 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_bridge_url_accepts_loopback_and_rejects_remote() {
-        assert_eq!(
-            validate_bridge_url("http://127.0.0.1:8765").unwrap(),
-            "http://127.0.0.1:8765"
-        );
-        assert_eq!(
-            validate_bridge_url("http://127.0.0.1:8765/").unwrap(),
-            "http://127.0.0.1:8765"
-        );
-        assert_eq!(
-            validate_bridge_url("  http://LOCALHOST:9000/ ").unwrap(),
-            "http://localhost:9000"
-        );
-        assert_eq!(
-            validate_bridge_url("http://[::1]:8765").unwrap(),
-            "http://[::1]:8765"
-        );
+    fn validate_bridge_url_accepts_only_127_0_0_1() {
+        for (input, canonical) in [
+            ("http://127.0.0.1:8765", "http://127.0.0.1:8765"),
+            ("http://127.0.0.1:8765/", "http://127.0.0.1:8765"),
+            ("  http://127.0.0.1:1 ", "http://127.0.0.1:1"),
+            ("http://127.0.0.1:65535", "http://127.0.0.1:65535"),
+            ("http://127.0.0.1:08765", "http://127.0.0.1:8765"),
+        ] {
+            assert_eq!(validate_bridge_url(input).unwrap(), canonical, "{input}");
+        }
 
         let rejected = [
             "",
+            "http://localhost:8765",
+            "http://LOCALHOST:8765",
+            "http://[::1]:8765",
+            "http://[::ffff:127.0.0.1]:8765",
+            "http://127.0.0.2:8765",
+            "http://127.1:8765",
+            "HTTP://127.0.0.1:8765",
             "https://evil.com",
             "https://127.0.0.1:8765",
             "http://192.168.1.5:8765",
             "http://0.0.0.0:8765",
             "http://user:pass@127.0.0.1:8765",
-            "http://localhost.evil.com:8765",
+            "http://127.0.0.1@evil.com:8765",
+            "http://127.0.0.1.evil.com:8765",
             "http://127.0.0.1:8765/v1/health",
+            "http://127.0.0.1:8765//",
             "http://127.0.0.1:8765?foo=bar",
             "http://127.0.0.1:8765#frag",
             "http://127.0.0.1",
+            "http://127.0.0.1:",
             "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
             "http://127.0.0.1:99999",
+            "http://127.0.0.1:123456",
+            "http://127.0.0.1:+8765",
             "http://127.0.0.1:8765\r\nEvil: 1",
+            "http://127.0.0.1: 8765",
         ];
 
         for bad in rejected {
-            assert!(
-                validate_bridge_url(bad).is_err(),
+            assert_eq!(
+                validate_bridge_url(bad),
+                Err(WasmError::BridgeError(BRIDGE_URL_ERROR.to_string())),
                 "expected '{bad}' to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validate_bridge_token_requires_32_visible_ascii_characters() {
+        let token = "A".repeat(BRIDGE_MIN_TOKEN_LEN);
+        assert_eq!(validate_bridge_token(&token).unwrap(), token);
+        assert_eq!(
+            validate_bridge_token(&format!("  {token}\n")).unwrap(),
+            token
+        );
+        let long = "x7-_~!".repeat(11);
+        assert_eq!(validate_bridge_token(&long).unwrap(), long);
+
+        for bad in [
+            String::new(),
+            "short-token".to_string(),
+            "a".repeat(BRIDGE_MIN_TOKEN_LEN - 1),
+            format!("{} b", "a".repeat(BRIDGE_MIN_TOKEN_LEN)),
+            format!("{}\tb", "a".repeat(BRIDGE_MIN_TOKEN_LEN)),
+            format!("{}\u{e9}", "a".repeat(BRIDGE_MIN_TOKEN_LEN)),
+        ] {
+            assert!(
+                matches!(validate_bridge_token(&bad), Err(WasmError::BridgeError(msg)) if msg.contains("32 visible ASCII")),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_failure_names_both_causes_and_the_origin_fix() {
+        let msg = fetch_failure_message("http://127.0.0.1:8765", "https://app.example");
+        assert!(msg.contains("http://127.0.0.1:8765"));
+        assert!(msg.contains("not running"));
+        assert!(msg.contains("just cli-bridge"));
+        assert!(msg.contains("does not allow this page's origin https://app.example"));
+        assert!(msg.contains("yubikey-cli bridge --allow-origin https://app.example"));
+    }
+
+    #[test]
+    fn bridge_statuses_map_to_clear_errors() {
+        let generate_disabled = "APDU rejected by bridge policy: APDU command failed: key \
+            generation is disabled on this bridge (...); restart the bridge with \
+            --allow-generate to permit it";
+        let forbidden = bridge_http_error(403, generate_disabled);
+        assert!(!forbidden.ends_session());
+        assert!(forbidden.to_string().contains("403 Forbidden"));
+        assert!(forbidden.to_string().contains(generate_disabled));
+
+        for status in [409, 503] {
+            let err = bridge_http_error(status, "server says why");
+            assert!(err.ends_session(), "{status}");
+            let text = err.to_string();
+            assert!(text.starts_with("Disconnected: "), "{text}");
+            assert!(text.contains(&status.to_string()));
+            assert!(text.contains("server says why"));
+            assert!(text.contains("reconnect"));
+        }
+        assert!(bridge_http_error(409, "x").to_string().contains("reset"));
+        assert!(bridge_http_error(409, "x").to_string().contains("expired"));
+
+        for (status, marker) in [
+            (401, "401 Unauthorized"),
+            (404, "404"),
+            (408, "408 Request Timeout"),
+            (413, "413 Payload Too Large"),
+            (502, "HTTP 502"),
+        ] {
+            let err = bridge_http_error(status, "detail");
+            assert!(!err.ends_session(), "{status}");
+            assert!(err.to_string().contains(marker), "{status}: {err}");
         }
     }
 }

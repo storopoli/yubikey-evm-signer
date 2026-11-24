@@ -4,7 +4,9 @@
  *
  * Usage:
  *   node scripts/verify-demo.mjs
- *       Verify demo HTML/JS integrity (DOM IDs, links, CSP, no inline handlers).
+ *       Verify demo HTML/JS integrity (DOM IDs, links, CSP, no inline handlers), and
+ *       that crates/signer-wasm/src exports (#[wasm_bindgen]) every WASM name and
+ *       YubiKeyDevice method demo/app.js uses.
  *   node scripts/verify-demo.mjs --check-wasm [--wasm-dir <path>]
  *       Also verify the wasm-bindgen output in <path> (default: packages/npm/dist)
  *       exports everything demo/app.js imports from the WASM module and every
@@ -16,7 +18,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -265,6 +267,27 @@ for (const m of appJs.matchAll(/\b(device|YubiKeyDevice)\.([A-Za-z_$][\w$]*)\s*\
 }
 if (instanceMethods.size === 0 || staticMethods.size === 0) {
     fail('Could not find any YubiKeyDevice calls in demo/app.js (expected `device.<method>(` and `YubiKeyDevice.<method>(`)');
+}
+
+// 7b. Without a WASM build: every name demo/app.js uses (named imports and
+//     YubiKeyDevice methods) must be exported by crates/signer-wasm/src, either as
+//     `#[wasm_bindgen(js_name = "...")]` or as a plain `#[wasm_bindgen]` item.
+const wasmSrcDir = resolve(repoRoot, 'crates/signer-wasm/src');
+const rustExports = new Set();
+for (const file of readdirSync(wasmSrcDir).filter((f) => f.endsWith('.rs'))) {
+    const source = readFileSync(resolve(wasmSrcDir, file), 'utf8');
+    for (const m of source.matchAll(/#\[wasm_bindgen\(([^)\]]*)\)\]/g)) {
+        const jsName = m[1].match(/\bjs_name\s*=\s*"([^"]+)"/);
+        if (jsName) rustExports.add(jsName[1]);
+    }
+    for (const m of source.matchAll(/#\[wasm_bindgen\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?(?:fn|struct)\s+([A-Za-z_]\w*)/g)) {
+        rustExports.add(m[1]);
+    }
+}
+for (const name of [...namedImports, ...staticMethods, ...instanceMethods]) {
+    if (!rustExports.has(name)) {
+        fail(`demo/app.js uses '${name}', which crates/signer-wasm/src does not export via #[wasm_bindgen]`);
+    }
 }
 
 function exportedNames(source) {

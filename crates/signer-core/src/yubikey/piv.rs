@@ -671,6 +671,110 @@ pub const fn metadata_status_allows_certificate_fallback(sw1: u8, sw2: u8) -> bo
     !matches!((sw1, sw2), (0x90, 0x00) | (0x6A, 0x82))
 }
 
+/// Step 1 of the slot public key lookup (sans-IO): interprets the complete
+/// `GET METADATA` response for `slot` (see [`build_get_metadata_apdu`]).
+///
+/// `response` is the final response after any `0x61 XX` / `0x6C XX` handling:
+/// the concatenated data with `0x9000`, or the failing status word.
+///
+/// # Returns
+///
+/// - `Ok(Some(key))`: metadata names a P-256 key; it is authoritative.
+/// - `Ok(None)`: metadata is unavailable (a status word allowed by
+///   [`metadata_status_allows_certificate_fallback`], such as `0x6D00` on firmware
+///   older than 5.3, or an unparseable `0x9000` payload); continue with the
+///   certificate via [`resolve_slot_public_key`].
+///
+/// # Errors
+///
+/// - [`Error::InvalidKeyType`] if metadata reports a key of another algorithm
+/// - [`Error::SlotEmpty`] if the card reports no key in the slot (`0x6A82`)
+pub fn slot_key_from_metadata_response(
+    slot: Slot,
+    response: &ApduResponse,
+) -> Result<Option<VerifyingKey>> {
+    if response.is_success() {
+        match parse_metadata_response(response.data()) {
+            Some(SlotMetadata {
+                public_key: Some(public_key),
+                ..
+            }) => Ok(Some(public_key)),
+            // Authoritative: the slot holds a key of another algorithm.
+            Some(_) => Err(Error::InvalidKeyType(slot.id())),
+            // Unparseable metadata: treat as unavailable.
+            None => Ok(None),
+        }
+    } else if metadata_status_allows_certificate_fallback(response.sw1(), response.sw2()) {
+        Ok(None)
+    } else {
+        Err(response.to_error_for_slot(slot))
+    }
+}
+
+/// Step 2 of the slot public key lookup (sans-IO): combines the result of
+/// [`slot_key_from_metadata_response`] with the complete certificate `GET DATA`
+/// response for `slot` (see [`build_get_certificate_apdu`]).
+///
+/// The certificate is always read, even when metadata named the key, so a
+/// certificate left over from a previous key can be reported as stale.
+///
+/// # Errors
+///
+/// When `metadata_key` is `None` (metadata unavailable):
+/// - [`Error::SlotEmpty`] if no certificate is present
+/// - [`Error::InvalidKeyType`] if the certificate does not hold a valid P-256 key
+/// - the mapped status-word error if reading the certificate failed otherwise
+pub fn resolve_slot_public_key(
+    slot: Slot,
+    metadata_key: Option<VerifyingKey>,
+    certificate: &ApduResponse,
+) -> Result<SlotPublicKey> {
+    let certificate_key = if !certificate.is_success() {
+        Err(certificate.to_error_for_slot(slot))
+    } else if certificate.data().is_empty() {
+        Err(Error::SlotEmpty(slot.id()))
+    } else {
+        Ok(parse_certificate_public_key(certificate.data()))
+    };
+
+    match (metadata_key, certificate_key) {
+        (Some(public_key), certificate_key) => {
+            let stale_certificate = match certificate_key {
+                Ok(Some(cert_key)) => cert_key != public_key,
+                Ok(None) => true,
+                Err(_) => false,
+            };
+            Ok(SlotPublicKey {
+                public_key,
+                source: PublicKeySource::Metadata,
+                stale_certificate,
+            })
+        }
+        (None, Ok(Some(public_key))) => Ok(SlotPublicKey {
+            public_key,
+            source: PublicKeySource::Certificate,
+            stale_certificate: false,
+        }),
+        (None, Ok(None)) => Err(Error::InvalidKeyType(slot.id())),
+        (None, Err(e)) => Err(e),
+    }
+}
+
+/// Decides whether a `PUT DATA` certificate deletion (see
+/// [`build_delete_certificate_apdu`]) succeeded.
+///
+/// `0x6A82` (no such object) counts as success: there is nothing to delete.
+///
+/// # Errors
+///
+/// Returns the mapped status-word error for any other non-success status word.
+pub const fn check_delete_certificate_response(response: &ApduResponse) -> Result<()> {
+    match (response.sw1(), response.sw2()) {
+        (0x90, 0x00) | (0x6A, 0x82) => Ok(()),
+        _ => Err(response.to_error()),
+    }
+}
+
 /// Parses the ASN.1 DER ECDSA signature from a `GENERAL AUTHENTICATE` response (`7C -> 82`).
 #[must_use]
 pub fn parse_signature_response(data: &[u8]) -> Option<Vec<u8>> {
@@ -1474,10 +1578,7 @@ impl PivExclusive<'_> {
     /// `0x6A82` (no such object) counts as success: there is nothing to delete.
     fn delete_certificate(&mut self, slot: Slot) -> Result<()> {
         let response = self.exchange(&build_delete_certificate_apdu(slot))?;
-        match (response.sw1(), response.sw2()) {
-            (0x90, 0x00) | (0x6A, 0x82) => Ok(()),
-            _ => Err(response.to_error()),
-        }
+        check_delete_certificate_response(&response)
     }
 
     /// Retrieves the P-256 public key of the private key in `slot`.
@@ -1523,53 +1624,10 @@ impl PivExclusive<'_> {
         self.require_selected()?;
 
         let metadata = self.exchange(&build_get_metadata_apdu(slot))?;
-        let metadata_key = if metadata.is_success() {
-            match parse_metadata_response(metadata.data()) {
-                Some(SlotMetadata {
-                    public_key: Some(public_key),
-                    ..
-                }) => Some(public_key),
-                // Authoritative: the slot holds a key of another algorithm.
-                Some(_) => return Err(Error::InvalidKeyType(slot.id())),
-                // Unparseable metadata: treat as unavailable.
-                None => None,
-            }
-        } else if metadata_status_allows_certificate_fallback(metadata.sw1(), metadata.sw2()) {
-            None
-        } else {
-            return Err(metadata.to_error_for_slot(slot));
-        };
+        let metadata_key = slot_key_from_metadata_response(slot, &metadata)?;
 
         let certificate = self.exchange(&build_get_certificate_apdu(slot))?;
-        let certificate_key = if !certificate.is_success() {
-            Err(certificate.to_error_for_slot(slot))
-        } else if certificate.data().is_empty() {
-            Err(Error::SlotEmpty(slot.id()))
-        } else {
-            Ok(parse_certificate_public_key(certificate.data()))
-        };
-
-        match (metadata_key, certificate_key) {
-            (Some(public_key), certificate_key) => {
-                let stale_certificate = match certificate_key {
-                    Ok(Some(cert_key)) => cert_key != public_key,
-                    Ok(None) => true,
-                    Err(_) => false,
-                };
-                Ok(SlotPublicKey {
-                    public_key,
-                    source: PublicKeySource::Metadata,
-                    stale_certificate,
-                })
-            }
-            (None, Ok(Some(public_key))) => Ok(SlotPublicKey {
-                public_key,
-                source: PublicKeySource::Certificate,
-                stale_certificate: false,
-            }),
-            (None, Ok(None)) => Err(Error::InvalidKeyType(slot.id())),
-            (None, Err(e)) => Err(e),
-        }
+        resolve_slot_public_key(slot, metadata_key, &certificate)
     }
 
     /// Signs a 32-byte digest using the P-256 key in the specified slot.
@@ -2511,6 +2569,56 @@ mod tests {
         assert!(metadata_status_allows_certificate_fallback(0x6D, 0x00));
         assert!(metadata_status_allows_certificate_fallback(0x6A, 0x81));
         assert!(metadata_status_allows_certificate_fallback(0x6E, 0x00));
+    }
+
+    #[test]
+    fn sans_io_lookup_helpers() {
+        let slot = Slot::Signature;
+        let key_a = sample_p256_uncompressed_point();
+        let key_b = second_p256_uncompressed_point();
+
+        // Step 1: metadata interpretation
+        let meta = |r: Result<ApduResponse>| slot_key_from_metadata_response(slot, &r.unwrap());
+        assert_eq!(
+            meta(ok(metadata_body(alg::ECCP256, &key_a))).unwrap(),
+            Some(vk(&key_a))
+        );
+        assert!(meta(sw(0x6D, 0x00)).unwrap().is_none());
+        assert!(meta(ok(vec![0xFF])).unwrap().is_none());
+        assert!(matches!(meta(sw(0x6A, 0x82)), Err(Error::SlotEmpty(0x9C))));
+        assert!(matches!(
+            meta(ok(metadata_body(0x07, &[0x81, 0x01, 0x00]))),
+            Err(Error::InvalidKeyType(0x9C))
+        ));
+
+        // Step 2: certificate combination
+        let resolve = |m: Option<&[u8]>, r: Result<ApduResponse>| {
+            resolve_slot_public_key(slot, m.map(vk), &r.unwrap())
+        };
+        let stale = resolve(Some(&key_a), ok(cert_object(&key_b))).unwrap();
+        assert_eq!(stale.public_key, vk(&key_a));
+        assert!(stale.stale_certificate);
+        let no_cert = resolve(Some(&key_a), sw(0x6A, 0x82)).unwrap();
+        assert!(!no_cert.stale_certificate);
+        let fallback = resolve(None, ok(cert_object(&key_b))).unwrap();
+        assert_eq!(fallback.source, PublicKeySource::Certificate);
+        assert_eq!(fallback.public_key, vk(&key_b));
+        assert!(matches!(
+            resolve(None, sw(0x6A, 0x82)),
+            Err(Error::SlotEmpty(0x9C))
+        ));
+        assert!(matches!(
+            resolve(None, ok(Vec::new())),
+            Err(Error::SlotEmpty(0x9C))
+        ));
+
+        // Certificate deletion outcome
+        assert!(check_delete_certificate_response(&sw(0x90, 0x00).unwrap()).is_ok());
+        assert!(check_delete_certificate_response(&sw(0x6A, 0x82).unwrap()).is_ok());
+        assert!(matches!(
+            check_delete_certificate_response(&sw(0x69, 0x82).unwrap()),
+            Err(Error::SecurityStatusNotSatisfied)
+        ));
     }
 
     // -------------------------------------------------------------------------
