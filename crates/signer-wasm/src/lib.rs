@@ -19,9 +19,10 @@
 //!
 //! - **Local PC/SC Bridge (Recommended)**: [`YubiKeyDevice::connect_bridge`]
 //!   connects to `yubikey-cli bridge` over a hardened loopback HTTP endpoint
-//!   (only `http://127.0.0.1:<port>`, e.g. `http://127.0.0.1:8765`) with Bearer
-//!   auth, exact `Origin` allowlist, and PIV-only APDU allowlist. Works in
-//!   Chrome, Firefox, Safari, Edge, and Brave on macOS, Linux, and Windows.
+//!   (only `http://127.0.0.1:<port>` with a port other than `80`, e.g.
+//!   `http://127.0.0.1:8765`) with Bearer auth, exact `Origin` allowlist, and
+//!   PIV-only APDU allowlist. Works in Chrome, Firefox, Safari, Edge, and Brave
+//!   on macOS, Linux, and Windows.
 //! - **WebUSB (Experimental)**: [`YubiKeyDevice::connect`] targets non-blocklisted
 //!   CCID devices or Isolated Web Apps with unrestricted USB permissions.
 //!

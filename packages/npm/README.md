@@ -49,7 +49,7 @@ just cli-bridge
 cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge --port 8765
 ```
 
-The bridge prints its URL (`http://127.0.0.1:<port>`) and a random 256-bit bearer token, which stays valid until the bridge process stops. It binds only to `127.0.0.1` and accepts only requests whose `Host` is exactly `127.0.0.1:<port>` (`localhost` and `[::1]` are rejected), requires an exact `Origin` from its allowlist and the bearer token (checked in constant time), and forwards only allowlisted PIV commands, each as one PC/SC transaction.
+The bridge prints its URL (`http://127.0.0.1:<port>`) and a random 256-bit bearer token, which stays valid until the bridge process stops. It binds only to `127.0.0.1` and accepts only requests whose `Host` is exactly `127.0.0.1:<port>` (`localhost` and `[::1]` are rejected; port `80` is refused because browsers omit it from `Host`), requires an exact `Origin` from its allowlist and the bearer token (checked in constant time), and forwards only allowlisted PIV commands, each as one PC/SC transaction.
 
 - `--allow-origin <origin>` adds an allowed page origin (repeatable). The defaults are `http://localhost:8000`, `http://127.0.0.1:8000`, and `https://storopoli.github.io`.
 - `--allow-generate` permits management key authentication, key generation, and certificate deletion. Without it, `authenticateManagementKey()` fails with a `403` error that names the flag, so `generateKey()` cannot be used.
@@ -125,7 +125,7 @@ Get the library version string.
 
 Connect to a YubiKey via the local PC/SC loopback bridge and select the PIV applet.
 
-- `url`: must be `http://127.0.0.1:<port>` (an optional trailing `/` is allowed). `localhost`, `[::1]`, `https://`, other hosts, and URLs with a path, query, or credentials are rejected before any request is sent.
+- `url`: must be `http://127.0.0.1:<port>` (an optional trailing `/` is allowed). `localhost`, `[::1]`, `https://`, other hosts, port `80` (browsers omit it from the `Host` header the bridge checks), and URLs with a path, query, or credentials are rejected before any request is sent.
 - `token`: the bearer token printed by `yubikey-cli bridge`, at least 32 visible ASCII characters with no spaces (surrounding whitespace is ignored).
 
 If the bridge cannot be reached, the error says so and suggests restarting the bridge with `--allow-origin <origin>` for this page's origin: a bridge that refuses the page's origin answers without CORS headers, so the browser reports it exactly like a bridge that is not running.
@@ -318,7 +318,7 @@ Methods throw JavaScript `Error` objects (async methods reject). The message sta
 | `WebUSB is not supported in this browser or requires a secure context (HTTPS/localhost)` | `connect()` without WebUSB or outside a secure context |
 | `No YubiKey device found (note: …)` | No device selected, selection cancelled, or blocked by Chromium's WebUSB policy |
 | `Failed to open device: …` / `Failed to claim interface: …` / `USB error: …` | WebUSB could not open or claim the device (for example the protected CCID class or the OS smart card driver), or another WebUSB call failed |
-| `Bridge error: Bridge URL must be http://127.0.0.1:<port> (localhost and [::1] are not accepted)` | `connectBridge()` URL rejected before any request |
+| `Bridge error: Bridge URL must be http://127.0.0.1:<port> with a port other than 80 (localhost and [::1] are not accepted)` | `connectBridge()` URL rejected before any request |
 | `Bridge error: Bridge bearer token must be at least 32 visible ASCII characters …` | `connectBridge()` token rejected before any request |
 | `Bridge error: Failed to reach the local PC/SC bridge at …` | The bridge is not running, or it does not allow this page's origin; the message names the `yubikey-cli bridge --allow-origin <origin>` command to use |
 | `Bridge error: Bridge authentication failed (401 Unauthorized): …` | Wrong bearer token |

@@ -14,7 +14,8 @@
 //! - **DNS rebinding protection**: the `Host` header must equal exactly
 //!   `127.0.0.1:<port>` of the bound listener; `localhost` and `[::1]` are
 //!   never accepted, so a browser cannot be pointed at a squatter on another
-//!   loopback address that shares the name.
+//!   loopback address that shares the name. Port `80` is refused, because
+//!   browsers omit the default HTTP port from `Host`.
 //! - **Strict origin allowlist**: requires an exact `Origin` match on every
 //!   request (including `OPTIONS` preflight); wildcard `"*"` is rejected.
 //! - **Constant-time Bearer auth**: requires `Authorization: Bearer <token>`
@@ -144,6 +145,14 @@ const CARD_RESET_MESSAGE: &str = "the YubiKey was reset by another PC/SC client 
 /// Message returned for an unknown, replaced, closed, or expired session ID.
 const NO_SESSION_MESSAGE: &str = "no active session or session_id mismatch";
 
+/// Default HTTP port, which the bridge refuses to use (see [`PORT_80_MESSAGE`]).
+const DEFAULT_HTTP_PORT: u16 = 80;
+
+/// Message returned when the bridge is configured for, or bound to, port 80.
+const PORT_80_MESSAGE: &str = "bridge port 80 is not supported: browsers omit the default \
+     HTTP port from the Host header (sending 127.0.0.1 instead of 127.0.0.1:80), so the \
+     bridge's exact Host check would refuse every request; choose another port";
+
 /// Factory closure producing a fresh [`Transport`] when `/v1/connect` is called.
 pub type TransportConnector = Box<dyn FnMut() -> Result<Box<dyn Transport + Send>> + Send>;
 
@@ -187,7 +196,8 @@ impl BridgeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ConnectionFailed`] if the OS CSPRNG fails.
+    /// Returns [`Error::ConnectionFailed`] if `port` is `80` (see [`Self::new`])
+    /// or the OS CSPRNG fails.
     pub fn loopback(port: u16) -> Result<Self> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let origins = DEFAULT_ALLOWED_ORIGINS
@@ -199,10 +209,12 @@ impl BridgeConfig {
 
     /// Creates a validated bridge configuration.
     ///
-    /// The only supported bind address is `127.0.0.1` (any port, `0` for an
-    /// ephemeral one); every other address, including other loopback addresses
-    /// such as `::1` or `127.0.0.2`, is rejected. Browsers must reach the bridge
-    /// as `http://127.0.0.1:<port>`, and the `Host` header must match exactly.
+    /// The only supported bind address is `127.0.0.1` (any port except `80`,
+    /// `0` for an ephemeral one); every other address, including other loopback
+    /// addresses such as `::1` or `127.0.0.2`, is rejected. Browsers must reach
+    /// the bridge as `http://127.0.0.1:<port>`, and the `Host` header must match
+    /// exactly. Port `80` is refused because browsers omit the default HTTP port
+    /// from `Host`, so that check could never pass.
     ///
     /// When `auth_token` is `None`, a fresh 32-byte (64-hex-character) token is
     /// generated via [`getrandom::fill`]. Key generation starts disabled and the
@@ -211,7 +223,7 @@ impl BridgeConfig {
     /// # Errors
     ///
     /// Returns [`Error::ConnectionFailed`] if:
-    /// - `bind_addr` is not `127.0.0.1`
+    /// - `bind_addr` is not `127.0.0.1`, or its port is `80`
     /// - `allowed_origins` is empty, contains `"*"`, or contains invalid origins
     /// - an explicit `auth_token` is shorter than [`MIN_TOKEN_LEN`] characters or
     ///   contains anything but visible ASCII (no whitespace or control characters)
@@ -320,6 +332,10 @@ impl BridgeConfig {
             )));
         }
 
+        if self.bind_addr.port() == DEFAULT_HTTP_PORT {
+            return Err(Error::ConnectionFailed(PORT_80_MESSAGE.to_string()));
+        }
+
         if self.allowed_origins.is_empty() {
             return Err(Error::ConnectionFailed(
                 "bridge requires at least one allowed Origin".to_string(),
@@ -420,6 +436,22 @@ fn validate_origin_entry(origin: &str) -> Result<()> {
             "bridge origin must not have a trailing slash or whitespace: '{origin}'"
         )));
     }
+    // Browsers serialize `Origin` without the scheme's default port and without
+    // leading zeros, so such an entry could never match.
+    let (default_port, authority) = match origin.strip_prefix("https://") {
+        Some(authority) => ("443", authority),
+        None => ("80", &origin["http://".len()..]),
+    };
+    if let Some((_, port)) = authority.rsplit_once(':')
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && (port.is_empty() || port.starts_with('0') || port == default_port)
+    {
+        return Err(Error::ConnectionFailed(format!(
+            "bridge origin must not spell out an empty, default ({default_port}) or \
+             zero-padded port, because browsers omit or normalize it in the Origin header: \
+             '{origin}'"
+        )));
+    }
     Ok(())
 }
 
@@ -499,7 +531,8 @@ impl BridgeServer {
     /// # Errors
     ///
     /// Returns [`Error::ConnectionFailed`] if configuration validation fails,
-    /// binding the TCP listener fails, or a thread cannot be spawned.
+    /// binding the TCP listener fails, the listener is not bound to `127.0.0.1`
+    /// on a port other than `80`, or a thread cannot be spawned.
     pub fn start<F>(config: BridgeConfig, connector: F) -> Result<BridgeHandle>
     where
         F: FnMut() -> Result<Box<dyn Transport + Send>> + Send + 'static,
@@ -521,6 +554,10 @@ impl BridgeServer {
             return Err(Error::ConnectionFailed(format!(
                 "bound bridge address is not 127.0.0.1: {local_addr}"
             )));
+        }
+
+        if local_addr.port() == DEFAULT_HTTP_PORT {
+            return Err(Error::ConnectionFailed(PORT_80_MESSAGE.to_string()));
         }
 
         let ctx = Arc::new(SharedContext {
@@ -2156,6 +2193,55 @@ mod tests {
             );
         }
         assert!(BridgeConfig::new(loopback(8765), origins(), None, "mock").is_ok());
+    }
+
+    #[test]
+    fn config_rejects_port_80() {
+        for result in [
+            BridgeConfig::new(loopback(80), origins(), None, "mock"),
+            BridgeConfig::loopback(80),
+        ] {
+            match result {
+                Err(Error::ConnectionFailed(msg)) => assert_eq!(msg, PORT_80_MESSAGE),
+                other => panic!("port 80 must be rejected, got {other:?}"),
+            }
+        }
+        for port in [0, 8080, 8765, 65535] {
+            assert!(BridgeConfig::loopback(port).is_ok(), "port {port}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_origins_browsers_never_send() {
+        let mut config = BridgeConfig::loopback(0).unwrap();
+        for origin in [
+            "http://localhost:80",
+            "http://localhost:080",
+            "http://localhost:08000",
+            "http://localhost:",
+            "https://example.com:443",
+            "http://[::1]:80",
+        ] {
+            assert!(
+                config.add_allowed_origin(origin).is_err(),
+                "{origin} must be rejected"
+            );
+            assert!(BridgeConfig::new(loopback(0), vec![origin.to_string()], None, "m").is_err());
+        }
+        for origin in [
+            "http://localhost:8000",
+            "http://example.com",
+            "https://example.com",
+            "https://example.com:80",
+            "http://example.com:443",
+            "http://[::1]",
+            "http://[::1]:8000",
+        ] {
+            assert!(
+                config.add_allowed_origin(origin).is_ok(),
+                "{origin} must be accepted"
+            );
+        }
     }
 
     #[test]

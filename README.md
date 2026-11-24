@@ -80,7 +80,7 @@ Install the `yubikey-evm-signer` npm package or try the live demo at [storopoli.
 
 Chromium blocks raw WebUSB access to YubiKey PIV applets on standard web pages across all operating systems. Yubico's vendor ID (`0x1050`) is listed in Chromium's `usb_blocklist.cc` and the WICG `blocklist.txt`, and Chromium restricts USB Smart Card (CCID, class `0x0B`) interfaces as a protected interface class.
 
-Connect through the local PC/SC bridge instead. Start the bridge locally with `just cli-bridge`, then pass the printed URL and bearer token to `YubiKeyDevice.connectBridge(url, token)`. The URL must be exactly `http://127.0.0.1:<port>`; `localhost` and `[::1]` are rejected. Because native PC/SC handles smart card communication, the bridge works in Chrome, Firefox, Safari, Edge, and Brave on macOS, Linux, and Windows. See [Local PC/SC bridge](#local-pcsc-bridge) for its security controls and protocol.
+Connect through the local PC/SC bridge instead. Start the bridge locally with `just cli-bridge`, then pass the printed URL and bearer token to `YubiKeyDevice.connectBridge(url, token)`. The URL must be exactly `http://127.0.0.1:<port>`; `localhost`, `[::1]`, and port `80` are rejected. Because native PC/SC handles smart card communication, the bridge works in Chrome, Firefox, Safari, Edge, and Brave on macOS, Linux, and Windows. See [Local PC/SC bridge](#local-pcsc-bridge) for its security controls and protocol.
 
 ```javascript
 import init, { YubiKeyDevice } from "yubikey-evm-signer";
@@ -199,7 +199,7 @@ If another PC/SC application resets the YubiKey during an operation, the CLI rep
 
 Security controls:
 
-- The bridge binds only to `127.0.0.1` and accepts a request only if its `Host` header is exactly `127.0.0.1:<port>`; `localhost` and `[::1]` are rejected, as a DNS rebinding defense.
+- The bridge binds only to `127.0.0.1` and accepts a request only if its `Host` header is exactly `127.0.0.1:<port>`; `localhost` and `[::1]` are rejected, as a DNS rebinding defense. Port `80` is refused, because browsers omit the default HTTP port from `Host`, so that check could never pass.
 - Every request must carry an `Origin` from the exact allowlist (wildcards are refused) and, except for CORS preflights, `Authorization: Bearer <token>`, compared in constant time. A token passed to `BridgeConfig` must be at least 32 visible ASCII characters.
 - Each APDU must pass the allowlist below. Each forwarded command, including its wrong-`Le` retry and its whole `GET RESPONSE` chain, runs as one PC/SC transaction; the bridge collects chained responses itself and returns the complete response.
 - One hardware session exists at a time; a new `/v1/connect` closes the previous one. A session ends after the idle timeout, when another PC/SC client resets the card, and when the bridge stops. Ending a session releases the card handle and resets the card, which clears the verified PIN and management key authentication.

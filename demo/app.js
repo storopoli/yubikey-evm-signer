@@ -287,16 +287,22 @@ function validateOptionalAddress(raw) {
     return trimmed;
 }
 
+/**
+ * Mirrors `validate_bridge_url` in crates/signer-wasm: returns the canonical
+ * `http://127.0.0.1:<port>` (no trailing slash, no leading zeros). Port 80 is
+ * rejected because browsers omit the default HTTP port from the `Host` header,
+ * which the bridge requires to be exactly `127.0.0.1:<port>`.
+ */
 function validateBridgeUrl(raw) {
     const trimmed = String(raw).trim();
     const match = /^http:\/\/127\.0\.0\.1:(\d{1,5})\/?$/.exec(trimmed);
     const port = match ? Number.parseInt(match[1], 10) : 0;
-    if (port < 1 || port > 65535) {
+    if (port < 1 || port > 65535 || port === 80) {
         throw new Error(
-            'Bridge URL must be http://127.0.0.1:<port> (localhost and [::1] are not accepted)'
+            'Bridge URL must be http://127.0.0.1:<port> with a port other than 80 (localhost and [::1] are not accepted)'
         );
     }
-    return trimmed;
+    return `http://127.0.0.1:${port}`;
 }
 
 function validateCalldataHex(raw) {

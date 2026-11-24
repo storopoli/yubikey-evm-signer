@@ -268,8 +268,8 @@ impl YubiKeyDevice {
     ///
     /// # Arguments
     ///
-    /// * `url` - Bridge URL; only `http://127.0.0.1:<port>` is accepted
-    ///   (`localhost` and `[::1]` are rejected)
+    /// * `url` - Bridge URL; only `http://127.0.0.1:<port>` with a port other
+    ///   than `80` is accepted (`localhost` and `[::1]` are rejected)
     /// * `token` - Bearer token printed by `yubikey-cli bridge` (at least 32
     ///   visible ASCII characters)
     ///

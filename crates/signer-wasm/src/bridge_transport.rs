@@ -25,8 +25,8 @@ use crate::error::{WasmError, WasmResult};
 use crate::transport::{AsyncApduTransport, exchange_apdu_full, transmit_apdu_full};
 
 /// Error message for every rejected bridge URL.
-pub const BRIDGE_URL_ERROR: &str =
-    "Bridge URL must be http://127.0.0.1:<port> (localhost and [::1] are not accepted)";
+pub const BRIDGE_URL_ERROR: &str = "Bridge URL must be http://127.0.0.1:<port> with a port other \
+     than 80 (localhost and [::1] are not accepted)";
 
 /// Minimum bridge bearer token length, in characters (same rule as the bridge).
 pub const BRIDGE_MIN_TOKEN_LEN: usize = 32;
@@ -34,10 +34,13 @@ pub const BRIDGE_MIN_TOKEN_LEN: usize = 32;
 /// Validates the local PC/SC bridge URL and returns its canonical form.
 ///
 /// Accepts only `http://127.0.0.1:<port>` with a decimal port of 1 to 5 digits
-/// in `1..=65535`, an optional trailing `/`, and surrounding whitespace. The
-/// result is `http://127.0.0.1:<port>` without the slash and without leading
-/// zeros in the port. Every other URL is rejected, including `localhost`,
-/// `[::1]`, other hosts, `https://`, credentials, paths, queries and fragments.
+/// in `1..=65535` other than `80`, an optional trailing `/`, and surrounding
+/// whitespace. The result is `http://127.0.0.1:<port>` without the slash and
+/// without leading zeros in the port. Every other URL is rejected, including
+/// `localhost`, `[::1]`, other hosts, `https://`, credentials, paths, queries
+/// and fragments. Port `80` (however it is spelled, e.g. `080`) is rejected
+/// because browsers omit the default HTTP port from the `Host` header, which
+/// the bridge requires to be exactly `127.0.0.1:<port>`.
 ///
 /// # Errors
 ///
@@ -53,7 +56,7 @@ pub fn validate_bridge_url(url: &str) -> WasmResult<String> {
         return Err(reject());
     }
     match port_str.parse::<u16>() {
-        Ok(port) if port != 0 => Ok(format!("http://127.0.0.1:{port}")),
+        Ok(port) if port != 0 && port != 80 => Ok(format!("http://127.0.0.1:{port}")),
         _ => Err(reject()),
     }
 }
@@ -189,7 +192,8 @@ impl BridgeTransport {
     /// # Errors
     ///
     /// Returns [`WasmError::BridgeError`] if the URL is not
-    /// `http://127.0.0.1:<port>`, the token is not at least
+    /// `http://127.0.0.1:<port>` with a port other than `80` (see
+    /// [`validate_bridge_url`]), the token is not at least
     /// [`BRIDGE_MIN_TOKEN_LEN`] visible ASCII characters (both checked before any
     /// request), the bridge is unreachable or refuses the request, or PIV
     /// selection fails; [`WasmError::Disconnected`] on `409`/`503`.
@@ -406,6 +410,9 @@ mod tests {
             ("  http://127.0.0.1:1 ", "http://127.0.0.1:1"),
             ("http://127.0.0.1:65535", "http://127.0.0.1:65535"),
             ("http://127.0.0.1:08765", "http://127.0.0.1:8765"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://127.0.0.1:81", "http://127.0.0.1:81"),
+            ("http://127.0.0.1:800", "http://127.0.0.1:800"),
         ] {
             assert_eq!(validate_bridge_url(input).unwrap(), canonical, "{input}");
         }
@@ -433,6 +440,10 @@ mod tests {
             "http://127.0.0.1",
             "http://127.0.0.1:",
             "http://127.0.0.1:0",
+            "http://127.0.0.1:80",
+            "http://127.0.0.1:80/",
+            "http://127.0.0.1:080",
+            "http://127.0.0.1:00080",
             "http://127.0.0.1:65536",
             "http://127.0.0.1:99999",
             "http://127.0.0.1:123456",
