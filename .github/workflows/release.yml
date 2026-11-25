@@ -109,6 +109,7 @@ jobs:
     needs: [verify-version, test]
     permissions:
       contents: read
+      id-token: write # OIDC token for crates.io Trusted Publishing
     strategy:
       fail-fast: true
       max-parallel: 1
@@ -127,8 +128,15 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Authenticate with crates.io (Trusted Publishing)
+        # Exchanges the workflow's OIDC token for a publish token that expires after 30 minutes
+        # and is revoked when the job ends. Each crate must list this workflow as a trusted
+        # publisher in its crates.io settings.
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: Publish to crates.io
-        run: | # zizmor: ignore[use-trusted-publishing]
+        run: |
           for attempt in 1 2 3 4 5; do
             if cargo publish -p "$PACKAGE"; then
               exit 0
@@ -141,7 +149,7 @@ jobs:
           done
         env:
           PACKAGE: ${{ matrix.package }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   npm:
     name: Publish Release to NPM
@@ -149,7 +157,7 @@ jobs:
     needs: [verify-version, test]
     permissions:
       contents: read
-      id-token: write
+      id-token: write # OIDC token for npm Trusted Publishing and provenance
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,7 +178,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          # Trusted Publishing needs Node >= 22.14.0 and npm >= 11.5.1.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
@@ -201,8 +210,21 @@ jobs:
           echo "$pack_output" | grep -Fq "LICENSE-MIT"
           echo "$pack_output" | grep -Fq "LICENSE-APACHE"
 
+      - name: Check that npm supports Trusted Publishing
+        run: |
+          npm_version="$(npm --version)"
+          echo "npm $npm_version"
+          node -e '
+            const [major, minor, patch] = process.argv[1].split(".").map(Number);
+            const ok = major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1)));
+            if (!ok) {
+              console.error(`npm ${process.argv[1]} is too old for Trusted Publishing (needs >= 11.5.1)`);
+              process.exit(1);
+            }
+          ' "$npm_version"
+
       - name: Publish to NPM
+        # No token: npm authenticates with the workflow's OIDC identity. The package must list this
+        # workflow as a trusted publisher with `npm publish` allowed in its npmjs.com settings.
         working-directory: packages/npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
