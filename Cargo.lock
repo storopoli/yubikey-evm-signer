@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "yubikey-evm-signer-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "alloy-primitives",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "yubikey-evm-signer-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.4.3",
  "hex",

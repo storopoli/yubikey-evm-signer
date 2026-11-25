@@ -1,6 +1,6 @@
 {
   "name": "yubikey-evm-signer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sign Ethereum transactions using YubiKey's secp256r1 (P-256) keys via WebUSB and EIP-7951",
   "type": "module",
   "main": "./dist/yubikey_evm_signer_wasm.js",
