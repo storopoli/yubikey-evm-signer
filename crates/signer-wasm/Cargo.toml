@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Core library
-yubikey-evm-signer-core = { path = "../signer-core", version = "0.1.0" }
+yubikey-evm-signer-core = { path = "../signer-core", version = "0.1.1" }
 
 # Crypto
 p256 = { workspace = true, features = ["ecdsa"] }
