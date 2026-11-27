@@ -190,8 +190,9 @@ cli-sign-tx:
 
 # Sign a custom 32-byte hash (requires PIN)
 [group('cli')]
+[positional-arguments]
 cli-sign hash:
-  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign {{hash}}
+  cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- sign "$1"
 
 # Start hardened local PC/SC loopback bridge for browser apps (options: --port, --allow-origin, --idle-timeout <seconds>, --allow-generate)
 [group('cli')]

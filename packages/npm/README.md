@@ -49,7 +49,7 @@ just cli-bridge
 cargo run --example yubikey-cli -p yubikey-evm-signer-core --features pcsc -- bridge --port 8765
 ```
 
-The bridge prints its URL (`http://127.0.0.1:<port>`) and a random 256-bit bearer token, which stays valid until the bridge process stops. It binds only to `127.0.0.1` and accepts only requests whose `Host` is exactly `127.0.0.1:<port>` (`localhost` and `[::1]` are rejected; port `80` is refused because browsers omit it from `Host`), requires an exact `Origin` from its allowlist and the bearer token (checked in constant time), and forwards only allowlisted PIV commands, each as one PC/SC transaction.
+The bridge prints its URL (`http://127.0.0.1:<port>`) and a random 256-bit bearer token, which stays valid until the bridge process stops. It binds only to `127.0.0.1` and accepts only requests whose `Host` is exactly `127.0.0.1:<port>` (`localhost` and `[::1]` are rejected; port `80` is refused because browsers omit it from `Host`), requires an exact `Origin` from its allowlist and the bearer token (checked in constant time), holds exclusive PC/SC access to the YubiKey for the lifetime of each session (resetting the card before releasing it), and forwards only allowlisted PIV commands.
 
 - `--allow-origin <origin>` adds an allowed page origin (repeatable). The defaults are `http://localhost:8000`, `http://127.0.0.1:8000`, and `https://storopoli.github.io`.
 - `--allow-generate` permits management key authentication, key generation, and certificate deletion. Without it, `authenticateManagementKey()` fails with a `403` error that names the flag, so `generateKey()` cannot be used.

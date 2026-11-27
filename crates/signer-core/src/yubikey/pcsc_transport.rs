@@ -20,17 +20,29 @@
 //! })?;
 //! ```
 //!
-//! # Concurrency and card resets
+//! # Concurrency, exclusive sessions, and card resets
 //!
-//! The card is opened in [`ShareMode::Shared`], so other PC/SC clients (ykman,
-//! gpg's scdaemon, another `yubikey-cli`) can use it too. Multi-APDU operations
-//! must run inside [`Transport::exclusive`], which wraps them in a PC/SC
-//! transaction (`SCardBeginTransaction` / `SCardEndTransaction` with
+//! [`PcscTransport::connect`] and [`PcscTransport::connect_reader`] open the
+//! card in [`ShareMode::Shared`], so other PC/SC clients (`ykman`, `gpg`'s
+//! `scdaemon`, another `yubikey-cli`) can use it too. Multi-APDU operations on
+//! a shared handle must run inside [`Transport::exclusive`], which wraps them
+//! in a PC/SC transaction (`SCardBeginTransaction` / `SCardEndTransaction` with
 //! [`Disposition::LeaveCard`]).
 //!
-//! When another client resets the card, the next exchange reports
-//! [`Error::CardReset`] after reconnecting the handle; the PIV applet must be
-//! selected again and the PIN re-verified.
+//! Whenever card-side authentication state (a verified PIV PIN or an
+//! authenticated management key) may be established on the card — especially
+//! across multiple requests such as in the local HTTP bridge — open the card
+//! with [`PcscTransport::connect_exclusive`] or
+//! [`PcscTransport::connect_reader_exclusive`] (`ShareMode::Exclusive`). While
+//! an exclusive handle is alive, no other local PC/SC client can connect to the
+//! card or use its authenticated state; dropping the transport disconnects with
+//! `Disposition::ResetCard`, clearing PIN and management key authentication
+//! before exclusive ownership is released.
+//!
+//! When another client (or a power/bus event) resets the card, the next
+//! exchange reports [`Error::CardReset`] after reconnecting the handle in the
+//! same share mode; the PIV applet must be selected again and the PIN
+//! re-verified.
 
 use pcsc::{
     Card, Context, Disposition, MAX_BUFFER_SIZE_EXTENDED, Protocols, Scope, ShareMode, Transaction,
@@ -71,9 +83,25 @@ fn reset_outcome(reconnect: core::result::Result<(), pcsc::Error>) -> Error {
     }
 }
 
-/// Re-establishes a handle after a reset without resetting the card again.
-fn reconnect_after_reset(card: &mut Card) -> Error {
-    reset_outcome(card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::LeaveCard))
+/// Maps a PC/SC connection error to [`Error::ConnectionFailed`], adding
+/// actionable guidance when an exclusive connection hits a sharing violation.
+fn map_connect_error(target: &str, share_mode: ShareMode, err: pcsc::Error) -> Error {
+    match err {
+        pcsc::Error::SharingViolation if share_mode == ShareMode::Exclusive => {
+            Error::ConnectionFailed(format!(
+                "failed to open exclusive connection to {target}: another PC/SC client is \
+                 currently using the card (close other smart-card apps such as ykman or \
+                 gpg-agent/scdaemon and retry)"
+            ))
+        }
+        other => Error::ConnectionFailed(format!("failed to connect to {target}: {other}")),
+    }
+}
+
+/// Re-establishes a handle after a reset without resetting the card again,
+/// preserving `share_mode` so an exclusive handle never downgrades to shared.
+fn reconnect_after_reset(card: &mut Card, share_mode: ShareMode) -> Error {
+    reset_outcome(card.reconnect(share_mode, Protocols::ANY, Disposition::LeaveCard))
 }
 
 /// Result of one raw PC/SC exchange.
@@ -133,20 +161,31 @@ fn is_yubikey_reader(name: &str) -> bool {
 /// A PC/SC transport for communicating with a YubiKey.
 ///
 /// This transport uses the system's PC/SC daemon to communicate with
-/// the YubiKey's smart card interface (CCID).
+/// the YubiKey's smart card interface (CCID). Dropping it disconnects the card
+/// with [`Disposition::ResetCard`], clearing any verified PIN or management key
+/// authentication on the card.
 pub struct PcscTransport {
     /// The PC/SC card handle.
     card: Card,
+    /// The PC/SC share mode (`Shared` or `Exclusive`) used to open `card`.
+    share_mode: ShareMode,
 }
 
 impl std::fmt::Debug for PcscTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PcscTransport").finish_non_exhaustive()
+        f.debug_struct("PcscTransport")
+            .field("exclusive", &self.is_exclusive())
+            .finish_non_exhaustive()
     }
 }
 
 impl PcscTransport {
-    /// Connects to the first available YubiKey.
+    /// Connects to the first available YubiKey in shared mode (`ShareMode::Shared`).
+    ///
+    /// Other local PC/SC clients can connect to the card concurrently; wrap
+    /// multi-APDU sequences in [`Transport::exclusive`]. Prefer
+    /// [`Self::connect_exclusive`] whenever a verified PIN or management key
+    /// authentication will be used across calls.
     ///
     /// # Returns
     ///
@@ -163,6 +202,32 @@ impl PcscTransport {
     /// let transport = PcscTransport::connect()?;
     /// ```
     pub fn connect() -> Result<Self> {
+        Self::connect_with_mode(ShareMode::Shared)
+    }
+
+    /// Connects to the first available YubiKey with exclusive access
+    /// (`ShareMode::Exclusive`).
+    ///
+    /// No other local PC/SC client can connect to the card or use card-side
+    /// PIN or management key authentication while this transport is alive.
+    /// Dropping the transport resets the card (`Disposition::ResetCard`) before
+    /// releasing exclusive ownership.
+    ///
+    /// # Returns
+    ///
+    /// A [`Result`] containing the exclusively connected transport.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::DeviceNotFound`] if no YubiKey reader is available
+    /// - [`Error::ConnectionFailed`] if establishing the PC/SC context fails,
+    ///   connecting fails, or another PC/SC client already holds the card
+    pub fn connect_exclusive() -> Result<Self> {
+        Self::connect_with_mode(ShareMode::Exclusive)
+    }
+
+    /// Connects to the first available YubiKey using `share_mode`.
+    fn connect_with_mode(share_mode: ShareMode) -> Result<Self> {
         let ctx = Context::establish(Scope::User).map_err(|e| {
             Error::ConnectionFailed(format!("failed to establish PC/SC context: {e}"))
         })?;
@@ -183,13 +248,17 @@ impl PcscTransport {
             .ok_or(Error::DeviceNotFound)?;
 
         let card = ctx
-            .connect(yubikey_reader.as_c_str(), ShareMode::Shared, Protocols::ANY)
-            .map_err(|e| Error::ConnectionFailed(format!("failed to connect to YubiKey: {e}")))?;
+            .connect(yubikey_reader.as_c_str(), share_mode, Protocols::ANY)
+            .map_err(|e| map_connect_error("YubiKey", share_mode, e))?;
 
-        Ok(Self { card })
+        Ok(Self { card, share_mode })
     }
 
-    /// Connects to a specific PC/SC reader by exact name (for multi-YubiKey environments).
+    /// Connects to a specific PC/SC reader by exact name in shared mode
+    /// (for multi-YubiKey environments).
+    ///
+    /// Prefer [`Self::connect_reader_exclusive`] whenever a verified PIN or
+    /// management key authentication will be used across calls.
     ///
     /// # Arguments
     ///
@@ -204,6 +273,34 @@ impl PcscTransport {
     /// - [`Error::DeviceNotFound`] if no matching reader is currently available
     /// - [`Error::ConnectionFailed`] if establishing the PC/SC context or connecting fails
     pub fn connect_reader(reader_name: &str) -> Result<Self> {
+        Self::connect_reader_with_mode(reader_name, ShareMode::Shared)
+    }
+
+    /// Connects to a specific PC/SC reader by exact name with exclusive access
+    /// (`ShareMode::Exclusive`).
+    ///
+    /// No other local PC/SC client can connect to the card while this transport
+    /// is alive; dropping it resets the card before releasing exclusive access.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader_name` - The exact reader name returned by [`Self::list_readers`]
+    ///
+    /// # Returns
+    ///
+    /// A [`Result`] containing the exclusively connected transport.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::DeviceNotFound`] if no matching reader is currently available
+    /// - [`Error::ConnectionFailed`] if establishing the PC/SC context fails,
+    ///   connecting fails, or another PC/SC client already holds the card
+    pub fn connect_reader_exclusive(reader_name: &str) -> Result<Self> {
+        Self::connect_reader_with_mode(reader_name, ShareMode::Exclusive)
+    }
+
+    /// Connects to a specific PC/SC reader by exact name using `share_mode`.
+    fn connect_reader_with_mode(reader_name: &str, share_mode: ShareMode) -> Result<Self> {
         let ctx = Context::establish(Scope::User).map_err(|e| {
             Error::ConnectionFailed(format!("failed to establish PC/SC context: {e}"))
         })?;
@@ -224,12 +321,17 @@ impl PcscTransport {
             .ok_or(Error::DeviceNotFound)?;
 
         let card = ctx
-            .connect(target_reader.as_c_str(), ShareMode::Shared, Protocols::ANY)
-            .map_err(|e| {
-                Error::ConnectionFailed(format!("failed to connect to reader '{reader_name}': {e}"))
-            })?;
+            .connect(target_reader.as_c_str(), share_mode, Protocols::ANY)
+            .map_err(|e| map_connect_error(&format!("reader '{reader_name}'"), share_mode, e))?;
 
-        Ok(Self { card })
+        Ok(Self { card, share_mode })
+    }
+
+    /// Returns `true` if this transport owns the card exclusively
+    /// (`ShareMode::Exclusive`).
+    #[must_use]
+    pub const fn is_exclusive(&self) -> bool {
+        matches!(self.share_mode, ShareMode::Exclusive)
     }
 
     /// Lists all available YubiKey readers.
@@ -275,7 +377,9 @@ impl Transport for PcscTransport {
     fn transmit(&mut self, apdu: &Apdu) -> Result<ApduResponse> {
         match exchange(&self.card, apdu)? {
             Exchange::Response(response) => Ok(response),
-            Exchange::Failed(pcsc::Error::ResetCard) => Err(reconnect_after_reset(&mut self.card)),
+            Exchange::Failed(pcsc::Error::ResetCard) => {
+                Err(reconnect_after_reset(&mut self.card, self.share_mode))
+            }
             Exchange::Failed(e) => Err(map_pcsc_error(e)),
         }
     }
@@ -285,10 +389,22 @@ impl Transport for PcscTransport {
         self.card.status2_owned().is_ok()
     }
 
+    fn is_exclusive_session(&self) -> bool {
+        self.is_exclusive()
+    }
+
     fn exclusive(&mut self, f: &mut dyn FnMut(&mut dyn Transport) -> Result<()>) -> Result<()> {
+        if self.is_exclusive() {
+            // The handle already owns the card exclusively via ShareMode::Exclusive
+            // for its entire lifetime (until Drop disconnects with ResetCard).
+            return f(self);
+        }
+
         let mut tx = match self.card.transaction2() {
             Ok(tx) => tx,
-            Err((card, pcsc::Error::ResetCard)) => return Err(reconnect_after_reset(card)),
+            Err((card, pcsc::Error::ResetCard)) => {
+                return Err(reconnect_after_reset(card, self.share_mode));
+            }
             Err((_, e)) => return Err(map_pcsc_error(e)),
         };
 
@@ -362,5 +478,39 @@ mod tests {
     fn yubikey_reader_detection() {
         assert!(is_yubikey_reader("Yubico YubiKey OTP+FIDO+CCID 00 00"));
         assert!(!is_yubikey_reader("Generic Smart Card Reader"));
+    }
+
+    #[test]
+    fn connect_error_reports_exclusive_sharing_violation() {
+        let exclusive_err = map_connect_error(
+            "YubiKey",
+            ShareMode::Exclusive,
+            pcsc::Error::SharingViolation,
+        );
+        match exclusive_err {
+            Error::ConnectionFailed(msg) => {
+                assert!(msg.contains("exclusive connection"), "{msg}");
+                assert!(msg.contains("another PC/SC client"), "{msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+
+        let shared_err =
+            map_connect_error("YubiKey", ShareMode::Shared, pcsc::Error::SharingViolation);
+        match shared_err {
+            Error::ConnectionFailed(msg) => {
+                assert!(msg.contains("failed to connect to YubiKey"), "{msg}");
+                assert!(!msg.contains("exclusive connection"), "{msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+
+        let other_err = map_connect_error("YubiKey", ShareMode::Exclusive, pcsc::Error::Timeout);
+        match other_err {
+            Error::ConnectionFailed(msg) => {
+                assert!(msg.contains("failed to connect to YubiKey"), "{msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
     }
 }

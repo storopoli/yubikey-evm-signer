@@ -1583,3 +1583,285 @@ fn weak_explicit_tokens_are_rejected() {
     assert_eq!(h.token, token);
     assert_eq!(h.health().status, 200);
 }
+
+#[test]
+fn non_exclusive_transport_is_rejected_at_connect() {
+    struct SharedTransport(MockPivCard);
+
+    impl Transport for SharedTransport {
+        fn transmit(&mut self, apdu: &Apdu) -> Result<ApduResponse> {
+            self.0.transmit(apdu)
+        }
+
+        fn is_connected(&self) -> bool {
+            self.0.is_connected()
+        }
+
+        fn is_exclusive_session(&self) -> bool {
+            false
+        }
+
+        fn exclusive(&mut self, f: &mut dyn FnMut(&mut dyn Transport) -> Result<()>) -> Result<()> {
+            self.0.exclusive(f)
+        }
+    }
+
+    let probe = Arc::new(Probe::default());
+    let (drop_tx, drops) = mpsc::channel();
+    let card_probe = Arc::clone(&probe);
+    let handle = BridgeServer::start(default_config().with_backend_name("mock"), move || {
+        let card: Box<dyn Transport + Send> = Box::new(SharedTransport(MockPivCard::new(
+            test_signing_key(),
+            Arc::clone(&card_probe),
+            drop_tx.clone(),
+        )));
+        Ok(card)
+    })
+    .expect("start bridge server");
+    let client = Client {
+        addr: handle.local_addr(),
+        token: handle.token().to_string(),
+    };
+
+    let resp = client.try_connect();
+    assert_eq!(resp.status, 500, "{}", resp.body);
+    assert!(resp.has_cors());
+    assert!(resp.error().contains("exclusive card session"));
+    assert!(resp.error().contains("connect_exclusive"));
+    assert_eq!(
+        probe.transmitted_count(),
+        0,
+        "bridge must reject non-exclusive transport before sending any APDU"
+    );
+    drops
+        .try_recv()
+        .expect("bridge must drop the rejected shared transport immediately");
+
+    handle.shutdown();
+}
+
+#[test]
+fn exclusive_bridge_session_blocks_second_pcsc_client_and_resets_auth_on_end() {
+    /// Models a single smart card behind PC/SC with `ShareMode::Shared` vs
+    /// `ShareMode::Exclusive` handles and `SCardDisconnect(Disposition::ResetCard)`
+    /// on drop.
+    struct SimulatedPcscReader {
+        card: MockPivCard,
+        shared_handles: usize,
+        exclusive_held: bool,
+        resets: usize,
+    }
+
+    impl SimulatedPcscReader {
+        fn new(probe: Arc<Probe>, dummy_drop: Sender<()>) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                card: MockPivCard::new(test_signing_key(), probe, dummy_drop),
+                shared_handles: 0,
+                exclusive_held: false,
+                resets: 0,
+            }))
+        }
+
+        fn connect(
+            reader: &Arc<Mutex<Self>>,
+            exclusive: bool,
+            on_drop: Option<Sender<()>>,
+        ) -> Result<SimulatedPcscHandle> {
+            let mut guard = reader.lock().unwrap();
+            if guard.exclusive_held || (exclusive && guard.shared_handles > 0) {
+                return Err(Error::ConnectionFailed(
+                    "another PC/SC client is currently using the card".to_string(),
+                ));
+            }
+            if exclusive {
+                guard.exclusive_held = true;
+            } else {
+                guard.shared_handles += 1;
+            }
+            Ok(SimulatedPcscHandle {
+                reader: Arc::clone(reader),
+                exclusive,
+                on_drop,
+            })
+        }
+    }
+
+    struct SimulatedPcscHandle {
+        reader: Arc<Mutex<SimulatedPcscReader>>,
+        exclusive: bool,
+        on_drop: Option<Sender<()>>,
+    }
+
+    impl Drop for SimulatedPcscHandle {
+        fn drop(&mut self) {
+            {
+                let mut guard = self.reader.lock().unwrap();
+                // pcsc::Card::drop calls SCardDisconnect(Disposition::ResetCard),
+                // clearing card-side PIN and management-key authentication before
+                // releasing ownership.
+                guard.card.pin_verified = false;
+                guard.card.mgmt_authenticated = false;
+                guard.card.pending_chunks.clear();
+                guard.resets += 1;
+                if self.exclusive {
+                    guard.exclusive_held = false;
+                } else {
+                    guard.shared_handles -= 1;
+                }
+            }
+            if let Some(tx) = self.on_drop.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    impl Transport for SimulatedPcscHandle {
+        fn transmit(&mut self, apdu: &Apdu) -> Result<ApduResponse> {
+            let mut guard = self.reader.lock().unwrap();
+            guard.card.transmit(apdu)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn is_exclusive_session(&self) -> bool {
+            self.exclusive
+        }
+
+        fn exclusive(&mut self, f: &mut dyn FnMut(&mut dyn Transport) -> Result<()>) -> Result<()> {
+            f(self)
+        }
+    }
+
+    let authenticate_bridge_session = |client: &Client, session_id: &str| {
+        assert!(
+            client
+                .transmit_apdu(session_id, &build_verify_pin_apdu(TEST_PIN).unwrap())
+                .apdu()
+                .is_success()
+        );
+        let alg = ManagementKeyAlgorithm::Aes192;
+        let witness_resp = client
+            .transmit_apdu(session_id, &build_mgmt_auth_request_witness_apdu(alg))
+            .apdu();
+        assert!(witness_resp.is_success());
+        let witness = parse_witness_response(witness_resp.data(), alg.block_size()).unwrap();
+        let decrypted_witness = decrypt_mgmt_witness(alg, &TEST_MGMT_KEY, &witness).unwrap();
+        let host_challenge = [0x42u8; 16];
+        let verify_mgmt =
+            build_mgmt_auth_verify_apdu(alg, &decrypted_witness, &host_challenge).unwrap();
+        assert!(
+            client
+                .transmit_apdu(session_id, &verify_mgmt)
+                .apdu()
+                .is_success()
+        );
+    };
+
+    let assert_second_client_unauthenticated = |reader: &Arc<Mutex<SimulatedPcscReader>>| {
+        let mut peer = SimulatedPcscReader::connect(reader, false, None)
+            .expect("second PC/SC client should be able to connect after session ends");
+        let sign_resp = peer
+            .transmit(&build_sign_apdu(Slot::Authentication, &[0x99; 32]))
+            .unwrap();
+        assert_eq!(
+            sign_resp.status_word(),
+            0x6982,
+            "second client must not inherit verified PIN state"
+        );
+        let gen_resp = peer
+            .transmit(&build_generate_key_apdu(Slot::Authentication))
+            .unwrap();
+        assert_eq!(
+            gen_resp.status_word(),
+            0x6982,
+            "second client must not inherit management-key auth state"
+        );
+    };
+
+    let probe = Arc::new(Probe::default());
+    let (dummy_tx, _dummy_rx) = mpsc::channel();
+    let reader = SimulatedPcscReader::new(Arc::clone(&probe), dummy_tx);
+    let (release_tx, releases) = mpsc::channel();
+
+    let connector_reader = Arc::clone(&reader);
+    let connector_release = release_tx.clone();
+    let config = default_config()
+        .with_allow_key_generation(true)
+        .with_idle_timeout(Duration::from_millis(200))
+        .unwrap()
+        .with_backend_name("mock");
+    let handle = BridgeServer::start(config, move || {
+        let h =
+            SimulatedPcscReader::connect(&connector_reader, true, Some(connector_release.clone()))?;
+        Ok(Box::new(h) as Box<dyn Transport + Send>)
+    })
+    .expect("start bridge");
+    let client = Client {
+        addr: handle.local_addr(),
+        token: handle.token().to_string(),
+    };
+
+    // 1. If another local PC/SC client already holds a shared handle, bridge
+    //    /v1/connect must fail closed instead of sharing card state with it.
+    let pre_existing_peer = SimulatedPcscReader::connect(&reader, false, None).unwrap();
+    let blocked = client.try_connect();
+    assert_eq!(blocked.status, 502, "{}", blocked.body);
+    assert!(blocked.error().contains("another PC/SC client"));
+    drop(pre_existing_peer);
+
+    // 2. Open an exclusive bridge session and authenticate both PIN and
+    //    management key. Between requests, no second PC/SC client can connect
+    //    to sign or generate a key, while the bridge itself works normally.
+    let session = client.connect();
+    authenticate_bridge_session(&client, &session);
+
+    assert!(
+        SimulatedPcscReader::connect(&reader, false, None).is_err(),
+        "second shared PC/SC client must be blocked during authenticated bridge session"
+    );
+    assert!(
+        SimulatedPcscReader::connect(&reader, true, None).is_err(),
+        "second exclusive PC/SC client must be blocked during authenticated bridge session"
+    );
+
+    // Bridge signing and key generation continue to work in the exclusive session.
+    let sign_resp = client
+        .transmit_apdu(
+            &session,
+            &build_sign_apdu(Slot::Authentication, &[0x11; 32]),
+        )
+        .apdu();
+    assert!(sign_resp.is_success());
+    let gen_resp = client
+        .transmit_apdu(&session, &build_generate_key_apdu(Slot::Authentication))
+        .apdu();
+    assert!(gen_resp.is_success());
+
+    // 3. Explicit /v1/disconnect resets card auth before releasing exclusive access.
+    assert_eq!(client.disconnect(&session).status, 200);
+    releases
+        .try_recv()
+        .expect("disconnect must release exclusive card handle");
+    assert_second_client_unauthenticated(&reader);
+
+    // 4. Idle timeout expiry resets card auth before releasing exclusive access.
+    let session = client.connect();
+    authenticate_bridge_session(&client, &session);
+    assert!(SimulatedPcscReader::connect(&reader, false, None).is_err());
+    releases
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("idle watchdog must release exclusive card handle");
+    assert_second_client_unauthenticated(&reader);
+
+    // 5. Bridge shutdown resets card auth before releasing exclusive access.
+    let session = client.connect();
+    authenticate_bridge_session(&client, &session);
+    assert!(SimulatedPcscReader::connect(&reader, false, None).is_err());
+    handle.shutdown();
+    releases
+        .try_recv()
+        .expect("shutdown must release exclusive card handle");
+    assert_second_client_unauthenticated(&reader);
+}

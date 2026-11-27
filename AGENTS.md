@@ -81,9 +81,9 @@ Two-crate workspace with native and browser transports:
   - `address.rs`: keccak-derived address identifiers of P-256 public keys (not secp256k1 accounts)
   - `signature.rs`: Signature types with low-S normalization
   - `error.rs`: Core `Error` enum (including `CardReset` and `PinRequired`)
-  - `bridge.rs`: Hardened `127.0.0.1`-only HTTP/1.1 PC/SC bridge server (non-WASM targets): exact `Host`/`Origin` checks, process-lifetime bearer token, idle session timeout, opt-in key generation, APDU allowlist in `validate_bridge_apdu`, one PC/SC transaction per forwarded command
+  - `bridge.rs`: Hardened `127.0.0.1`-only HTTP/1.1 PC/SC bridge server (non-WASM targets): exact `Host`/`Origin` checks, process-lifetime bearer token, idle session timeout, opt-in key generation, APDU allowlist in `validate_bridge_apdu`, exclusive PC/SC session enforcement (`Transport::is_exclusive_session`, `PcscTransport::connect_exclusive`) with card reset on session end
   - `yubikey/`: PIV applet communication
-    - `Transport` trait for synchronous native/mock transports, with `exclusive` scopes (PC/SC transactions; `PcscTransport` behind the optional `pcsc` feature maps card resets to `Error::CardReset`)
+    - `Transport` trait for synchronous native/mock transports, with `exclusive` scopes and `is_exclusive_session` (`PcscTransport` behind the optional `pcsc` feature supports both shared `connect` and exclusive `connect_exclusive` sessions, and maps card resets to `Error::CardReset`)
     - `PivSession` / `PivExclusive` and sans-IO PIV APDU builders/parsers in `piv.rs`; slot public keys come from Yubico `GET METADATA` (firmware 5.3+) with certificate fallback and stale-certificate detection; `generate_key` returns `GeneratedKey` and deletes the slot certificate
     - `Slot` enum for PIV slot management
     - `Apdu` for command encoding

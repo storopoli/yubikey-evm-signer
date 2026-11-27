@@ -261,9 +261,24 @@ fn print_signing_key(info: &SlotPublicKey) {
     println!();
 }
 
-/// Connects to the first YubiKey and wraps it in a PIV session.
+/// Connects to the first YubiKey in shared mode and wraps it in a PIV session.
 fn connect_session() -> Option<PivSession> {
     match PcscTransport::connect() {
+        Ok(transport) => Some(PivSession::new(Box::new(transport))),
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "Failed to connect: {e}");
+            None
+        }
+    }
+}
+
+/// Connects to the first YubiKey with exclusive PC/SC access and wraps it in a PIV session.
+///
+/// Used for operations that verify a PIN or authenticate the management key so
+/// no other local PC/SC client can use that card state before the session drops
+/// and resets the card.
+fn connect_exclusive_session() -> Option<PivSession> {
+    match PcscTransport::connect_exclusive() {
         Ok(transport) => Some(PivSession::new(Box::new(transport))),
         Err(e) => {
             let _ = writeln!(io::stderr(), "Failed to connect: {e}");
@@ -839,35 +854,38 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Connect and inspect the slot before prompting for sensitive credentials
-    let Some(mut session) = connect_session() else {
-        return ExitCode::FAILURE;
-    };
+    // Connect and inspect the slot before prompting for sensitive credentials,
+    // then release the shared handle until the user confirms and enters the key.
+    let slot_report = {
+        let Some(mut session) = connect_session() else {
+            return ExitCode::FAILURE;
+        };
 
-    let slot_report = match read_slot_public_key(&mut session) {
-        Ok(info) => {
-            // Like the output below: abort, with nothing changed, if it fails.
-            if !warn_if_stale_certificate(&info) {
+        match read_slot_public_key(&mut session) {
+            Ok(info) => {
+                // Like the output below: abort, with nothing changed, if it fails.
+                if !warn_if_stale_certificate(&info) {
+                    return ExitCode::FAILURE;
+                }
+                format!(
+                    "Slot 9a already holds a P-256 key:\n  Public Key: {}\n  Derived Address: {}\n",
+                    hex::encode(info.public_key.to_sec1_point(false).as_bytes()),
+                    Address::from_public_key(&info.public_key)
+                )
+            }
+            Err(Error::SlotEmpty(_)) => "Slot 9a appears to be empty.\n\
+                 (On firmware older than 5.3 a key without a certificate cannot be detected.)\n"
+                .to_string(),
+            Err(Error::InvalidKeyType(_)) => {
+                "Slot 9a holds a key or certificate that is not P-256.\n".to_string()
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "Failed to inspect slot 9a: {e}\nAborting; no changes were made."
+                );
                 return ExitCode::FAILURE;
             }
-            format!(
-                "Slot 9a already holds a P-256 key:\n  Public Key: {}\n  Derived Address: {}\n",
-                hex::encode(info.public_key.to_sec1_point(false).as_bytes()),
-                Address::from_public_key(&info.public_key)
-            )
-        }
-        Err(Error::SlotEmpty(_)) => "Slot 9a appears to be empty.\n\
-             (On firmware older than 5.3 a key without a certificate cannot be detected.)\n"
-            .to_string(),
-        Err(Error::InvalidKeyType(_)) => {
-            "Slot 9a holds a key or certificate that is not P-256.\n".to_string()
-        }
-        Err(e) => {
-            let _ = writeln!(
-                io::stderr(),
-                "Failed to inspect slot 9a: {e}\nAborting; no changes were made."
-            );
-            return ExitCode::FAILURE;
         }
     };
     if !print_before_card_change(&format!(
@@ -940,6 +958,12 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Open an exclusive PC/SC handle before touching the output file or card so
+    // no other local client can observe or use management-key authentication.
+    let Some(mut session) = connect_exclusive_session() else {
+        return ExitCode::FAILURE;
+    };
+
     // Claim the output file now, after every prompt; an unusable path still
     // fails while the slot is untouched.
     let mut pubkey_file = match pubkey_out {
@@ -953,7 +977,7 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         None => None,
     };
 
-    // SELECT -> management key auth -> GENERATE -> certificate delete in one PC/SC transaction
+    // SELECT -> management key auth -> GENERATE -> certificate delete under exclusive ownership
     let outcome = session.exclusive(|piv| {
         piv.select()?;
         if let Err(auth_error) = piv.authenticate_management_key_with(&mgmt_key, alg) {
@@ -967,6 +991,9 @@ fn cmd_generate(args: &[String]) -> ExitCode {
             .map(CardChange::Generated)
     });
     drop(mgmt_key);
+    // Disconnect and reset the card immediately so management-key auth is
+    // cleared before writing output files or printing to the console.
+    drop(session);
 
     match outcome {
         Ok(CardChange::Generated(generated)) => {
@@ -1036,18 +1063,21 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 
     println!("Signing hash: 0x{}\n", hex::encode(hash));
 
-    // Connect and read the public key before prompting for PIN
-    let Some(mut session) = connect_session() else {
-        return ExitCode::FAILURE;
-    };
-
-    let key_info = match read_slot_public_key(&mut session) {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("Failed to get public key: {e}");
-            eprintln!();
-            print_certificate_guidance();
+    // Connect and read the public key before prompting for PIN, then release
+    // the shared handle until signing starts.
+    let key_info = {
+        let Some(mut session) = connect_session() else {
             return ExitCode::FAILURE;
+        };
+
+        match read_slot_public_key(&mut session) {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("Failed to get public key: {e}");
+                eprintln!();
+                print_certificate_guidance();
+                return ExitCode::FAILURE;
+            }
         }
     };
     warn_if_stale_certificate(&key_info);
@@ -1063,8 +1093,12 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 
     println!("Verifying PIN and signing (touch YubiKey if required)...");
 
+    let Some(mut session) = connect_exclusive_session() else {
+        return ExitCode::FAILURE;
+    };
     let sign_result = sign_in_one_transaction(&mut session, &key_info, &pin, &hash);
     drop(pin);
+    drop(session);
 
     match sign_result {
         Ok(der_signature) => {
@@ -1103,18 +1137,21 @@ fn cmd_sign(args: &[String]) -> ExitCode {
 fn cmd_sign_tx() -> ExitCode {
     println!("Creating and signing a sample EIP-1559 transaction hash...\n");
 
-    // Connect and read the public key before prompting for PIN
-    let Some(mut session) = connect_session() else {
-        return ExitCode::FAILURE;
-    };
-
-    let key_info = match read_slot_public_key(&mut session) {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("Failed to get public key: {e}");
-            eprintln!();
-            print_certificate_guidance();
+    // Connect and read the public key before prompting for PIN, then release
+    // the shared handle until signing starts.
+    let key_info = {
+        let Some(mut session) = connect_session() else {
             return ExitCode::FAILURE;
+        };
+
+        match read_slot_public_key(&mut session) {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("Failed to get public key: {e}");
+                eprintln!();
+                print_certificate_guidance();
+                return ExitCode::FAILURE;
+            }
         }
     };
     warn_if_stale_certificate(&key_info);
@@ -1161,8 +1198,12 @@ fn cmd_sign_tx() -> ExitCode {
 
     println!("Verifying PIN and signing (touch YubiKey if required)...");
 
+    let Some(mut session) = connect_exclusive_session() else {
+        return ExitCode::FAILURE;
+    };
     let sign_result = sign_in_one_transaction(&mut session, &key_info, &pin, &hash_bytes);
     drop(pin);
+    drop(session);
 
     match sign_result {
         Ok(der_signature) => {
@@ -1305,7 +1346,7 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
     }
 
     let handle = match BridgeServer::start(config, || {
-        let transport = PcscTransport::connect()?;
+        let transport = PcscTransport::connect_exclusive()?;
         let boxed: Box<dyn Transport + Send> = Box::new(transport);
         Ok(boxed)
     }) {
@@ -1339,7 +1380,10 @@ fn cmd_bridge(args: &[String]) -> ExitCode {
         "Idle timeout: {} s (an idle session is closed and the card reset).",
         handle.idle_timeout().as_secs()
     );
-    println!("Security: 127.0.0.1 only, exact Origin allowlist, PIV-only APDU allowlist.");
+    println!(
+        "Security: 127.0.0.1 only, exact Origin allowlist, PIV-only APDU allowlist, \
+         exclusive PC/SC session."
+    );
     println!("Press Ctrl+C to stop the bridge.");
 
     let _ = stop_rx.recv();
