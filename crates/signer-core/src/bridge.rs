@@ -27,11 +27,18 @@
 //!   certificate `GET DATA`; key generation (`GENERATE ASYMMETRIC`,
 //!   management-key `GENERAL AUTHENTICATE`, and certificate deletion) is
 //!   opt-in via [`BridgeConfig::with_allow_key_generation`].
-//! - **Atomic exchanges**: every forwarded APDU, including its `0x6C XX` retry
-//!   and `0x61 XX` `GET RESPONSE` chain, runs as one exclusive PC/SC scope.
-//! - **Session lifetime**: an idle session is closed (resetting the card) after
-//!   [`BridgeConfig::idle_timeout`], and on shutdown; a card reset by another
-//!   PC/SC client closes the session (`409`).
+//! - **Exclusive card session**: `/v1/connect` requires a transport that owns
+//!   the card exclusively for the whole session
+//!   ([`Transport::is_exclusive_session`], e.g.
+//!   `PcscTransport::connect_exclusive`), so no other local PC/SC client can
+//!   connect to the card or use verified PIN or management-key state between
+//!   bridge requests. Every forwarded APDU, including its `0x6C XX` retry and
+//!   `0x61 XX` `GET RESPONSE` chain, also runs inside one exclusive scope.
+//! - **Session lifetime**: an idle session is closed (dropping the transport
+//!   and resetting the card before releasing exclusive access) after
+//!   [`BridgeConfig::idle_timeout`], on `/v1/disconnect`, on a replacement
+//!   `/v1/connect`, and on shutdown; an unexpected card reset closes the
+//!   session (`409`).
 //! - **Request framing limits**: strict header syntax (no obs-fold, no bare CR
 //!   or LF, `token` field names), rejects `Transfer-Encoding`, enforces
 //!   `Content-Type: application/json` on `POST`, caps header (8 KiB) and body
@@ -141,6 +148,11 @@ const KEY_GENERATION_DISABLED: &str = "key generation is disabled on this bridge
 const CARD_RESET_MESSAGE: &str = "the YubiKey was reset by another PC/SC client and the bridge \
      session was closed; reconnect (PIV selection, PIN and management key authentication \
      must be repeated)";
+
+/// Message returned when the configured connector yields a non-exclusive transport.
+const EXCLUSIVE_SESSION_REQUIRED: &str = "bridge requires an exclusive card session (use \
+     PcscTransport::connect_exclusive) so other local PC/SC clients cannot use authenticated \
+     card state between requests";
 
 /// Message returned for an unknown, replaced, closed, or expired session ID.
 const NO_SESSION_MESSAGE: &str = "no active session or session_id mismatch";
@@ -551,7 +563,9 @@ impl BridgeServer {
     /// # Arguments
     ///
     /// * `config` - Validated [`BridgeConfig`] (`127.0.0.1` address, origins, token)
-    /// * `connector` - Closure called on `POST /v1/connect` to open a [`Transport`]
+    /// * `connector` - Closure called on `POST /v1/connect` to open an exclusive
+    ///   [`Transport`] ([`Transport::is_exclusive_session`] must return `true`,
+    ///   e.g. `PcscTransport::connect_exclusive`)
     ///
     /// # Errors
     ///
@@ -1785,6 +1799,22 @@ fn handle_connect(stream: &mut TcpStream, ctx: &SharedContext, origin: &str, bod
             return;
         }
     };
+
+    // Refuse shared card handles so another local PC/SC client cannot access
+    // card-side PIN or management-key authentication between bridge requests.
+    if !transport.is_exclusive_session() {
+        drop(transport);
+        let _ = write_json_response(
+            stream,
+            500,
+            "Internal Server Error",
+            Some(origin),
+            &ErrorBody {
+                error: EXCLUSIVE_SESSION_REQUIRED,
+            },
+        );
+        return;
+    }
 
     // Select the PIV applet as one exclusive exchange (including any 0x6C
     // wrong-Le retry and 0x61 GET RESPONSE chain) before issuing a session ID.

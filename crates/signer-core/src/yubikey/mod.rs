@@ -94,6 +94,23 @@ pub trait Transport: AsDynTransport {
     /// `true` if connected, `false` otherwise.
     fn is_connected(&self) -> bool;
 
+    /// Returns whether this transport holds exclusive access to the card for
+    /// the entire lifetime of the connection and resets the card when dropped.
+    ///
+    /// When `true`, no other local client can connect to the card or use
+    /// card-side authentication state (verified PIN or authenticated management
+    /// key) between calls, and dropping the transport clears that card state
+    /// before another client can connect.
+    ///
+    /// The default implementation returns `true`, which holds for transports
+    /// that have no other local clients (such as in-memory mocks or a claimed
+    /// WebUSB interface). Shared transports such as `PcscTransport::connect`
+    /// override this to return `false`, while
+    /// `PcscTransport::connect_exclusive` returns `true`.
+    fn is_exclusive_session(&self) -> bool {
+        true
+    }
+
     /// Runs `f` as one exclusive scope with respect to other clients of the card.
     ///
     /// Every APDU that `f` sends through the [`Transport`] it receives is
