@@ -154,7 +154,7 @@ pub fn is_webusb_supported() -> bool {
     }
 }
 
-/// Returns the library version string (e.g., `"0.1.1"`).
+/// Returns the library version string (e.g., `"0.1.2"`).
 #[wasm_bindgen(js_name = "getVersion")]
 pub fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
